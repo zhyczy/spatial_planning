@@ -26,28 +26,26 @@ mkdir -p "$OUTPUT_DIR"
 
 case "$DATASET" in
   mindcube)
-    DATA_PATH="dataset/evaluation/MindCube/MindCube_tinybench.jsonl"
-    IMAGE_ROOT="dataset/evaluation/MindCube"
+    DATA_PATH="datasets/evaluation/MindCube/MindCube_tinybench.jsonl"
+    IMAGE_ROOT="datasets/evaluation/MindCube"
     ;;
   sat)
-    DATA_PATH="dataset/evaluation/SAT/test.json"
-    IMAGE_ROOT="dataset/evaluation/SAT"
+    DATA_PATH="datasets/evaluation/SAT/test.json"
+    IMAGE_ROOT="datasets/evaluation/SAT"
     ;;
   vsibench)
-    DATA_PATH="dataset/evaluation/vsibench/test.jsonl"
-    IMAGE_ROOT="dataset/evaluation/vsibench"
+    DATA_PATH="datasets/evaluation/vsibench/test.jsonl"
+    IMAGE_ROOT="datasets/evaluation/vsibench"
     ;;
   mmsibench)
-    DATA_PATH="dataset/evaluation/MMSIBench/data/test_data_final.json"
-    IMAGE_ROOT="dataset/evaluation/MMSIBench"   # images are resolved relative to this root
+    DATA_PATH="datasets/evaluation/MMSIBench/data/test_data_final.json"
+    IMAGE_ROOT="datasets/evaluation/MMSIBench"   # images are resolved relative to this root
     ;;
   *)
     echo "Unknown dataset: $DATASET. Choose: mindcube | sat | vsibench | mmsibench"
     exit 1
     ;;
 esac
-
-OUTPUT_PATH="results/${DATASET}_image_instructions.jsonl"
 
 # Determine GPU count for display
 NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "?")
@@ -58,7 +56,7 @@ echo " Dataset  : $DATASET"
 echo " Model    : $MODEL_PATH"
 echo " Data     : $DATA_PATH"
 echo " GPUs     : $CUDA_INFO"
-echo " Output   : $OUTPUT_PATH  (timestamped sub-dir)"
+echo " Output   : results/$DATASET/<model_name>/<timestamp>/"
 echo "========================================"
 
 cd "$ROOT_DIR"
@@ -67,5 +65,4 @@ python generate_image_instructions.py \
   --data_path    "$DATA_PATH" \
   --image_root   "$IMAGE_ROOT" \
   --model_path   "$MODEL_PATH" \
-  --output_path  "$OUTPUT_PATH" \
   "$@"

@@ -9,6 +9,8 @@ external/
 # data
 vsibench/
 vace_outputs/
+predicted_instructions/
+generated_images/
 
 # C extensions
 *.so

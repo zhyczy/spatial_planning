@@ -13,7 +13,7 @@ spatial_planning/
 │   └── run_generate_instructions.sh # convenience bash wrapper
 ├── checkpoints/
 │   └── Qwen3-VL-4B-Instruct/        # local model weights
-└── dataset/
+└── datasets/
     └── evaluation/
         ├── MindCube/
         ├── SAT/
@@ -105,8 +105,8 @@ Supported `DATASET` values: `mindcube` | `sat` | `vsibench` | `mmsibench`
 ```bash
 python generate_image_instructions.py \
   --dataset      mmsibench \
-  --data_path    dataset/evaluation/MMSIBench/data/test_data_final.json \
-  --image_root   dataset/evaluation/MMSIBench \
+  --data_path    datasets/evaluation/MMSIBench/data/test_data_final.json \
+  --image_root   datasets/evaluation/MMSIBench \
   --model_path   checkpoints/Qwen3-VL-4B-Instruct \
   --output_path  results/mmsibench_instructions.jsonl \
   --max_samples  100 \

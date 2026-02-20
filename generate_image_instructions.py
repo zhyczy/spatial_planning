@@ -4,36 +4,32 @@ call Qwen VL locally, and output image-generation instructions.
 
 Usage examples:
   # MindCube dataset
-  python src/generate_image_instructions.py \
+  python generate_image_instructions.py \
     --dataset mindcube \
-    --data_path dataset/evaluation/MindCube/MindCube_tinybench.jsonl \
-    --image_root dataset/evaluation/MindCube \
-    --model_path /path/to/Qwen3-VL-7B-Instruct \
-    --output_path results/mindcube_img_instructions.jsonl
+    --data_path datasets/evaluation/MindCube/MindCube_tinybench.jsonl \
+    --image_root datasets/evaluation/MindCube \
+    --model_path checkpoints/Qwen3-VL-4B-Instruct
 
   # SAT dataset
-  python src/generate_image_instructions.py \
+  python generate_image_instructions.py \
     --dataset sat \
-    --data_path dataset/evaluation/SAT/test.json \
-    --image_root dataset/evaluation/SAT \
-    --model_path /path/to/Qwen3-VL-7B-Instruct \
-    --output_path results/sat_img_instructions.jsonl
+    --data_path datasets/evaluation/SAT/test.json \
+    --image_root datasets/evaluation/SAT \
+    --model_path checkpoints/Qwen3-VL-4B-Instruct
 
   # VSIBench dataset (images loaded by scene from scannet/arkitscenes subfolders)
-  python src/generate_image_instructions.py \
+  python generate_image_instructions.py \
     --dataset vsibench \
-    --data_path dataset/evaluation/vsibench/test.jsonl \
-    --image_root dataset/evaluation/vsibench \
-    --model_path /path/to/Qwen3-VL-7B-Instruct \
-    --output_path results/vsibench_img_instructions.jsonl
+    --data_path datasets/evaluation/vsibench/test.jsonl \
+    --image_root datasets/evaluation/vsibench \
+    --model_path checkpoints/Qwen3-VL-4B-Instruct
 
   # MMSIBench dataset
-  python src/generate_image_instructions.py \
+  python generate_image_instructions.py \
     --dataset mmsibench \
-    --data_path dataset/evaluation/MMSIBench/data/test_data_final.json \
-    --image_root dataset/evaluation/MMSIBench/data/images \
-    --model_path /path/to/Qwen3-VL-7B-Instruct \
-    --output_path results/mmsibench_img_instructions.jsonl
+    --data_path datasets/evaluation/MMSIBench/data/test_data_final.json \
+    --image_root datasets/evaluation/MMSIBench \
+    --model_path checkpoints/Qwen3-VL-4B-Instruct
 """
 
 import json
@@ -115,9 +111,9 @@ class Config:
     # Dataset
     dataset: str = "mindcube"
     """Dataset name: mindcube | sat | vsibench | mmsibench"""
-    data_path: str = "dataset/evaluation/MindCube/MindCube_tinybench.jsonl"
+    data_path: str = "datasets/evaluation/MindCube/MindCube_tinybench.jsonl"
     """Path to the dataset file (jsonl or json)."""
-    image_root: str = "dataset/evaluation/MindCube"
+    image_root: str = "datasets/evaluation/MindCube"
     """Root directory for resolving relative image paths."""
 
     # Model
@@ -591,13 +587,17 @@ def main():
     data_path  = Path(config.data_path)  if Path(config.data_path).is_absolute()  else script_dir / config.data_path
     image_root = Path(config.image_root) if Path(config.image_root).is_absolute() else script_dir / config.image_root
 
-    # Output path: if set to default, use a timestamped directory like Spatial_RAI
+    # Derive a short model name from the checkpoint path (last directory component)
+    model_name = Path(config.model_path).name or "model"
+
+    # Output layout: results/<dataset>/<model_name>/<dataset>_<timestamp>/
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if config.output_path == "results/image_instructions.jsonl":
-        out_dir = script_dir / "results" / config.dataset / f"{config.dataset}_{timestamp}"
-    else:
-        out_base = Path(config.output_path) if Path(config.output_path).is_absolute() else script_dir / config.output_path
-        out_dir  = out_base.parent / f"{out_base.stem}_{timestamp}"
+    base_results = (
+        Path(config.output_path).parent
+        if Path(config.output_path).is_absolute()
+        else script_dir / Path(config.output_path).parent
+    )
+    out_dir = base_results / config.dataset / model_name / f"{config.dataset}_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Logging ────────────────────────────────────────────────────────────────
