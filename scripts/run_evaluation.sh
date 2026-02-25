@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Baseline QwenVL reasoning evaluation on MMSIBench.
-# Automatically shards the dataset across all visible GPUs.
+# Dual-method QwenVL reasoning evaluation on MMSIBench.
+# Runs both baseline (original images) and augmented (+ generated images) inference
+# for every sample. Automatically shards the dataset across all visible GPUs.
 #
 # Usage:
-#   bash scripts/run_evaluation.sh [MODEL_TYPE] [MODEL_PATH] [OPTIONS...]
+#   bash scripts/run_evaluation.sh [MODEL_TYPE] [MODEL_PATH] [GEN_DIR] [OPTIONS...]
+#
+# Positional args (all optional, in order):
+#   MODEL_TYPE   qwen2.5-vl | qwen3-vl          (default: qwen3-vl)
+#   MODEL_PATH   path to checkpoint directory    (default: checkpoints/Qwen3-VL-4B-Instruct)
+#   GEN_DIR      path to generated images root   (default: generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B)
 #
 # Examples:
-#   bash scripts/run_evaluation.sh qwen2.5-vl checkpoints/Qwen2.5-VL-3B-Instruct
-#   bash scripts/run_evaluation.sh qwen3-vl   checkpoints/Qwen3-VL-4B-Instruct
-#   bash scripts/run_evaluation.sh qwen3-vl   checkpoints/Qwen3-VL-8B-Instruct --limit 50
+#   bash scripts/run_evaluation.sh
+#   bash scripts/run_evaluation.sh qwen3-vl checkpoints/Qwen3-VL-4B-Instruct
+#   bash scripts/run_evaluation.sh qwen3-vl checkpoints/Qwen3-VL-4B-Instruct generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B
+#   bash scripts/run_evaluation.sh qwen3-vl checkpoints/Qwen3-VL-4B-Instruct generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B --limit 12
 #
 #   # Restrict to specific GPUs
 #   CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_evaluation.sh qwen3-vl checkpoints/Qwen3-VL-4B-Instruct
@@ -18,13 +25,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
-MODEL_TYPE="${1:-qwen2.5-vl}"
-MODEL_PATH="${2:-checkpoints/Qwen2.5-VL-3B-Instruct}"
-shift 2 2>/dev/null || true   # pass remaining args to python
+MODEL_TYPE="${1:-qwen3-vl}"
+MODEL_PATH="${2:-checkpoints/Qwen3-VL-4B-Instruct}"
+GEN_DIR="${3:-generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B}"
+shift 3 2>/dev/null || true   # pass remaining args to python
 
-# Resolve relative model path against workspace root
+# Resolve relative paths against workspace root
 if [[ "$MODEL_PATH" != /* ]]; then
     MODEL_PATH="$ROOT_DIR/$MODEL_PATH"
+fi
+if [[ "$GEN_DIR" != /* ]]; then
+    GEN_DIR="$ROOT_DIR/$GEN_DIR"
 fi
 
 DATA_DIR="$ROOT_DIR/datasets/evaluation/MMSIBench"
@@ -37,6 +48,7 @@ echo "========================================"
 echo " Model type  : $MODEL_TYPE"
 echo " Model path  : $MODEL_PATH"
 echo " Data dir    : $DATA_DIR"
+echo " Gen dir     : $GEN_DIR"
 echo " Output dir  : $OUTPUT_DIR"
 echo " GPUs        : $CUDA_INFO"
 echo "========================================"
@@ -46,5 +58,6 @@ python evaluation.py \
     --model_type "$MODEL_TYPE" \
     --model_path "$MODEL_PATH" \
     --data_dir   "$DATA_DIR" \
+    --gen_dir    "$GEN_DIR" \
     --output_dir "$OUTPUT_DIR" \
     "$@"

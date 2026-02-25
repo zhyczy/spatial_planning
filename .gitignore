@@ -11,6 +11,7 @@ vsibench/
 vace_outputs/
 predicted_instructions/
 generated_images/
+results_single/
 
 # C extensions
 *.so
