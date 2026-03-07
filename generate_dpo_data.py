@@ -96,6 +96,24 @@ Question: {question}
 
 Respond with ONLY your answer."""
 
+JUDGE_GT_SIMILARITY_PROMPT = """\
+You are a spatial reasoning evaluator. You will be given:
+1. One or more generated images.
+2. A spatial reasoning question.
+3. A predicted answer (produced by a model looking at those images).
+4. The ground truth answer.
+
+Your task: score how well the predicted answer matches the ground truth.
+Use ONLY the following integer scale:
+   2  = Completely correct — predicted answer fully matches the ground truth.
+   1  = Close / reasoning direction correct, but not fully accurate.
+   0  = Unrelated or neutral — no meaningful signal.
+  -1  = Partially wrong — some elements are incorrect.
+  -2  = Completely wrong — directly contradicts the ground truth.
+
+Output ONLY a JSON object (no extra text):
+{"score": <integer from -2 to 2>, "reason": "<brief explanation>"}"""
+
 
 # ── Model loading helpers ─────────────────────────────────────────────────────
 
@@ -513,7 +531,7 @@ def label_worker(
                     # Empty instructions — this is a valid "no generation needed" response
                     rollout_scores.append({
                         "rollout_idx": ri,
-                        "score": 0.0,  # Neutral score
+                        "score": 0.5,  # Neutral score
                         "method": scoring_method,
                         "detail": "empty_instructions",
                     })
@@ -532,35 +550,13 @@ def label_worker(
                     # Generator failed entirely — negative signal
                     rollout_scores.append({
                         "rollout_idx": ri,
-                        "score": -1.0,
+                        "score": -2.0,
                         "method": scoring_method,
                         "detail": "no_generated_images",
                     })
                     continue
 
                 # ── Score this rollout ─────────────────────────────────────
-                if scoring_method in ("confidence", "both"):
-                    # Implicit scoring: measure answer confidence with generated images
-                    aug_images = sample["image_paths"] + gen_images
-                    conf_msg = [
-                        {"role": "user", "content": (
-                            [{"type": "image", "image": p} for p in aug_images if os.path.isfile(p)]
-                            + [{"type": "text", "text": JUDGE_CONFIDENCE_INSTRUCTION.format(
-                                question=sample["question"]
-                            )}]
-                        )},
-                    ]
-
-                    try:
-                        _, mean_logprob = get_answer_logits(
-                            model, processor, conf_msg, max_new_tokens=64
-                        )
-                    except Exception as e:
-                        log.error(f"Confidence scoring failed for sample {sample['id']} rollout {ri}: {e}")
-                        mean_logprob = -10.0
-
-                    score = mean_logprob  # Higher = more confident
-
                 if scoring_method in ("explicit", "both"):
                     # Explicit scoring: ask judge directly
                     content = []
@@ -610,6 +606,54 @@ def label_worker(
                         # Combine: normalize confidence to 0-10 range then average
                         conf_normalized = max(0, min(10, (mean_logprob + 5) * 2))
                         score = 0.5 * explicit_score + 0.5 * conf_normalized
+
+                if scoring_method == "gt_similarity":
+                    # Step 1: Ask the judge to answer the question using original + generated images
+                    qa_content = [
+                        {"type": "image", "image": p}
+                        for p in sample["image_paths"] + gen_images if os.path.isfile(p)
+                    ]
+                    qa_content.append({"type": "text", "text": (
+                        f"Answer the following spatial reasoning question based on the image(s) above.\n"
+                        f"Question: {sample['question']}\n"
+                        f"Respond with ONLY your answer, no explanation."
+                    )})
+                    qa_msg = [{"role": "user", "content": qa_content}]
+                    try:
+                        predicted_answer = generate_text(
+                            model, processor, qa_msg,
+                            max_new_tokens=64, temperature=0.1, do_sample=False,
+                        )
+                    except Exception as e:
+                        log.error(f"GT-sim answer prediction failed for sample {sample['id']} rollout {ri}: {e}")
+                        predicted_answer = ""
+
+                    # Step 2: Score the predicted answer against GT on [-2, 2]
+                    sim_content = [{"type": "text", "text": (
+                        f"Question: {sample['question']}\n"
+                        f"Predicted answer: {predicted_answer}\n"
+                        f"Ground truth answer: {sample['gt_answer']}\n\n"
+                        f"Score the similarity of the predicted answer to the ground truth."
+                    )}]
+                    sim_msg = [
+                        {"role": "system", "content": JUDGE_GT_SIMILARITY_PROMPT},
+                        {"role": "user", "content": sim_content},
+                    ]
+                    try:
+                        raw_sim = generate_text(
+                            model, processor, sim_msg,
+                            max_new_tokens=128, temperature=0.1, do_sample=False,
+                        )
+                        m = re.search(r'"score"\s*:\s*(-?\d+)', raw_sim)
+                        if m:
+                            score = float(max(-2, min(2, int(m.group(1)))))
+                        else:
+                            nums = re.findall(r'-?\d+', raw_sim)
+                            valid = [int(n) for n in nums if -2 <= int(n) <= 2]
+                            score = float(valid[0]) if valid else 0.0
+                    except Exception as e:
+                        log.error(f"GT-sim scoring failed for sample {sample['id']} rollout {ri}: {e}")
+                        score = 0.0
 
                 rollout_scores.append({
                     "rollout_idx": ri,
@@ -808,9 +852,10 @@ def parse_args():
                         help="Number of instruction sets to sample per question.")
 
     # Scoring
-    parser.add_argument("--scoring_method", type=str, default="confidence",
-                        choices=["confidence", "explicit", "both"],
-                        help="How to score rollouts: implicit confidence, explicit judge, or both.")
+    parser.add_argument("--scoring_method", type=str, default="gt_similarity",
+                        choices=["confidence", "explicit", "both", "gt_similarity"],
+                        help="How to score rollouts: implicit confidence, explicit judge, both, "
+                             "or gt_similarity (predict answer from generated image then compare to GT on [-2,2]).")
     parser.add_argument("--min_score_gap", type=float, default=0.5,
                         help="Minimum score gap to keep a preference pair.")
 

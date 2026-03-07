@@ -297,7 +297,10 @@ def train():
     )
 
     if training_args.gradient_checkpointing:
-        if training_args.vision_lora:
+        # use_reentrant=True + Flash Attention 2 + DDP causes SIGSEGV during NCCL
+        # all-reduce on the first backward pass. Always use non-reentrant when LoRA
+        # is enabled (frozen backbone) or when using vision_lora.
+        if training_args.lora_enable or training_args.vision_lora:
             training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
         else:
             training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}

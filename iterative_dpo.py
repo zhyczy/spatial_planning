@@ -131,6 +131,7 @@ def run_dpo_training(
     learning_rate: float = 1e-5,
     beta: float = 0.1,
     num_gpus: int = -1,
+    lora_enable: bool = True,
     extra_args: Optional[List[str]] = None,
 ):
     """Launch DPO training via deepspeed subprocess.
@@ -156,31 +157,61 @@ def run_dpo_training(
     except Exception:
         pass
 
-    cmd = [
-        "deepspeed", "--num_gpus", str(num_gpus), train_script,
+    # Use torchrun for multi-GPU DDP; fall back to plain python for single GPU.
+    # (deepspeed launcher was avoided due to SIGSEGV; torchrun/DDP is stable.)
+    if num_gpus > 1:
+        cmd = [
+            sys.executable, "-u", "-m", "torch.distributed.run",
+            "--nproc_per_node", str(num_gpus),
+            "--master_port", str(29500 + os.getpid() % 1000),  # avoid port clash
+            train_script,
+        ]
+    else:
+        cmd = [sys.executable, "-u", train_script]
+    ds_args = []
+
+    cmd.extend([
         "--dpo_loss", "sigmoid",
         "--precompute_ref_log_probs", "False",
         "--beta", str(beta),
-        "--use_liger_loss", "True",
-        "--deepspeed", deepspeed_config,
+        "--use_liger_loss", "False",
+    ])
+    cmd.extend(ds_args)
+
+    # ── LoRA vs Full-model mode ───────────────────────────────────────────
+    if lora_enable:
+        lora_args = [
+            "--lora_enable", "True",
+            "--lora_rank", str(lora_rank),
+            "--lora_alpha", str(lora_alpha),
+            "--lora_dropout", "0.05",
+            "--freeze_vision_tower", "True",
+            "--freeze_llm", "True",
+            "--freeze_merger", "True",
+        ]
+    else:
+        lora_args = [
+            "--lora_enable", "False",
+            "--freeze_vision_tower", "False",
+            "--freeze_llm", "False",
+            "--freeze_merger", "False",
+        ]
+
+    cmd.extend([
         "--model_id", model_id,
         "--data_path", data_path,
         "--image_folder", "",
         "--remove_unused_columns", "False",
-        "--lora_enable", "True",
-        "--lora_rank", str(lora_rank),
-        "--lora_alpha", str(lora_alpha),
-        "--lora_dropout", "0.05",
-        "--freeze_vision_tower", "True",
-        "--freeze_llm", "True",
-        "--freeze_merger", "True",
+    ])
+    cmd.extend(lora_args)
+    cmd.extend([
         "--bf16", "True",
         "--fp16", "False",
         "--disable_flash_attn2", "False",
         "--output_dir", output_dir,
         "--num_train_epochs", str(num_train_epochs),
-        "--per_device_train_batch_size", str(per_device_batch_size),
-        "--gradient_accumulation_steps", str(gradient_accumulation_steps),
+        "--per_device_train_batch_size", "1",
+        "--gradient_accumulation_steps", str(max(1, per_device_batch_size * gradient_accumulation_steps)),
         "--image_min_pixels", str(512 * 28 * 28),
         "--image_max_pixels", str(1280 * 28 * 28),
         "--learning_rate", str(learning_rate),
@@ -190,19 +221,23 @@ def run_dpo_training(
         "--logging_steps", "1",
         "--tf32", "True",
         "--gradient_checkpointing", "True",
-        "--report_to", "tensorboard",
+        "--report_to", "none",
         "--lazy_preprocess", "True",
         "--save_strategy", "steps",
         "--save_steps", "200",
         "--save_total_limit", "3",
         "--dataloader_num_workers", "4",
-    ]
+    ])
     if extra_args:
         cmd.extend(extra_args)
 
     logger.info(f"Training command:\n  {' '.join(cmd)}")
 
-    result = subprocess.run(cmd, cwd=str(SCRIPT_DIR))
+    env = os.environ.copy()
+    # Both LoRA and full-model use all visible GPUs via torchrun DDP.
+    # No longer restricting LoRA to GPU 0.
+
+    result = subprocess.run(cmd, cwd=str(SCRIPT_DIR), env=env)
     if result.returncode != 0:
         raise RuntimeError(f"DPO training failed with return code {result.returncode}")
 
@@ -219,9 +254,9 @@ def merge_lora_weights(base_model_id: str, adapter_path: str, output_path: str):
     if Path(merge_script).exists():
         cmd = [
             sys.executable, merge_script,
-            "--model_id", base_model_id,
-            "--adapter_path", adapter_path,
-            "--output_path", output_path,
+            "--model-path", adapter_path,
+            "--model-base", base_model_id,
+            "--save-model-path", output_path,
         ]
         logger.info(f"Merging LoRA: {' '.join(cmd)}")
         result = subprocess.run(cmd)
@@ -275,13 +310,16 @@ def parse_args():
                         help="Number of DPO iterations (shards).")
     parser.add_argument("--num_rollouts", type=int, default=8,
                         help="On-policy rollouts per question per iteration.")
-    parser.add_argument("--scoring_method", type=str, default="confidence",
-                        choices=["confidence", "explicit", "both"])
+    parser.add_argument("--scoring_method", type=str, default="gt_similarity",
+                        choices=["gt_similarity", "explicit", "both"])
     parser.add_argument("--min_score_gap", type=float, default=0.3,
                         help="Min score gap for pair selection (lower than single-shot "
                              "since iterative refinement produces tighter distributions).")
 
     # ── Training hyperparams ──────────────────────────────────────────────
+    parser.add_argument("--lora_enable", type=lambda x: x.lower() != "false", default=True,
+                        help="LoRA mode (default True). Set False for full-model DPO "
+                             "(needs ZeRO-3 + much more VRAM).")
     parser.add_argument("--lora_rank", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -520,7 +558,9 @@ def main():
         #   3. Reference model = base model (correct DPO semantics)
         train_output_dir = str(iter_dir / "model_lora")
 
-        if (iter_dir / "model_lora").exists():
+        _lora_dir = iter_dir / "model_lora"
+        _lora_done = _lora_dir.exists() and any(_lora_dir.iterdir())
+        if _lora_done:
             logger.info(f"[Iter {iteration}] Step C: Trained model exists, skipping training.")
         else:
             logger.info(f"[Iter {iteration}] Step C: DPO training with {len(accumulated_pairs)} accumulated pairs")
@@ -537,6 +577,7 @@ def main():
                 learning_rate=args.learning_rate,
                 beta=args.beta,
                 num_gpus=args.num_gpus,
+                lora_enable=args.lora_enable,
             )
 
         # ── Merge LoRA for next iteration's on-policy rollout ─────────────
