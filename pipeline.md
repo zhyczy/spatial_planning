@@ -6,9 +6,15 @@
 SAT 训练数据
      │
      ▼
-【Step 1】iterative_dpo.py          ← 迭代 DPO 训练 Planner
-     │  rollout → 生成图 → 打分 → 构建偏好对 → DPO 训练 → 合并 LoRA
-     │  (重复 N 轮，每轮用累积偏好对)
+【Step 1】grpo.py / iterative_dpo.py  ← 迭代训练 Planner（两种算法可选）
+     │
+     │  ─── GRPO（推荐）─────────────────────────────────────────────────
+     │  rollout → 生成图 → 打分 → 全K组 advantages → GRPO 策略梯度训练 → 合并 LoRA
+     │
+     │  ─── DPO（原版）──────────────────────────────────────────────────
+     │  rollout → 生成图 → 打分 → 构建偏好对(最优/最差) → DPO 训练 → 合并 LoRA
+     │
+     │  (均重复 N 轮，每轮用累积数据)
      ▼
  trained planner (model_merged/)
      │
@@ -52,7 +58,113 @@ cd /egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning
 
 ---
 
-## Step 1: 迭代 DPO 训练 (`iterative_dpo.py`)
+## Step 1a: 迭代 GRPO 训练（推荐）(`grpo.py`)
+
+### 原理
+
+GRPO（Group Relative Policy Optimization）相比 DPO 的核心改进：
+- **DPO**：每个问题只用最优/最差的一对 rollout，丢弃中间信息
+- **GRPO**：所有 K 个 rollout 都参与训练，归一化奖励作为 advantage，policy gradient 更新
+
+每轮迭代：
+1. **Rollout** — 当前 Planner 以高温度对每个问题生成 G 组（默认 G=8）不同的 `<thinking>+<instructions>`（多卡并行）
+2. **Execution** — Flux2Klein 将每组 instructions 渲染成图片（多卡并行）
+3. **Labeling** — Critic 模型对每组生成图打分（多卡并行，打分逻辑与 DPO 完全相同）
+4. **GRPO Dataset** — 将所有 G 组 rollout 的奖励归一化为 advantage：`A_i = (r_i - mean_r) / std_r`，展平为 (prompt, completion, advantage) 三元组；累积历史所有轮数据
+5. **GRPO Training** — 用 advantage 加权策略梯度损失训练，可选 KL 正则（beta），torchrun 多卡 DDP
+6. **LoRA Merge** — 合并 LoRA 到 base model，作为下一轮 Planner
+
+**GRPO 损失函数：**
+```
+L = mean_i[ A_i × NLL(completion_i | prompt) ] + beta × mean_i[ KL(π_θ ∥ π_ref)_i ]
+```
+
+### 命令
+
+```bash
+cd /egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning
+
+# ── Pilot：SAT 2000 samples，5 iterations，LoRA ──
+conda run -n SPR python grpo.py \
+    --dataset sat \
+    --data_path datasets/evaluation/SAT/train_action_consequence.json \
+    --image_root datasets/evaluation/SAT \
+    --max_samples 2000 \
+    --output_dir train_records/grpo_sat_pilot \
+    --planner_model_path checkpoints/Qwen3-VL-4B-Instruct \
+    --flux_ckpt checkpoints/flux2-klein-4B \
+    --critic_model_path checkpoints/Qwen3-VL-8B-Instruct \
+    --num_iterations 5 \
+    --num_rollouts 8 \
+    --num_gpus -1 \
+    --num_train_epochs 1 \
+    --learning_rate 1e-4 \
+    --beta 0.04 \
+    --min_reward_std 0.05 \
+    --lora_enable True \
+    --lora_rank 64 \
+    2>&1 | tee /tmp/sat_grpo_pilot.log
+
+# ── Full scale ──
+conda run -n SPR python grpo.py \
+    --dataset sat \
+    --data_path datasets/evaluation/SAT/train_action_consequence.json \
+    --image_root datasets/evaluation/SAT \
+    --max_samples -1 \
+    --output_dir train_records/grpo_sat_full \
+    --planner_model_path checkpoints/Qwen3-VL-4B-Instruct \
+    --flux_ckpt checkpoints/flux2-klein-4B \
+    --critic_model_path checkpoints/Qwen3-VL-8B-Instruct \
+    --num_iterations 5 \
+    --num_rollouts 8 \
+    --num_gpus -1 \
+    --learning_rate 5e-5 \
+    --beta 0.04 \
+    --lora_enable True \
+    2>&1 | tee /tmp/sat_grpo_full.log
+
+# ── 续跑 ──
+conda run -n SPR python grpo.py \
+    --resume_from train_records/grpo_sat_full/sat_<timestamp> \
+    --resume_iter 2 \
+    ... (其他参数与首次相同)
+```
+
+### GRPO 参数说明
+
+| 参数 | 默认值 | pilot 推荐 | full 推荐 | 说明 |
+|------|--------|-----------|----------|------|
+| `--num_rollouts` | `8` | `8` | `8` | 每问题采样组数 G；G 越大 advantage 估计越准，显存/时间也越多 |
+| `--beta` | `0.04` | `0.04` | `0.04` | KL 惩罚系数；0 = 纯策略梯度；增大则更保守 |
+| `--min_reward_std` | `0.05` | `0.05` | `0.05` | 奖励方差过小的组被丢弃（梯度为零）；0 保留全部 |
+| `--learning_rate` | `1e-5` | `1e-4` | `5e-5` | 学习率 |
+| `--num_train_epochs` | `1` | `1` | `1` | 每轮训练 epoch 数 |
+| `--per_device_batch_size` | `1` | `1` | `1` | 每卡 batch size |
+| `--gradient_accumulation_steps` | `8` | `4` | `8` | 梯度累积步数 |
+
+### GRPO 输出结构
+
+```
+train_records/grpo_sat_pilot/
+└── sat_<timestamp>/
+    ├── config.json
+    ├── grpo.log
+    ├── shards.json
+    ├── iter_0/
+    │   ├── rollouts.jsonl            # Planner G 组原始输出
+    │   ├── generated_images/         # Flux2Klein 生成图
+    │   ├── labeled.jsonl             # 带评分的 rollout（打分逻辑同 DPO）
+    │   ├── grpo_examples.json        # 本轮 GRPO 训练样本（含 advantage）
+    │   ├── grpo_accumulated.json     # 累积训练样本
+    │   ├── model_lora/               # LoRA 适配器
+    │   └── model_merged/             # 合并模型（→ iter_1 的 Planner）
+    └── iter_N/
+        └── model_merged/             # ← 最终模型
+```
+
+---
+
+## Step 1b: 迭代 DPO 训练（原版）(`iterative_dpo.py`)
 
 ### 原理
 
