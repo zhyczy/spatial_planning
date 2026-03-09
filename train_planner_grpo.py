@@ -203,6 +203,9 @@ class GRPOTrainingArguments(TrainingArguments):
                     "Larger values keep the policy closer to the reference model."
         },
     )
+    # We use a custom compute_loss that needs 'advantage' (not in model.forward).
+    # Disable column removal so the collator output is passed through unchanged.
+    remove_unused_columns: bool = field(default=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -415,9 +418,11 @@ class GRPODataset(Dataset):
 def grpo_collate_fn(features: list):
     """Collate GRPO examples into a padded batch.
 
-    Handles variable-length input_ids and labels by left-padding (attention mask
-    is derived from non-pad positions).  Pixel values are concatenated since the
-    model expects a flat list of image patches.
+    Uses RIGHT-padding so sequences are compatible with Flash Attention 2.
+    Flash Attention 2's varlen kernel computes cumulative sequence lengths
+    assuming padding is on the right; left-padding causes buffer overruns
+    → SIGSEGV.  Pixel values are concatenated since the model expects a
+    flat list of image patches.
     """
     if not features:
         return {}
@@ -439,13 +444,13 @@ def grpo_collate_fn(features: list):
         seq_len = ids.size(0)
         pad_len = max_len - seq_len
 
-        # Left-pad so the computation graph stays consistent with flash-attn
-        padded_ids = torch.cat([torch.full((pad_len,), pad_id, dtype=ids.dtype), ids])
+        # Right-pad: required for Flash Attention 2 compatibility
+        padded_ids = torch.cat([ids, torch.full((pad_len,), pad_id, dtype=ids.dtype)])
         padded_lbls = torch.cat(
-            [torch.full((pad_len,), IGNORE_INDEX, dtype=lbls.dtype), lbls]
+            [lbls, torch.full((pad_len,), IGNORE_INDEX, dtype=lbls.dtype)]
         )
         attn_mask = torch.cat(
-            [torch.zeros(pad_len, dtype=torch.long), torch.ones(seq_len, dtype=torch.long)]
+            [torch.ones(seq_len, dtype=torch.long), torch.zeros(pad_len, dtype=torch.long)]
         )
 
         batch_input_ids.append(padded_ids)
@@ -511,11 +516,21 @@ class GRPOPlannerTrainer(Trainer):
         # Pop the advantage tensor (not a standard model input)
         advantages = inputs.pop("advantage", None)  # [B]
 
+        # Pop labels too — we compute our own loss; passing labels to the model
+        # triggers its internal loss path which may interfere with logits output
+        # under DDP + LoRA + gradient checkpointing.
+        labels = inputs.pop("labels")  # [B, T]  (-100 for prompt/pad positions)
+
         # ── Forward pass through policy model ────────────────────────────
         outputs = model(**inputs)
         logits = outputs.logits  # [B, T, V]
 
-        labels = inputs["labels"]  # [B, T]  (-100 for prompt/pad positions)
+        if logits is None:
+            raise RuntimeError(
+                "Model forward returned logits=None. This usually means the model "
+                "is not producing output tensors. Check the model forward and "
+                "ensure pixel_values/image_grid_thw are valid."
+            )
 
         # Autoregressive: predict token t+1 from token t
         shift_logits = logits[:, :-1, :].contiguous()   # [B, T-1, V]
@@ -632,6 +647,21 @@ def train():
         training_args.lora_namespan_exclude += ["visual"]
 
     local_rank = training_args.local_rank
+
+    # ── Force safe SDPA backend for Blackwell GPU compatibility ──────────────
+    # When flash_attention_2 is disabled we also disable PyTorch's built-in
+    # flash/efficient/cudnn SDP backends, which JIT-compile Triton kernels and
+    # segfault on new GPU architectures (Blackwell sm_100).  Only the pure-math
+    # cuBLAS backend is kept; it is hardware-accelerated and always stable.
+    if training_args.disable_flash_attn2:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        try:
+            torch.backends.cuda.enable_cudnn_sdp(False)
+        except AttributeError:
+            pass
+        torch.backends.cuda.enable_math_sdp(True)
+
     compute_dtype = (
         torch.float16 if training_args.fp16
         else (torch.bfloat16 if training_args.bf16 else torch.float32)
@@ -761,6 +791,7 @@ def train():
         ref_model.eval()
         for p in ref_model.parameters():
             p.requires_grad = False
+        ref_model.to(training_args.device)
         rank0_print("Reference model loaded and frozen.")
 
     # ── Processor ─────────────────────────────────────────────────────────────

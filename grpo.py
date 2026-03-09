@@ -349,7 +349,7 @@ def run_grpo_training(
     cmd.extend([
         "--bf16", "True",
         "--fp16", "False",
-        "--disable_flash_attn2", "False",
+        "--disable_flash_attn2", "True",
         "--output_dir", output_dir,
         "--num_train_epochs", str(num_train_epochs),
         "--per_device_train_batch_size", str(per_device_batch_size),
@@ -376,6 +376,16 @@ def run_grpo_training(
     logger.info(f"GRPO training command:\n  {' '.join(cmd)}")
 
     env = os.environ.copy()
+    # Point Triton's autotune cache to a local /tmp directory so that
+    # multiple DDP workers don't race on the NFS-backed ~/.triton/autotune,
+    # which causes SIGSEGV during Flash Attention 2 kernel compilation.
+    triton_cache = f"/tmp/triton_cache_{os.getpid()}"
+    os.makedirs(triton_cache, exist_ok=True)
+    env.setdefault("TRITON_CACHE_DIR", triton_cache)
+    # NCCL/CUDA env vars for Blackwell GPU stability
+    env.setdefault("NCCL_P2P_DISABLE", "1")
+    env.setdefault("NCCL_IB_DISABLE", "1")
+    env.setdefault("CUDA_LAUNCH_BLOCKING", "1")
     result = subprocess.run(cmd, cwd=str(SCRIPT_DIR), env=env)
     if result.returncode != 0:
         raise RuntimeError(f"GRPO training failed with return code {result.returncode}")

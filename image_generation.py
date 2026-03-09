@@ -334,6 +334,13 @@ def main():
         results_jsonl = instr_root / pm / "results.jsonl"
         if not results_jsonl.is_file():
             logger.warning(f"results.jsonl not found: {results_jsonl}")
+            # Pre-create the expected output dir so downstream evaluation steps
+            # don't mistake a missing dir for "no generated images" and fall back
+            # to baseline.  Dataset name is inferred from predicted_instructions_root.
+            dataset_name = instr_root.name   # e.g. results/mmsibench → "mmsibench"
+            pre_gen_dir = out_root / dataset_name / pm / flux_ckpt.name
+            pre_gen_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Pre-created output dir: {pre_gen_dir}")
             continue
         with open(results_jsonl, "r", encoding="utf-8") as f:
             for line in f:

@@ -236,7 +236,10 @@ def run_dpo_training(
     env = os.environ.copy()
     # Both LoRA and full-model use all visible GPUs via torchrun DDP.
     # No longer restricting LoRA to GPU 0.
-
+    # Point Triton's autotune cache to a local /tmp directory so that
+    # multiple DDP workers don't race on the NFS-backed ~/.triton/autotune,
+    # which causes SIGSEGV during Flash Attention 2 kernel compilation.
+    env.setdefault("TRITON_CACHE_DIR", f"/tmp/triton_cache_{os.getpid()}")
     result = subprocess.run(cmd, cwd=str(SCRIPT_DIR), env=env)
     if result.returncode != 0:
         raise RuntimeError(f"DPO training failed with return code {result.returncode}")

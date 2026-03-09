@@ -211,11 +211,12 @@ def train():
     else:
         training_args.lora_namespan_exclude = []
 
-    if training_args.lora_enable and not training_args.vision_lora:
-        training_args.lora_namespan_exclude += ["visual"]
-
-    local_rank = training_args.local_rank
-    compute_dtype = (
+        # Always exclude embedding layers: applying LoRA to embed_tokens/lm_head
+        # with tie_word_embeddings=True triggers PEFT warnings and complicates
+        # LoRA merging.  These layers are large and rarely need fine-tuning.
+        for _emb_name in ["embed_tokens", "lm_head"]:
+            if _emb_name not in training_args.lora_namespan_exclude:
+                training_args.lora_namespan_exclude.append(_emb_name)
         torch.float16 if training_args.fp16
         else (torch.bfloat16 if training_args.bf16 else torch.float32)
     )

@@ -692,6 +692,15 @@ def main():
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     logger.info(f"Merged {len(all_records)} records → {final_path}")
+
+    # Also write to the parent-level results.jsonl so that image_generation.py
+    # can find it at results/<dataset>/<model_name>/results.jsonl without needing
+    # to know the timestamp subdirectory name.
+    canonical_path = out_dir.parent / "results.jsonl"
+    import shutil
+    shutil.copy2(final_path, canonical_path)
+    logger.info(f"Canonical copy → {canonical_path}")
+
     logger.info("Done.")
 
 
