@@ -18,8 +18,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
-MODEL_TYPE="${1:-qwen2.5-vl}"
-MODEL_PATH="${2:-checkpoints/Qwen2.5-VL-3B-Instruct}"
+MODEL_TYPE="${1:-qwen3.5}"
+MODEL_PATH="${2:-checkpoints/Qwen3.5-4B}"
 shift 2 2>/dev/null || true   # pass remaining args to python
 
 # Resolve relative model path against workspace root

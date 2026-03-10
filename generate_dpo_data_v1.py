@@ -118,53 +118,25 @@ Output ONLY a JSON object (no extra text):
 # ── Model loading helpers ─────────────────────────────────────────────────────
 
 def load_model_for_inference(model_path: str, device: str):
-    """Load a Qwen multimodal model for inference (planner or judge).
+    """Load a Qwen VL model for inference (planner or judge)."""
+    from transformers import AutoProcessor
 
-    Detects vision capability via ``vision_config`` in AutoConfig, which covers
-    all Qwen VL generations (Qwen2-VL, Qwen2.5-VL, Qwen3.5, …) regardless of
-    whether "VL" appears in the architecture string.
-
-    FA2 is skipped for ``qwen3_5`` because its kernel loads without error but
-    crashes with ``cudaErrorIllegalAddress`` inside ``generate()`` at runtime.
-    All other models try FA2 first and fall back to sdpa on load-time errors.
-    """
-    from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
-
-    cfg = AutoConfig.from_pretrained(model_path)
-    model_type = (cfg.model_type or "").lower()
-    # Presence of vision_config is the canonical VL signal, independent of name.
-    has_vision = getattr(cfg, "vision_config", None) is not None
-
-    # qwen3_5 FA2 kernels crash at generate() time, not at load time, so the
-    # try/except around from_pretrained can't catch them. Use sdpa directly.
-    attn_impls = ["sdpa"] if model_type == "qwen3_5" else ["flash_attention_2", "sdpa"]
-
-    last_exc = None
-    for attn_impl in attn_impls:
-        try:
-            if has_vision:
-                model = AutoModelForImageTextToText.from_pretrained(
-                    model_path,
-                    dtype=torch.bfloat16,
-                    device_map=device,
-                    attn_implementation=attn_impl,
-                )
-            else:
-                from transformers import AutoModelForCausalLM
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    dtype=torch.bfloat16,
-                    device_map=device,
-                    attn_implementation=attn_impl,
-                )
-            break
-        except Exception as exc:
-            last_exc = exc
-            continue
-    else:
-        raise RuntimeError(
-            f"Failed to load model from {model_path}"
-        ) from last_exc
+    try:
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            dtype=torch.bfloat16,
+            device_map=device,
+            attn_implementation="flash_attention_2",
+        )
+    except (ImportError, TypeError):
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
+            attn_implementation="flash_attention_2",
+        )
 
     processor = AutoProcessor.from_pretrained(model_path)
     model.eval()
@@ -199,7 +171,6 @@ def generate_text(model, processor, messages, max_new_tokens=512,
             temperature=temperature,
             top_p=top_p,
             use_cache=True,
-            pad_token_id=processor.tokenizer.eos_token_id,
         )
 
     trimmed = [out[len(inp):] for inp, out in zip(inputs["input_ids"], generated_ids)]
@@ -237,7 +208,6 @@ def get_answer_logits(model, processor, messages, max_new_tokens=64):
             return_dict_in_generate=True,
             output_scores=True,
             use_cache=True,
-            pad_token_id=processor.tokenizer.eos_token_id,
         )
 
     generated_ids = outputs.sequences
@@ -350,12 +320,6 @@ def run_rollouts(samples, model_path, num_rollouts, output_dir, num_gpus):
         all_gpu_ids = [str(i) for i in range(n_available)]
     if num_gpus > 0:
         all_gpu_ids = all_gpu_ids[:num_gpus]
-    if not all_gpu_ids:
-        raise RuntimeError(
-            "No CUDA GPUs detected for rollouts. "
-            "Set CUDA_VISIBLE_DEVICES or ensure GPUs are available "
-            f"(torch.cuda.device_count()={n_available})."
-        )
 
     log_file = str(output_dir / "rollout.log")
     chunks = chunk_dataset(samples, len(all_gpu_ids))
@@ -500,12 +464,6 @@ def run_execution(rollout_records, flux_ckpt, output_dir, num_inference_steps, n
         all_gpu_ids = [str(i) for i in range(n_available)]
     if num_gpus > 0:
         all_gpu_ids = all_gpu_ids[:num_gpus]
-    if not all_gpu_ids:
-        raise RuntimeError(
-            "No CUDA GPUs detected for image generation. "
-            "Set CUDA_VISIBLE_DEVICES or ensure GPUs are available "
-            f"(torch.cuda.device_count()={n_available})."
-        )
 
     log_file = str(output_dir / "execution.log")
     chunks = chunk_dataset(tasks, len(all_gpu_ids))
@@ -732,12 +690,6 @@ def run_labeling(rollout_records, judge_model_path, gen_dir, scoring_method,
         all_gpu_ids = [str(i) for i in range(n_available)]
     if num_gpus > 0:
         all_gpu_ids = all_gpu_ids[:num_gpus]
-    if not all_gpu_ids:
-        raise RuntimeError(
-            "No CUDA GPUs detected for labeling. "
-            "Set CUDA_VISIBLE_DEVICES or ensure GPUs are available "
-            f"(torch.cuda.device_count()={n_available})."
-        )
 
     log_file = str(output_dir / "labeling.log")
     chunks = chunk_dataset(rollout_records, len(all_gpu_ids))

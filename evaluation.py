@@ -196,16 +196,44 @@ def load_model_and_processor(
     logger = logging.getLogger(__name__)
     logger.info(f"Loading model type='{model_type}' from '{model_path}' onto {device}")
 
-    if model_type in ("qwen2.5-vl", "qwen3-vl"):
+    if model_type in ("qwen2.5-vl", "qwen3-vl", "qwen3.5"):
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            dtype=torch.bfloat16,
-            device_map="cpu",
-            attn_implementation="flash_attention_2",
-            local_files_only=True,
-        )
+        # Qwen3.5: sdpa for transformer blocks; linear attention layers use
+        # flash-linear-attention automatically when the library is installed.
+        if model_type == "qwen3.5":
+            attn_impls = ["sdpa"]
+            try:
+                import fla  # noqa: F401
+                logger.info("flash-linear-attention: available ✓ (linear-attn fast path active)")
+            except Exception as fla_exc:
+                logger.warning(
+                    f"flash-linear-attention import failed ({type(fla_exc).__name__}: {fla_exc}) "
+                    "— Qwen3.5 linear-attention layers will use slow torch fallback. "
+                    "Install with: pip install flash-linear-attention"
+                )
+        else:
+            attn_impls = ["flash_attention_2", "sdpa"]
+
+        last_exc = None
+        for attn_impl in attn_impls:
+            try:
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_path,
+                    dtype=torch.bfloat16,
+                    device_map="cpu",
+                    attn_implementation=attn_impl,
+                    local_files_only=True,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                continue
+        else:
+            raise RuntimeError(
+                f"Failed to load model from {model_path}"
+            ) from last_exc
+
         model = model.to(device)
         processor = AutoProcessor.from_pretrained(
             model_path,
@@ -213,12 +241,12 @@ def load_model_and_processor(
         )
 
         model_device = next(model.parameters()).device
-        logger.info(f"Model loaded on device: {model_device}")
+        logger.info(f"Model loaded on device: {model_device} (attn={attn_impl})")
         return model, processor
 
     raise ValueError(
         f"Unknown model_type '{model_type}'. "
-        "Supported: 'qwen2.5-vl', 'qwen3-vl'"
+        "Supported: 'qwen2.5-vl', 'qwen3-vl', 'qwen3.5'"
     )
 
 
@@ -241,6 +269,7 @@ def prepare_batch(
     batch_data: List[Dict],
     extra_images_list: List[List[str]],
     processor: Any,
+    enable_thinking: bool = False,
 ) -> Tuple[Dict, List[str]]:
     """Tokenise a batch. *extra_images_list[i]* are generated images for batch_data[i]."""
     from qwen_vl_utils import process_vision_info
@@ -251,7 +280,10 @@ def prepare_batch(
     ]
 
     prompts_text = [
-        processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        processor.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
         for msgs in batch_messages
     ]
 
@@ -290,6 +322,7 @@ def run_inference(
             **batch_inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            pad_token_id=processor.tokenizer.eos_token_id,
         )
 
     # Trim input tokens from output
@@ -406,6 +439,7 @@ def evaluate(
     output_path_baseline: Path,
     output_path_augmented: Path,
     device: str = "cuda:0",
+    baseline_thinking: bool = False,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Run both methods for every sample in *data*.
 
@@ -437,7 +471,8 @@ def evaluate(
         # ---- Method A: Baseline (original images only) ----
         try:
             no_extra = [[] for _ in batch_data]
-            b_inputs, b_prompts = prepare_batch(batch_data, no_extra, processor)
+            b_inputs, b_prompts = prepare_batch(batch_data, no_extra, processor,
+                                                enable_thinking=baseline_thinking)
             b_outputs = run_inference(b_inputs, model, processor, max_new_tokens)
             baseline_results.extend(
                 postprocess(batch_data, b_outputs, b_prompts, no_extra, "baseline")
@@ -455,7 +490,8 @@ def evaluate(
             gen_extra = [
                 get_generated_images(item["index"], gen_dir) for item in batch_data
             ]
-            a_inputs, a_prompts = prepare_batch(batch_data, gen_extra, processor)
+            a_inputs, a_prompts = prepare_batch(batch_data, gen_extra, processor,
+                                                enable_thinking=False)
             a_outputs = run_inference(a_inputs, model, processor, max_new_tokens)
             augmented_results.extend(
                 postprocess(batch_data, a_outputs, a_prompts, gen_extra, "augmented")
@@ -495,6 +531,7 @@ def _worker(
     out_baseline: Path,
     out_augmented: Path,
     log_file: Optional[str],
+    baseline_thinking: bool = False,
 ) -> None:
     """Entry point for each subprocess (one per GPU)."""
     if log_file:
@@ -520,6 +557,7 @@ def _worker(
         out_baseline,
         out_augmented,
         device,
+        baseline_thinking=baseline_thinking,
     )
     logger.info(f"[Worker {gpu_id}] Done.")
 
@@ -646,7 +684,7 @@ def main() -> None:
     )
     # Model
     parser.add_argument("--model_type", type=str, default="qwen2.5-vl",
-                        choices=["qwen2.5-vl", "qwen3-vl"])
+                        choices=["qwen2.5-vl", "qwen3-vl", "qwen3.5"])
     parser.add_argument("--model_path", type=str, required=True)
     # Data
     parser.add_argument("--data_dir", type=str,
@@ -666,6 +704,10 @@ def main() -> None:
     parser.add_argument("--gen_model_name", type=str, default=None,
                         help="Human-readable name for the image generation model "
                              "(defaults to the last path component of --gen_dir).")
+    # Thinking mode
+    parser.add_argument("--baseline_thinking", action="store_true", default=False,
+                        help="Enable Qwen3.5 thinking mode for the baseline method. "
+                             "Augmented (our method) always uses thinking=False.")
 
     args = parser.parse_args()
 
@@ -738,6 +780,7 @@ def main() -> None:
     logger.info(f"    model_path     : {planning_model_path}")
     logger.info(f"    max_new_tokens : {args.max_new_tokens}")
     logger.info(f"    batch_size     : {args.batch_size}")
+    logger.info(f"    baseline_thinking: {args.baseline_thinking}")
     logger.info("")
     logger.info("  [Generation model — augmented images]")
     logger.info(f"    gen_model_name : {gen_model_display}")
@@ -763,6 +806,7 @@ def main() -> None:
             "model_path": str(planning_model_path),
             "max_new_tokens": args.max_new_tokens,
             "batch_size": args.batch_size,
+            "baseline_thinking": args.baseline_thinking,
         },
         "reasoning_model": {
             "model_name": planning_model_display,
@@ -770,6 +814,7 @@ def main() -> None:
             "model_path": str(planning_model_path),
             "max_new_tokens": args.max_new_tokens,
             "batch_size": args.batch_size,
+            "baseline_thinking": args.baseline_thinking,
         },
         "generation_model": {
             "gen_model_name": gen_model_display,
@@ -814,6 +859,7 @@ def main() -> None:
                 str(gen_dir) if gen_dir else None,
                 ob, oa,
                 str(log_file),
+                args.baseline_thinking,
             ),
         )
         p.start()

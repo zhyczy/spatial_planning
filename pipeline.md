@@ -51,10 +51,10 @@ cd /egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning
 
 | 角色 | 路径 |
 |------|------|
-| Planner (初始/微调目标) | `checkpoints/Qwen3-VL-4B-Instruct` |
-| Critic (打分) | `checkpoints/Qwen3-VL-8B-Instruct` |
+| Planner (初始/微调目标) | `checkpoints/Qwen3.5-4B` |
+| Critic (打分，训练阶段) | `checkpoints/Qwen3.5-9B` |
 | Generator | `checkpoints/flux2-klein-4B` |
-| Judge (VQA 评估) | `checkpoints/Qwen3-VL-4B-Instruct` |
+| Judge (VQA 评估) | `checkpoints/Qwen3.5-4B` |
 
 ---
 
@@ -91,9 +91,9 @@ conda run -n SPR python grpo.py \
     --image_root datasets/evaluation/SAT \
     --max_samples 2000 \
     --output_dir train_records/grpo_sat_pilot \
-    --planner_model_path checkpoints/Qwen3-VL-4B-Instruct \
+    --planner_model_path checkpoints/Qwen3.5-4B \
     --flux_ckpt checkpoints/flux2-klein-4B \
-    --critic_model_path checkpoints/Qwen3-VL-8B-Instruct \
+    --critic_model_path checkpoints/Qwen3.5-9B \
     --num_iterations 5 \
     --num_rollouts 8 \
     --num_gpus -1 \
@@ -112,9 +112,9 @@ conda run -n SPR python grpo.py \
     --image_root datasets/evaluation/SAT \
     --max_samples -1 \
     --output_dir train_records/grpo_sat_full \
-    --planner_model_path checkpoints/Qwen3-VL-4B-Instruct \
+    --planner_model_path checkpoints/Qwen3.5-4B \
     --flux_ckpt checkpoints/flux2-klein-4B \
-    --critic_model_path checkpoints/Qwen3-VL-8B-Instruct \
+    --critic_model_path checkpoints/Qwen3.5-9B \
     --num_iterations 5 \
     --num_rollouts 8 \
     --num_gpus -1 \
@@ -232,9 +232,9 @@ conda run -n SPR python iterative_dpo.py \
     --image_root datasets/evaluation/SAT \
     --max_samples 2000 \
     --output_dir train_records/iterative_dpo_sat_pilot \
-    --planner_model_path checkpoints/Qwen3-VL-4B-Instruct \
+    --planner_model_path checkpoints/Qwen3.5-4B \
     --flux_ckpt checkpoints/flux2-klein-4B \
-    --critic_model_path checkpoints/Qwen3-VL-8B-Instruct \
+    --critic_model_path checkpoints/Qwen3.5-9B \
     --num_iterations 5 \
     --num_rollouts 8 \
     --num_gpus -1 \
@@ -253,9 +253,9 @@ conda run -n SPR python iterative_dpo.py \
     --image_root datasets/evaluation/SAT \
     --max_samples -1 \
     --output_dir train_records/iterative_dpo_sat_full \
-    --planner_model_path checkpoints/Qwen3-VL-4B-Instruct \
+    --planner_model_path checkpoints/Qwen3.5-4B \
     --flux_ckpt checkpoints/flux2-klein-4B \
-    --critic_model_path checkpoints/Qwen3-VL-8B-Instruct \
+    --critic_model_path checkpoints/Qwen3.5-9B \
     --num_iterations 5 \
     --num_rollouts 8 \
     --num_gpus -1 \
@@ -453,7 +453,7 @@ generated_images/
 # 本次实验使用的命令
 conda run -n SPR python evaluation.py \
     --model_type qwen3-vl \
-    --model_path checkpoints/Qwen3-VL-4B-Instruct \
+    --model_path checkpoints/Qwen3.5-4B \
     --data_dir datasets/evaluation/MMSIBench \
     --gen_dir generated_images/mmsibench/mmsibench_<timestamp>/flux2-klein-4B \
     --limit 30 \
@@ -463,7 +463,7 @@ conda run -n SPR python evaluation.py \
 # Baseline only（不传 gen_dir）
 conda run -n SPR python evaluation.py \
     --model_type qwen3-vl \
-    --model_path checkpoints/Qwen3-VL-4B-Instruct \
+    --model_path checkpoints/Qwen3.5-4B \
     --data_dir datasets/evaluation/MMSIBench \
     --limit 30 \
     --output_dir results/eval_baseline

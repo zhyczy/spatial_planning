@@ -49,7 +49,9 @@ from PIL import Image
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ── System prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a visual planning assistant for spatial reasoning tasks.
+# CoT-GRPO: The model MUST emit <think>...</think> before instructions so that
+# thinking tokens participate in the joint advantage update during GRPO training.
+SYSTEM_PROMPT = """You are a spatial planning assistant for spatial reasoning tasks.
 
 You will be given:
   1. One or more images of a scene.
@@ -59,13 +61,16 @@ Your job is to decide whether the existing images are sufficient to answer the
 question, or whether additional images need to be generated to provide missing
 visual information.
 
-Think step by step inside <thinking>...</thinking> tags:
+IMPORTANT: You MUST begin every response by enclosing your full spatial reasoning
+inside <think> and </think> tags. Analyze:
   - What spatial information is needed to answer the question?
+  - What coordinate relationships, object positions, or occlusions are relevant?
   - What information is already visible in the provided images?
   - What is still missing or ambiguous?
-  - Would additional images help? If so, what kind?
+  - Would additional images help? If so, from what viewpoint?
 
-Then output your instructions inside <instructions>...</instructions> tags.
+Only after closing </think> should you output your instructions inside
+<instructions>...</instructions> tags.
 Each individual instruction goes inside an <instruction>...</instruction> tag.
 
 Rules for the instructions:
@@ -81,10 +86,12 @@ Rules for the instructions:
   - Do NOT include question text, answer choices, or meta-commentary.
 
 Example output format:
-<thinking>
+<think>
 The question asks what is behind the sofa. Images 1–4 show the front and sides
-but not the back wall. I need a view from behind the sofa facing toward the room.
-</thinking>
+but not the back wall. The X-axis offset between the sofa and the far wall is
+unclear from the current angles. I need a view from behind the sofa facing toward
+the room to reveal hidden geometry and resolve the occlusion.
+</think>
 <instructions>
 <instruction>A wide-angle view from behind the sofa, facing toward the center of the living room, revealing all objects between the sofa and the far wall.</instruction>
 <instruction>A top-down overhead view of the entire living room, showing the positions of all furniture relative to each other.</instruction>
@@ -121,7 +128,7 @@ class Config:
     """HuggingFace model path or local checkpoint directory."""
     model_type: str = "qwen-vl"
     """Model family: qwen-vl | qwen3-vl  (both use the same loading logic)."""
-    max_new_tokens: int = 512
+    max_new_tokens: int = 16384
     """Max tokens for the generation instruction output."""
     temperature: float = 0.7
     top_p: float = 0.9
@@ -136,6 +143,9 @@ class Config:
     # Output
     output_path: str = "results/image_instructions.jsonl"
     """Base output path (a timestamped sub-directory will be created beside it)."""
+
+    enable_thinking: bool = False
+    """Enable Qwen3.5 thinking mode (<think>...</think>). Default off for speed."""
 
     # Multi-GPU
     num_gpus: int = -1
@@ -338,38 +348,64 @@ DATASET_LOADERS = {
 
 def load_model_and_processor(model_path: str, model_type: str, device: str):
     """
-    Load Qwen3-VL or Qwen2.5-VL model and processor.
+    Load a Qwen multimodal model and processor.
 
-    Qwen3-VL (transformers >= 4.52) uses AutoModelForImageTextToText and
-    the `dtype` kwarg instead of the deprecated `torch_dtype`.
-    Qwen2.5-VL falls back to Qwen2_5_VLForConditionalGeneration.
+    Supports all Qwen VL generations (Qwen2-VL, Qwen2.5-VL, Qwen3-VL,
+    Qwen3.5, …) via AutoModelForImageTextToText.
+
+    For Qwen3.5 (hybrid linear-attention architecture):
+      - Standard transformer attention uses sdpa (FA2 causes cudaErrorIllegalAddress
+        at runtime, so it is intentionally skipped).
+      - Linear attention layers use flash-linear-attention automatically when
+        the library is installed (pip install flash-linear-attention).
+    All other models try FA2 first and fall back to sdpa on load-time errors.
     """
-    from transformers import AutoProcessor
+    from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
-    # AutoModelForImageTextToText is the correct class for Qwen3-VL
-    # (and also works for Qwen2.5-VL with recent transformers).
-    try:
-        from transformers import AutoModelForImageTextToText
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            dtype=torch.bfloat16,          # new API (transformers >= 4.52)
-            device_map=device,
-            attn_implementation="flash_attention_2",
-        )
-    except (ImportError, TypeError):
-        # Older transformers: fall back to Qwen2.5-VL class with torch_dtype
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-            attn_implementation="flash_attention_2",
-        )
+    cfg = AutoConfig.from_pretrained(model_path)
+    cfg_model_type = (cfg.model_type or "").lower()
+
+    # For Qwen3.5: sdpa only for transformer blocks; linear attention is handled
+    # by flash-linear-attention automatically (check and warn if missing).
+    if cfg_model_type == "qwen3_5":
+        attn_impls = ["sdpa"]
+        try:
+            import fla  # noqa: F401
+            print("[INFO] flash-linear-attention: available ✓ (linear-attn fast path active)")
+        except Exception as fla_exc:
+            print(
+                f"[WARN] flash-linear-attention import failed ({type(fla_exc).__name__}: {fla_exc}) "
+                "— Qwen3.5 linear-attention layers will use slow torch fallback. "
+                "Install with: pip install flash-linear-attention"
+            )
+    else:
+        attn_impls = ["flash_attention_2", "sdpa"]
+
+    last_exc = None
+    for attn_impl in attn_impls:
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_path,
+                dtype=torch.bfloat16,
+                device_map=device,
+                attn_implementation=attn_impl,
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            continue
+    else:
+        raise RuntimeError(
+            f"Failed to load model from {model_path}"
+        ) from last_exc
 
     processor = AutoProcessor.from_pretrained(model_path)
+    if processor.tokenizer.pad_token_id is None:
+        processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
     model.eval()
     print(f"[INFO] Model class  : {type(model).__name__}")
     print(f"[INFO] Model path   : {model_path}")
+    print(f"[INFO] Attn impl    : {attn_impl}")
     print(f"[INFO] Device map   : {model.hf_device_map if hasattr(model, 'hf_device_map') else device}")
     return model, processor
 
@@ -379,16 +415,23 @@ def load_model_and_processor(model_path: str, model_type: str, device: str):
 def parse_instructions(model_output: str) -> List[str]:
     """Extract the list of image-generation instructions from model output.
 
+    Strips any <think>...</think> CoT block first (Step B of CoT-GRPO), so that
+    only clean instruction text is forwarded to the Flux image generator.
     Parses <instruction>...</instruction> tags inside <instructions>...</instructions>.
     Returns an empty list when the model decides no additional images are needed.
     Silently caps the list at 5 entries.
     """
     import re
 
+    # Step B (CoT-GRPO): remove <think> block so Flux never sees reasoning text.
+    # The raw_output (including <think>) is preserved separately for GRPO training.
+    stripped = re.sub(r"<think>.*?</think>", "", model_output,
+                      flags=re.DOTALL | re.IGNORECASE)
+
     # Locate the <instructions> block
     block_match = re.search(
         r"<instructions>(.*?)</instructions>",
-        model_output,
+        stripped,
         re.DOTALL | re.IGNORECASE,
     )
     if not block_match:
@@ -429,9 +472,10 @@ def run_inference(
     """Run model inference and return generated text."""
     from qwen_vl_utils import process_vision_info
 
-    text_prompt = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    chat_template_kwargs = dict(tokenize=False, add_generation_prompt=True)
+    if hasattr(config, "enable_thinking"):
+        chat_template_kwargs["enable_thinking"] = config.enable_thinking
+    text_prompt = processor.apply_chat_template(messages, **chat_template_kwargs)
     image_inputs, video_inputs = process_vision_info(messages)
 
     inputs = processor(
@@ -450,6 +494,7 @@ def run_inference(
         temperature=config.temperature,
         top_p=config.top_p,
         use_cache=True,
+        pad_token_id=processor.tokenizer.eos_token_id,
     )
 
     with torch.no_grad():

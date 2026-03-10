@@ -52,10 +52,10 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 #  Shared model checkpoints
 # ══════════════════════════════════════════════════════════════════════════════
-PLANNER_MODEL="checkpoints/Qwen3-VL-4B-Instruct"
-CRITIC_MODEL="checkpoints/Qwen3-VL-8B-Instruct"
+PLANNER_MODEL="checkpoints/Qwen3.5-4B"
+CRITIC_MODEL="checkpoints/Qwen3.5-9B"
 FLUX_CKPT="checkpoints/flux2-klein-4B"
-EVAL_MODEL="checkpoints/Qwen3-VL-4B-Instruct"   # VQA judge for Step 4
+EVAL_MODEL="checkpoints/Qwen3.5-4B"   # VQA judge for Step 4
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Scale-specific config
@@ -232,7 +232,7 @@ if [[ "$RUN_STEPS" == "all" || "$RUN_STEPS" == "eval" ]]; then
     [[ "$EVAL_LIMIT" != "-1" ]] && LIMIT_ARG="--limit ${EVAL_LIMIT}"
 
     conda run --no-capture-output -n SPR python -u evaluation.py \
-        --model_type qwen3-vl \
+        --model_type qwen3.5 \
         --model_path "$EVAL_MODEL" \
         --data_dir   datasets/evaluation/MMSIBench \
         --gen_dir    "$GEN_DIR" \

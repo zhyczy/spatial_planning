@@ -2,9 +2,9 @@
 Iterative GRPO: Group Relative Policy Optimization for the spatial Planning Model.
 
 Architecture:
-  - Planning Model : Qwen3-VL-4B-Instruct  (trainable, LoRA)
+  - Planning Model : Qwen3.5-4B  (trainable, LoRA)
   - Executor       : Flux2Klein-4B          (frozen image generator)
-  - Critic / Judge : Qwen3-VL-8B            (frozen scorer)
+  - Critic / Judge : Qwen3.5-9B             (frozen scorer)
 
 Each iteration executes a closed loop:
   Step A  – On-policy rollout: sample G instruction sets per question (T=0.9)
@@ -40,8 +40,8 @@ Usage:
     --dataset sat \\
     --data_path datasets/evaluation/SAT/train_action_consequence.json \\
     --image_root datasets/evaluation/SAT \\
-    --planner_model_path checkpoints/Qwen3-VL-4B-Instruct \\
-    --critic_model_path  checkpoints/Qwen3-VL-8B-Instruct \\
+    --planner_model_path checkpoints/Qwen3.5-4B \\
+    --critic_model_path  checkpoints/Qwen3.5-9B \\
     --max_samples -1 \\
     --num_iterations 5
 
@@ -220,9 +220,12 @@ def build_grpo_dataset(
         for m, adv in zip(matched, advantages):
             example = {
                 "image": rec["image_paths"],
+                # raw_output contains the FULL model response including <think>
+                # reasoning tokens, so the advantage back-props through all of
+                # them (CoT-GRPO joint update).
                 "conversations": [
                     {"from": "system", "value": SYSTEM_PROMPT},
-                    {"from": "human", "value": user_content},
+                    {"from": "human",  "value": user_content},
                     {"from": "gpt",   "value": m["raw_output"]},
                 ],
                 "advantage": adv,
@@ -448,7 +451,7 @@ def parse_args():
 
     # ── Models ────────────────────────────────────────────────────────────
     parser.add_argument("--planner_model_path", type=str, required=True,
-                        help="Base Planning Model (Qwen3-VL-4B-Instruct).")
+                        help="Base Planning Model (Qwen3.5-4B).")
     parser.add_argument("--critic_model_path", type=str, default=None,
                         help="Frozen Critic MLLM (Qwen3-VL-8B). Defaults to planner.")
     parser.add_argument("--flux_ckpt", type=str, default="checkpoints/flux2-klein-4B",

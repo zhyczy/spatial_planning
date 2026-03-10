@@ -169,16 +169,30 @@ def load_model_and_processor(
     logger = logging.getLogger(__name__)
     logger.info(f"Loading model type='{model_type}' from '{model_path}' onto {device}")
 
-    if model_type in ("qwen2.5-vl", "qwen3-vl"):
+    if model_type in ("qwen2.5-vl", "qwen3-vl", "qwen3.5"):
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            dtype=torch.bfloat16,
-            device_map="cpu",
-            attn_implementation="flash_attention_2",
-            local_files_only=True,
-        )
+        attn_impls = ["flash_attention_2", "sdpa"]
+
+        last_exc = None
+        for attn_impl in attn_impls:
+            try:
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    device_map="cpu",
+                    attn_implementation=attn_impl,
+                    local_files_only=True,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                continue
+        else:
+            raise RuntimeError(
+                f"Failed to load model from {model_path}"
+            ) from last_exc
+
         model = model.to(device)
         processor = AutoProcessor.from_pretrained(
             model_path,
@@ -186,12 +200,12 @@ def load_model_and_processor(
         )
 
         model_device = next(model.parameters()).device
-        logger.info(f"Model loaded on device: {model_device}")
+        logger.info(f"Model loaded on device: {model_device} (attn={attn_impl})")
         return model, processor
 
     raise ValueError(
         f"Unknown model_type '{model_type}'. "
-        "Supported: 'qwen2.5-vl', 'qwen3-vl'"
+        "Supported: 'qwen2.5-vl', 'qwen3-vl', 'qwen3.5'"
     )
 
 
@@ -452,7 +466,7 @@ def main() -> None:
         "--model_type",
         type=str,
         default="qwen2.5-vl",
-        choices=["qwen2.5-vl", "qwen3-vl"],
+        choices=["qwen2.5-vl", "qwen3-vl", "qwen3.5"],
         help="Model family to use (default: qwen2.5-vl)",
     )
     parser.add_argument(
