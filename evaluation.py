@@ -711,6 +711,15 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Auto-scale max_new_tokens for thinking mode
+    _THINKING_MIN_TOKENS = 16384
+    if args.baseline_thinking and args.max_new_tokens < _THINKING_MIN_TOKENS:
+        print(
+            f"[INFO] baseline_thinking=True: auto-setting max_new_tokens "
+            f"{args.max_new_tokens} → {_THINKING_MIN_TOKENS}"
+        )
+        args.max_new_tokens = _THINKING_MIN_TOKENS
+
     # ---- Setup ----
     try:
         mp.set_start_method("spawn", force=True)
