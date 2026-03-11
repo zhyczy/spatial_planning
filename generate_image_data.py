@@ -1,5 +1,5 @@
 """
-Step 0: Automatically generate DPO preference pairs for the Planning Model.
+Step 0: Automatically generate GRPO preference pairs for the Planning Model.
 
 Pipeline overview:
   1. Rollout    – Sample K diverse instructions per (images, question) from the
@@ -14,11 +14,11 @@ Pipeline overview:
 Output:
   A JSON file where each entry has:
     { "image": [...], "prompt": "...", "chosen": "...", "rejected": "..." }
-  Ready for DPO training via train_planner.py.
+  Ready for GRPO training via train_planner.py.
 
 Usage:
   # End-to-end (rollout → generate → label → build pairs)
-  python generate_dpo_data.py \
+  python generate_GRPO_data.py \
     --dataset mmsibench \
     --data_path datasets/evaluation/MMSIBench/data/test_data_final.json \
     --image_root datasets/evaluation/MMSIBench \
@@ -27,10 +27,10 @@ Usage:
     --flux_ckpt checkpoints/flux2-klein-4B
 
   # Resume from existing rollout results
-  python generate_dpo_data.py --resume_from results/dpo_data/rollout_xxx/
+  python generate_GRPO_data.py --resume_from results/GRPO_data/rollout_xxx/
 
   # Quick test with 10 samples
-  python generate_dpo_data.py --dataset mmsibench ... --max_samples 10
+  python generate_GRPO_data.py --dataset mmsibench ... --max_samples 10
 """
 
 import argparse
@@ -118,25 +118,53 @@ Output ONLY a JSON object (no extra text):
 # ── Model loading helpers ─────────────────────────────────────────────────────
 
 def load_model_for_inference(model_path: str, device: str):
-    """Load a Qwen VL model for inference (planner or judge)."""
-    from transformers import AutoProcessor
+    """Load a Qwen multimodal model for inference (planner or judge).
 
-    try:
-        from transformers import AutoModelForImageTextToText
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            dtype=torch.bfloat16,
-            device_map=device,
-            attn_implementation="flash_attention_2",
-        )
-    except (ImportError, TypeError):
-        from transformers import Qwen2_5_VLForConditionalGeneration
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-            attn_implementation="flash_attention_2",
-        )
+    Detects vision capability via ``vision_config`` in AutoConfig, which covers
+    all Qwen VL generations (Qwen2-VL, Qwen2.5-VL, Qwen3.5, …) regardless of
+    whether "VL" appears in the architecture string.
+
+    FA2 is skipped for ``qwen3_5`` because its kernel loads without error but
+    crashes with ``cudaErrorIllegalAddress`` inside ``generate()`` at runtime.
+    All other models try FA2 first and fall back to sdpa on load-time errors.
+    """
+    from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+
+    cfg = AutoConfig.from_pretrained(model_path)
+    model_type = (cfg.model_type or "").lower()
+    # Presence of vision_config is the canonical VL signal, independent of name.
+    has_vision = getattr(cfg, "vision_config", None) is not None
+
+    # qwen3_5 FA2 kernels crash at generate() time, not at load time, so the
+    # try/except around from_pretrained can't catch them. Use sdpa directly.
+    attn_impls = ["sdpa"] if model_type == "qwen3_5" else ["flash_attention_2", "sdpa"]
+
+    last_exc = None
+    for attn_impl in attn_impls:
+        try:
+            if has_vision:
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_path,
+                    dtype=torch.bfloat16,
+                    device_map=device,
+                    attn_implementation=attn_impl,
+                )
+            else:
+                from transformers import AutoModelForCausalLM
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    dtype=torch.bfloat16,
+                    device_map=device,
+                    attn_implementation=attn_impl,
+                )
+            break
+        except Exception as exc:
+            last_exc = exc
+            continue
+    else:
+        raise RuntimeError(
+            f"Failed to load model from {model_path}"
+        ) from last_exc
 
     processor = AutoProcessor.from_pretrained(model_path)
     model.eval()
@@ -171,6 +199,7 @@ def generate_text(model, processor, messages, max_new_tokens=512,
             temperature=temperature,
             top_p=top_p,
             use_cache=True,
+            pad_token_id=processor.tokenizer.eos_token_id,
         )
 
     trimmed = [out[len(inp):] for inp, out in zip(inputs["input_ids"], generated_ids)]
@@ -208,6 +237,7 @@ def get_answer_logits(model, processor, messages, max_new_tokens=64):
             return_dict_in_generate=True,
             output_scores=True,
             use_cache=True,
+            pad_token_id=processor.tokenizer.eos_token_id,
         )
 
     generated_ids = outputs.sequences
@@ -320,6 +350,12 @@ def run_rollouts(samples, model_path, num_rollouts, output_dir, num_gpus):
         all_gpu_ids = [str(i) for i in range(n_available)]
     if num_gpus > 0:
         all_gpu_ids = all_gpu_ids[:num_gpus]
+    if not all_gpu_ids:
+        raise RuntimeError(
+            "No CUDA GPUs detected for rollouts. "
+            "Set CUDA_VISIBLE_DEVICES or ensure GPUs are available "
+            f"(torch.cuda.device_count()={n_available})."
+        )
 
     log_file = str(output_dir / "rollout.log")
     chunks = chunk_dataset(samples, len(all_gpu_ids))
@@ -464,6 +500,12 @@ def run_execution(rollout_records, flux_ckpt, output_dir, num_inference_steps, n
         all_gpu_ids = [str(i) for i in range(n_available)]
     if num_gpus > 0:
         all_gpu_ids = all_gpu_ids[:num_gpus]
+    if not all_gpu_ids:
+        raise RuntimeError(
+            "No CUDA GPUs detected for image generation. "
+            "Set CUDA_VISIBLE_DEVICES or ensure GPUs are available "
+            f"(torch.cuda.device_count()={n_available})."
+        )
 
     log_file = str(output_dir / "execution.log")
     chunks = chunk_dataset(tasks, len(all_gpu_ids))
@@ -690,6 +732,12 @@ def run_labeling(rollout_records, judge_model_path, gen_dir, scoring_method,
         all_gpu_ids = [str(i) for i in range(n_available)]
     if num_gpus > 0:
         all_gpu_ids = all_gpu_ids[:num_gpus]
+    if not all_gpu_ids:
+        raise RuntimeError(
+            "No CUDA GPUs detected for labeling. "
+            "Set CUDA_VISIBLE_DEVICES or ensure GPUs are available "
+            f"(torch.cuda.device_count()={n_available})."
+        )
 
     log_file = str(output_dir / "labeling.log")
     chunks = chunk_dataset(rollout_records, len(all_gpu_ids))
@@ -731,7 +779,7 @@ def run_labeling(rollout_records, judge_model_path, gen_dir, scoring_method,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STEP 4: Build DPO preference pairs
+#  STEP 4: Build GRPO preference pairs
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_preference_pairs(labeled_records: list, output_path: Path,
@@ -775,7 +823,7 @@ def build_preference_pairs(labeled_records: list, output_path: Path,
 
         if gap < min_score_gap:
             # Low gap but not identical — still use as weak signal
-            # (useful for on-policy iterative DPO where near-ties carry info)
+            # (useful for on-policy iterative GRPO where near-ties carry info)
             if gap > 0:
                 # Keep the pair but mark it as low-confidence
                 pass
@@ -809,7 +857,7 @@ def build_preference_pairs(labeled_records: list, output_path: Path,
         }
         pairs.append(pair)
 
-    # Save as JSON (compatible with Qwen-VL-Series-Finetune DPO format)
+    # Save as JSON (compatible with Qwen-VL-Series-Finetune GRPO format)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(pairs, f, indent=2, ensure_ascii=False)
 
@@ -828,7 +876,7 @@ def build_preference_pairs(labeled_records: list, output_path: Path,
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate DPO preference data for the spatial Planning Model."
+        description="Generate GRPO preference data for the spatial Planning Model."
     )
 
     # Dataset
@@ -866,7 +914,7 @@ def parse_args():
     parser.add_argument("--num_gpus", type=int, default=-1)
 
     # Output
-    parser.add_argument("--output_dir", type=str, default="results/dpo_data",
+    parser.add_argument("--output_dir", type=str, default="results/GRPO_data",
                         help="Root output directory.")
 
     # Resume
@@ -985,10 +1033,10 @@ def main():
 
     # ── Step 4: Build preference pairs ────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("STEP 4: Building DPO preference pairs")
+    logger.info("STEP 4: Building GRPO preference pairs")
     logger.info("=" * 60)
-    dpo_data_path = output_dir / "dpo_train.json"
-    pairs = build_preference_pairs(labeled_records, dpo_data_path, args.min_score_gap)
+    GRPO_data_path = output_dir / "GRPO_train.json"
+    pairs = build_preference_pairs(labeled_records, GRPO_data_path, args.min_score_gap)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     logger.info("=" * 60)
@@ -999,10 +1047,10 @@ def main():
     logger.info(f"  Scoring method          : {args.scoring_method}")
     logger.info(f"  Preference pairs        : {len(pairs)}")
     logger.info(f"  Output directory        : {output_dir}")
-    logger.info(f"  DPO training data       : {dpo_data_path}")
+    logger.info(f"  GRPO training data       : {GRPO_data_path}")
     logger.info(f"")
-    logger.info(f"Next step: run DPO training with:")
-    logger.info(f"  python train_planner.py --data_path {dpo_data_path} ...")
+    logger.info(f"Next step: run GRPO training with:")
+    logger.info(f"  python train_planner.py --data_path {GRPO_data_path} ...")
 
 
 if __name__ == "__main__":

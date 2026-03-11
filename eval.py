@@ -1,0 +1,913 @@
+"""
+Dual-method reasoning evaluation on MMSIBench using Wan2.1-VACE-14B video frames.
+
+For every question, runs TWO inference passes in a single GPU worker:
+
+  Method A – Baseline
+      Input: original QA images + question
+
+  Method B – Augmented
+      Input: original QA images + downsampled video frames
+             (frame_*.png from vid_*_frames/ under gen_dir/{sample_id}/)
+             + question
+      Falls back to Baseline input when no video frames exist for a sample.
+
+Both methods share the same model instance per GPU worker.
+
+Usage
+-----
+# Full pipeline (baseline vs video-augmented)
+python eval.py \\
+    --model_type  qwen3-vl \\
+    --model_path  checkpoints/Qwen3-VL-4B-Instruct \\
+    --data_dir    datasets/evaluation/MMSIBench \\
+    --gen_dir     generated_videos/mmsibench/<planning_model>/Wan2.1-VACE-14B
+
+# Baseline only (no gen_dir)
+python eval.py \\
+    --model_type  qwen3-vl \\
+    --model_path  checkpoints/Qwen3-VL-4B-Instruct \\
+    --data_dir    datasets/evaluation/MMSIBench
+
+# Smoke test
+python eval.py \\
+    --model_type  qwen3-vl \\
+    --model_path  checkpoints/Qwen3-VL-4B-Instruct \\
+    --data_dir    datasets/evaluation/MMSIBench \\
+    --gen_dir     generated_videos/mmsibench/<planning_model>/Wan2.1-VACE-14B \\
+    --limit 12
+
+# Multi-GPU
+CUDA_VISIBLE_DEVICES=0,1,2,3 python eval.py \\
+    --model_type  qwen3-vl \\
+    --model_path  checkpoints/Qwen3-VL-4B-Instruct \\
+    --data_dir    datasets/evaluation/MMSIBench \\
+    --gen_dir     generated_videos/mmsibench/<planning_model>/Wan2.1-VACE-14B
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import torch.multiprocessing as mp
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Prompt templates
+# ---------------------------------------------------------------------------
+QUESTION_TEMPLATE = "{Question}"
+ANSWER_INSTRUCTION = (
+    "Answer with the option's letter from the given choices directly. "
+    "Enclose the option's letter within ``."
+)
+# Prepended to the question when video frames are provided in the augmented path.
+VIDEO_FRAME_PREFIX = (
+    "The following images are uniformly sampled frames from a synthesized video "
+    "that depicts the spatial scene described in the question from different "
+    "viewpoints or at different times. "
+    "Use these frames together with the original images to reason about the question.\n"
+)
+
+
+# ===========================================================================
+# Dataset utilities
+# ===========================================================================
+
+def load_dataset(data_dir: Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Load MMSIBench dataset from *test_data_final.json*.
+
+    Image paths stored in the JSON (``local_images``) are relative to the
+    dataset root.  They are resolved to absolute paths here.
+    """
+    json_file = data_dir / "data" / "test_data_final.json"
+    if not json_file.exists():
+        raise FileNotFoundError(
+            f"Dataset file not found: {json_file}\n"
+            "Run datasets/evaluation/MMSIBench/download.py first."
+        )
+
+    with open(json_file, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    if limit is not None:
+        raw = raw[:limit]
+
+    dataset: List[Dict[str, Any]] = []
+    for item in raw:
+        local_images = item.get("local_images", [])
+        image_paths = [str((data_dir / p).resolve()) for p in local_images]
+        dataset.append({
+            "index": item.get("id", len(dataset)),
+            "image": image_paths,
+            "question": item.get("question", ""),
+            "answer": item.get("answer", ""),
+            "category": item.get("type", "unknown"),
+            "thought": item.get("thought_gt", ""),
+        })
+
+    return dataset
+
+
+def chunk_dataset(dataset: List[Dict], num_shards: int) -> List[List[Dict]]:
+    if num_shards <= 1:
+        return [dataset]
+    chunk_size = math.ceil(len(dataset) / num_shards)
+    return [dataset[s: s + chunk_size] for s in range(0, len(dataset), chunk_size)]
+
+
+def get_generated_frames(sample_index: int, gen_dir: Optional[Path]) -> List[str]:
+    """Return sorted list of downsampled frame paths for *sample_index*.
+
+    Looks for vid_*_frames/ subdirectories under gen_dir/{sample_index}/
+    and collects all frame_*.png files from them (sorted by directory name
+    then by file name).
+
+    Returns an empty list if gen_dir is None, the sub-folder doesn't exist,
+    or no vid_*_frames/ directories are found.
+    """
+    if gen_dir is None:
+        return []
+    sample_dir = gen_dir / str(sample_index)
+    if not sample_dir.is_dir():
+        return []
+
+    frames: List[str] = []
+    # Collect all vid_*_frames/ dirs, sorted by name (vid_0_frames, vid_1_frames, ...)
+    frame_dirs = sorted(
+        d for d in sample_dir.iterdir()
+        if d.is_dir() and d.name.endswith("_frames")
+    )
+    for frame_dir in frame_dirs:
+        pngs = sorted(
+            p for p in frame_dir.iterdir()
+            if p.suffix.lower() == ".png"
+        )
+        frames.extend(str(p) for p in pngs)
+
+    return frames
+
+
+# ===========================================================================
+# Answer extraction
+# ===========================================================================
+
+def extract_answer_letter(text: str) -> str:
+    """Extract the answer letter (A-D) from raw model output."""
+    if not text or not isinstance(text, str):
+        return ""
+
+    m = re.search(r"``([^`]*)``", text)
+    if m:
+        text = m.group(1)
+
+    m = re.search(r"`([^`]*)`", text)
+    if m:
+        text = m.group(1)
+
+    m = re.search(r"\b[A-D]\b(?!\s[a-zA-Z])", text)
+    if m:
+        return m.group()
+
+    return ""
+
+
+# ===========================================================================
+# Model loading
+# ===========================================================================
+
+def load_model_and_processor(
+    model_type: str,
+    model_path: str,
+    device: str = "cuda:0",
+) -> Tuple[Any, Any]:
+    """Load model and processor for the given *model_type*."""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Loading model type='{model_type}' from '{model_path}' onto {device}")
+
+    if model_type in ("qwen2.5-vl", "qwen3-vl", "qwen3.5"):
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        if model_type == "qwen3.5":
+            attn_impls = ["sdpa"]
+            try:
+                import fla  # noqa: F401
+                logger.info("flash-linear-attention: available ✓")
+            except Exception as fla_exc:
+                logger.warning(
+                    f"flash-linear-attention import failed ({type(fla_exc).__name__}: {fla_exc}) "
+                    "— using slow torch fallback."
+                )
+        else:
+            attn_impls = ["flash_attention_2", "sdpa"]
+
+        last_exc = None
+        for attn_impl in attn_impls:
+            try:
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_path,
+                    dtype=torch.bfloat16,
+                    device_map="cpu",
+                    attn_implementation=attn_impl,
+                    local_files_only=True,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                continue
+        else:
+            raise RuntimeError(f"Failed to load model from {model_path}") from last_exc
+
+        model = model.to(device)
+        processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
+
+        logger.info(
+            f"Model loaded on device: {next(model.parameters()).device} (attn={attn_impl})"
+        )
+        return model, processor
+
+    raise ValueError(
+        f"Unknown model_type '{model_type}'. "
+        "Supported: 'qwen2.5-vl', 'qwen3-vl', 'qwen3.5'"
+    )
+
+
+# ===========================================================================
+# Inference helpers
+# ===========================================================================
+
+def build_user_message(item: Dict[str, Any], extra_frames: List[str]) -> Dict:
+    """Build a Qwen-VL chat message.
+
+    Image order: original QA images → downsampled video frames → question text.
+    When video frames are present, a brief context sentence is prepended to the
+    question so the model understands the nature of the additional images.
+    """
+    all_images = item["image"] + extra_frames
+    image_contents = [{"type": "image", "image": p} for p in all_images]
+    question_text = QUESTION_TEMPLATE.format(Question=item["question"])
+    if extra_frames:
+        text = f"{VIDEO_FRAME_PREFIX}{question_text}\n{ANSWER_INSTRUCTION}"
+    else:
+        text = f"{question_text}\n{ANSWER_INSTRUCTION}"
+    return {"role": "user", "content": image_contents + [{"type": "text", "text": text}]}
+
+
+def prepare_batch(
+    batch_data: List[Dict],
+    extra_frames_list: List[List[str]],
+    processor: Any,
+) -> Tuple[Dict, List[str]]:
+    """Tokenise a batch. *extra_frames_list[i]* are the video frames for batch_data[i]."""
+    from qwen_vl_utils import process_vision_info
+
+    batch_messages = [
+        [build_user_message(item, frames)]
+        for item, frames in zip(batch_data, extra_frames_list)
+    ]
+
+    prompts_text = [
+        processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        for msgs in batch_messages
+    ]
+
+    all_image_inputs: List[Any] = []
+    all_video_inputs: List[Any] = []
+    for msgs in batch_messages:
+        imgs, vids = process_vision_info(msgs)
+        all_image_inputs.extend(imgs or [])
+        all_video_inputs.extend(vids or [])
+
+    batch_inputs = processor(
+        text=prompts_text,
+        images=all_image_inputs if all_image_inputs else None,
+        videos=all_video_inputs if all_video_inputs else None,
+        return_tensors="pt",
+        padding=True,
+        padding_side="left",
+    )
+    return batch_inputs, prompts_text
+
+
+def run_inference(
+    batch_inputs: Dict,
+    model: Any,
+    processor: Any,
+    max_new_tokens: int = 128,
+) -> List[str]:
+    """Run generation and return decoded strings."""
+    batch_inputs = {
+        k: v.to(model.device) if isinstance(v, torch.Tensor) else v
+        for k, v in batch_inputs.items()
+    }
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **batch_inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=processor.tokenizer.eos_token_id,
+        )
+
+    trimmed = [
+        out[len(inp):]
+        for inp, out in zip(batch_inputs["input_ids"], generated_ids)
+    ]
+    return processor.batch_decode(
+        trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+
+
+def postprocess(
+    batch_data: List[Dict],
+    outputs: List[str],
+    prompts: List[str],
+    extra_frames_list: List[List[str]],
+    method: str,
+) -> List[Dict]:
+    """Package raw outputs into result dicts."""
+    results = []
+    for item, output, prompt, frames in zip(batch_data, outputs, prompts, extra_frames_list):
+        results.append({
+            "method": method,
+            "index": item.get("index", ""),
+            "category": item.get("category", "unknown"),
+            "question": item.get("question", ""),
+            "answer": item.get("answer", ""),
+            "prediction": extract_answer_letter(output),
+            "output": output,
+            "thought_gt": item.get("thought", ""),
+            "original_images": item["image"],
+            "video_frames": frames,
+            "prompt": prompt,
+        })
+    return results
+
+
+def _error_result(item: Dict, exc: Exception, method: str, frames: List[str]) -> Dict:
+    return {
+        "method": method,
+        "index": item.get("index", ""),
+        "category": item.get("category", "unknown"),
+        "question": item.get("question", ""),
+        "answer": item.get("answer", ""),
+        "prediction": "",
+        "output": f"ERROR: {exc}",
+        "thought_gt": item.get("thought", ""),
+        "original_images": item.get("image", []),
+        "video_frames": frames,
+        "prompt": "",
+    }
+
+
+# ===========================================================================
+# Metrics
+# ===========================================================================
+
+def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
+    """Compute overall and per-category accuracy."""
+    total = len(results)
+    correct = 0
+    cat_correct: dict = defaultdict(int)
+    cat_total: dict = defaultdict(int)
+
+    for r in results:
+        pred = r.get("prediction", "").lower().strip()
+        gt = r.get("answer", "").lower().strip()
+        cat = r.get("category", "unknown")
+        cat_total[cat] += 1
+        if pred == gt:
+            correct += 1
+            cat_correct[cat] += 1
+
+    cat_accuracy = {cat: cat_correct[cat] / cat_total[cat] for cat in cat_total}
+    return {
+        "overall_accuracy": correct / total if total else 0.0,
+        "total_samples": total,
+        "correct_samples": correct,
+        "category_accuracy": cat_accuracy,
+        "category_counts": dict(cat_total),
+    }
+
+
+def log_metrics(metrics: Dict, label: str, logger: logging.Logger) -> None:
+    logger.info("=" * 60)
+    logger.info(f"RESULTS — {label}")
+    logger.info("=" * 60)
+    logger.info(f"  Total   : {metrics['total_samples']}")
+    logger.info(f"  Correct : {metrics['correct_samples']}")
+    logger.info(f"  Accuracy: {metrics['overall_accuracy']:.2%}")
+    logger.info("")
+    logger.info("  Per-category accuracy:")
+    for cat, acc in sorted(metrics["category_accuracy"].items()):
+        n = metrics["category_counts"].get(cat, 0)
+        logger.info(f"    {cat:35s}: {acc:6.2%}  ({n} samples)")
+    logger.info("=" * 60)
+
+
+# ===========================================================================
+# Core evaluation function (runs on one GPU)
+# ===========================================================================
+
+def evaluate(
+    data: List[Dict],
+    model_type: str,
+    model_path: str,
+    batch_size: int,
+    max_new_tokens: int,
+    gen_dir: Optional[Path],
+    output_path_baseline: Path,
+    output_path_augmented: Path,
+    device: str = "cuda:0",
+) -> Tuple[List[Dict], List[Dict]]:
+    """Run both methods for every sample in *data*.
+
+    Method A (Baseline): original QA images only.
+    Method B (Augmented): original QA images + downsampled video frames
+                          from vid_*_frames/ under gen_dir/{id}/.
+                          Falls back to baseline input when no frames exist.
+
+    The model is loaded once and reused for both passes.
+    Returns (baseline_results, augmented_results).
+    """
+    logger = logging.getLogger(__name__)
+
+    if batch_size != 1:
+        logger.warning("batch_size > 1 not supported; forcing to 1.")
+        batch_size = 1
+
+    model, processor = load_model_and_processor(model_type, model_path, device)
+
+    baseline_results: List[Dict] = []
+    augmented_results: List[Dict] = []
+
+    n_with_frames = sum(1 for item in data if get_generated_frames(item["index"], gen_dir))
+    logger.info(
+        f"[{device}] {len(data)} samples total; "
+        f"{n_with_frames} have video frames, "
+        f"{len(data) - n_with_frames} fall back to original QA images for augmented."
+    )
+
+    n_batches = math.ceil(len(data) / batch_size)
+    for i in tqdm(range(0, len(data), batch_size), total=n_batches, desc=f"[{device}]"):
+        batch_data = data[i: i + batch_size]
+
+        # ---- Method A: Baseline (original images only) ----
+        try:
+            no_extra = [[] for _ in batch_data]
+            b_inputs, b_prompts = prepare_batch(batch_data, no_extra, processor)
+            b_outputs = run_inference(b_inputs, model, processor, max_new_tokens)
+            baseline_results.extend(
+                postprocess(batch_data, b_outputs, b_prompts, no_extra, "baseline")
+            )
+        except Exception as exc:
+            logger.error(
+                f"[baseline] Error on idx={batch_data[0].get('index', '?')}: {exc}",
+                exc_info=True,
+            )
+            for item in batch_data:
+                baseline_results.append(_error_result(item, exc, "baseline", []))
+
+        # ---- Method B: Augmented (original images + video frames) ----
+        try:
+            frames_list = [
+                get_generated_frames(item["index"], gen_dir) for item in batch_data
+            ]
+            a_inputs, a_prompts = prepare_batch(batch_data, frames_list, processor)
+            a_outputs = run_inference(a_inputs, model, processor, max_new_tokens)
+            augmented_results.extend(
+                postprocess(batch_data, a_outputs, a_prompts, frames_list, "augmented")
+            )
+        except Exception as exc:
+            logger.error(
+                f"[augmented] Error on idx={batch_data[0].get('index', '?')}: {exc}",
+                exc_info=True,
+            )
+            for item, frames in zip(batch_data, frames_list):
+                augmented_results.append(_error_result(item, exc, "augmented", frames))
+
+    for path, results in [
+        (output_path_baseline, baseline_results),
+        (output_path_augmented, augmented_results),
+    ]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        logger.info(f"Saved {len(results)} results → {path}")
+
+    return baseline_results, augmented_results
+
+
+# ===========================================================================
+# Multi-GPU worker
+# ===========================================================================
+
+def _worker(
+    gpu_id: str,
+    data_shard: List[Dict],
+    model_type: str,
+    model_path: str,
+    batch_size: int,
+    max_new_tokens: int,
+    gen_dir: Optional[str],
+    out_baseline: Path,
+    out_augmented: Path,
+    log_file: Optional[str],
+) -> None:
+    """Entry point for each subprocess (one per GPU)."""
+    if log_file:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+            force=True,
+        )
+
+    logger = logging.getLogger(__name__)
+    device = f"cuda:{gpu_id}"
+    torch.cuda.set_device(int(gpu_id))
+
+    logger.info(f"[Worker {gpu_id}] Starting – {len(data_shard)} samples on {device}")
+    evaluate(
+        data_shard,
+        model_type,
+        model_path,
+        batch_size,
+        max_new_tokens,
+        Path(gen_dir) if gen_dir else None,
+        out_baseline,
+        out_augmented,
+        device,
+    )
+    logger.info(f"[Worker {gpu_id}] Done.")
+
+
+# ===========================================================================
+# Per-sample change analysis
+# ===========================================================================
+
+def analyze_changes(
+    baseline_results: List[Dict],
+    augmented_results: List[Dict],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """Categorise every sample into one of five mutually exclusive groups.
+
+    Groups
+    ------
+    degraded        Baseline correct, augmented wrong  (video frames hurt).
+    improved        Baseline wrong, augmented correct   (video frames helped).
+    correct_no_gen  Baseline correct, no video frames, augmented == baseline.
+    correct_with_gen Baseline correct, has video frames, augmented also correct.
+    always_wrong    Both baseline and augmented wrong.
+    """
+    aug_by_idx = {r["index"]: r for r in augmented_results}
+
+    groups: Dict[str, List[Dict]] = {
+        "degraded": [],
+        "improved": [],
+        "correct_no_gen": [],
+        "correct_with_gen": [],
+        "always_wrong": [],
+    }
+
+    for b in baseline_results:
+        idx = b["index"]
+        a = aug_by_idx.get(idx)
+        if a is None:
+            logger.warning(f"No augmented result found for index {idx}, skipping.")
+            continue
+
+        b_correct = b.get("prediction", "").lower().strip() == b.get("answer", "").lower().strip()
+        a_correct = a.get("prediction", "").lower().strip() == a.get("answer", "").lower().strip()
+        has_frames = bool(a.get("video_frames"))
+
+        entry = {
+            "index": idx,
+            "category": b.get("category", "unknown"),
+            "question": b.get("question", ""),
+            "answer": b.get("answer", ""),
+            "baseline_prediction": b.get("prediction", ""),
+            "augmented_prediction": a.get("prediction", ""),
+            "baseline_output": b.get("output", ""),
+            "augmented_output": a.get("output", ""),
+            "video_frames": a.get("video_frames", []),
+        }
+
+        if b_correct and not a_correct:
+            groups["degraded"].append(entry)
+        elif not b_correct and a_correct:
+            groups["improved"].append(entry)
+        elif b_correct and not has_frames:
+            groups["correct_no_gen"].append(entry)
+        elif b_correct and has_frames and a_correct:
+            groups["correct_with_gen"].append(entry)
+        else:
+            groups["always_wrong"].append(entry)
+
+    total = sum(len(v) for v in groups.values())
+    counts = {k: len(v) for k, v in groups.items()}
+    proportions = {k: len(v) / total if total else 0.0 for k, v in groups.items()}
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("PER-SAMPLE CHANGE ANALYSIS")
+    logger.info("=" * 60)
+    descriptions = {
+        "degraded":        "Baseline ✓ → Augmented ✗  (video frames hurt)",
+        "improved":        "Baseline ✗ → Augmented ✓  (video frames helped)",
+        "correct_no_gen":  "Baseline ✓, no video frames, Augmented ✓",
+        "correct_with_gen": "Baseline ✓, has video frames, Augmented ✓",
+        "always_wrong":    "Baseline ✗ & Augmented ✗  (both wrong)",
+    }
+    for key, desc in descriptions.items():
+        n = counts[key]
+        pct = proportions[key]
+        logger.info(f"  {desc:<52s}: {n:4d}  ({pct:.1%})")
+    logger.info(f"  {'Total':<52s}: {total:4d}")
+    logger.info("=" * 60)
+
+    return {
+        "total": total,
+        "counts": counts,
+        "proportions": proportions,
+        "descriptions": descriptions,
+        "samples": {k: v for k, v in groups.items()},
+    }
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Dual-method reasoning evaluation on MMSIBench (baseline vs video-augmented). "
+            "Baseline: original QA images only. "
+            "Augmented: original QA images + downsampled video frames from gen_dir."
+        )
+    )
+    # Model
+    parser.add_argument("--model_type", type=str, default="qwen3-vl",
+
+                        choices=["qwen2.5-vl", "qwen3-vl", "qwen3.5"])
+    parser.add_argument("--model_path", type=str, required=True)
+    # Data
+    parser.add_argument("--data_dir", type=str,
+                        default="datasets/evaluation/MMSIBench")
+    parser.add_argument(
+        "--gen_dir", type=str, default=None,
+        help=(
+            "Root of generated videos, e.g. "
+            "generated_videos/mmsibench/<planning_model>/Wan2.1-VACE-14B. "
+            "Expects sub-folder per sample id containing vid_*_frames/ directories "
+            "with frame_*.png files produced by generate_video_data.py."
+        ),
+    )
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Cap number of samples (useful for smoke tests).")
+    # Inference
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--max_new_tokens", type=int, default=128)
+    # Output
+    parser.add_argument("--output_dir", type=str, default="results/mmsibench")
+    parser.add_argument("--model_name", type=str, default=None,
+                        help="Sub-folder name for this run (default: model_type).")
+    parser.add_argument("--gen_model_name", type=str, default=None,
+                        help="Human-readable name for the video generation model "
+                             "(defaults to the last path component of --gen_dir).")
+
+    args = parser.parse_args()
+
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = args.model_name or args.model_type
+    experiment_name = f"{model_name}_{timestamp}"
+    output_dir = Path(args.output_dir).resolve() / model_name / experiment_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = output_dir / "run.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+    )
+    logger = logging.getLogger(__name__)
+
+    # ---- Load dataset ----
+    data_dir = Path(args.data_dir).resolve()
+    dataset = load_dataset(data_dir, limit=args.limit)
+
+    # ---- Resolve gen_dir ----
+    gen_dir: Optional[Path] = None
+    if args.gen_dir:
+        gen_dir = Path(args.gen_dir)
+        if not gen_dir.is_absolute():
+            gen_dir = Path.cwd() / gen_dir
+        gen_dir = gen_dir.resolve()
+        if not gen_dir.exists():
+            logger.warning(
+                f"gen_dir does not exist: {gen_dir}. "
+                "Augmented method will be identical to baseline."
+            )
+
+    # ---- GPU setup ----
+    n_gpu = torch.cuda.device_count()
+    if n_gpu <= 0:
+        raise RuntimeError("At least one CUDA device is required.")
+
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    gpu_ids = (
+        [x.strip() for x in cuda_visible.split(",") if x.strip()]
+        if cuda_visible
+        else [str(i) for i in range(n_gpu)]
+    )
+
+    n_with_frames = sum(
+        1 for item in dataset if get_generated_frames(item["index"], gen_dir)
+    )
+
+    if args.gen_model_name:
+        gen_model_display = args.gen_model_name
+    elif gen_dir is not None:
+        gen_model_display = gen_dir.name
+    else:
+        gen_model_display = "(none — augmented = baseline)"
+
+    planning_model_path = Path(args.model_path).resolve()
+    planning_model_display = args.model_name or planning_model_path.name
+
+    logger.info("=" * 60)
+    logger.info("EVALUATION CONFIGURATION")
+    logger.info("=" * 60)
+    logger.info("")
+    logger.info("  [Reasoning model]")
+    logger.info(f"    model_name     : {planning_model_display}")
+    logger.info(f"    model_type     : {args.model_type}")
+    logger.info(f"    model_path     : {planning_model_path}")
+    logger.info(f"    max_new_tokens : {args.max_new_tokens}")
+    logger.info(f"    batch_size     : {args.batch_size}")
+    logger.info("")
+    logger.info("  [Video generation model — augmented input]")
+    logger.info(f"    gen_model_name : {gen_model_display}")
+    logger.info(f"    gen_dir        : {gen_dir}")
+    logger.info("")
+    logger.info("  [Dataset]")
+    logger.info(f"    data_dir       : {data_dir}")
+    logger.info(f"    samples        : {len(dataset)}")
+    logger.info(f"    w/ video frames: {n_with_frames} / {len(dataset)}")
+    logger.info("")
+    logger.info("  [Runtime]")
+    logger.info(f"    GPUs           : {gpu_ids}")
+    logger.info(f"    output_dir     : {output_dir}")
+    logger.info(f"    log_file       : {log_file}")
+    logger.info("")
+    logger.info("=" * 60)
+
+    # ---- Save configuration.json ----
+    config_record = {
+        "reasoning_model": {
+            "model_name": planning_model_display,
+            "model_type": args.model_type,
+            "model_path": str(planning_model_path),
+            "max_new_tokens": args.max_new_tokens,
+            "batch_size": args.batch_size,
+        },
+        "generation_model": {
+            "gen_model_name": gen_model_display,
+            "gen_dir": str(gen_dir) if gen_dir else None,
+        },
+        "dataset": {
+            "data_dir": str(data_dir),
+            "limit": args.limit,
+            "total_samples": len(dataset),
+            "samples_with_video_frames": n_with_frames,
+        },
+        "runtime": {
+            "gpus": gpu_ids,
+            "output_dir": str(output_dir),
+            "log_file": str(log_file),
+            "timestamp": timestamp,
+        },
+    }
+    config_path = output_dir / "configuration.json"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config_record, f, indent=2, ensure_ascii=False)
+    logger.info(f"Configuration saved → {config_path}")
+
+    # ---- Launch workers ----
+    shards = chunk_dataset(dataset, len(gpu_ids))
+    out_baseline_paths: List[Path] = []
+    out_augmented_paths: List[Path] = []
+    processes: List[mp.Process] = []
+
+    for gpu_id, shard in zip(gpu_ids, shards):
+        ob = output_dir / f"baseline_gpu{gpu_id}.json"
+        oa = output_dir / f"augmented_gpu{gpu_id}.json"
+        out_baseline_paths.append(ob)
+        out_augmented_paths.append(oa)
+
+        p = mp.Process(
+            target=_worker,
+            args=(
+                gpu_id, shard,
+                args.model_type, args.model_path,
+                args.batch_size, args.max_new_tokens,
+                str(gen_dir) if gen_dir else None,
+                ob, oa,
+                str(log_file),
+            ),
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    # ---- Merge results ----
+    logger.info("Merging results from all workers…")
+
+    def merge(paths: List[Path]) -> List[Dict]:
+        merged = []
+        for path in paths:
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    merged.extend(json.load(f))
+            else:
+                logger.warning(f"Missing worker output: {path}")
+        merged.sort(key=lambda r: r.get("index", 0))
+        return merged
+
+    baseline_all = merge(out_baseline_paths)
+    augmented_all = merge(out_augmented_paths)
+
+    # ---- Compute & log metrics ----
+    metrics_baseline = compute_metrics(baseline_all)
+    metrics_augmented = compute_metrics(augmented_all)
+
+    log_metrics(metrics_baseline, "BASELINE  (original QA images only)", logger)
+    log_metrics(metrics_augmented, "AUGMENTED (original QA images + video frames)", logger)
+
+    # Side-by-side summary
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("SUMMARY COMPARISON")
+    logger.info("=" * 60)
+    logger.info(f"  {'Method':<48} {'Accuracy':>8}  {'Correct':>8} / Total")
+    logger.info(f"  {'-'*48}  {'-'*8}  {'-'*14}")
+    logger.info(
+        f"  {'Baseline  (original QA images only)':<48} "
+        f"{metrics_baseline['overall_accuracy']:>8.2%}  "
+        f"{metrics_baseline['correct_samples']:>8} / {metrics_baseline['total_samples']}"
+    )
+    logger.info(
+        f"  {'Augmented (original QA + video frames)':<48} "
+        f"{metrics_augmented['overall_accuracy']:>8.2%}  "
+        f"{metrics_augmented['correct_samples']:>8} / {metrics_augmented['total_samples']}"
+    )
+    logger.info("=" * 60)
+
+    # ---- Save outputs ----
+    with open(output_dir / "eval_result_baseline.json", "w", encoding="utf-8") as f:
+        json.dump(baseline_all, f, ensure_ascii=False, indent=2)
+    with open(output_dir / "eval_result_augmented.json", "w", encoding="utf-8") as f:
+        json.dump(augmented_all, f, ensure_ascii=False, indent=2)
+    with open(output_dir / "metrics_baseline.json", "w", encoding="utf-8") as f:
+        json.dump(metrics_baseline, f, ensure_ascii=False, indent=2)
+    with open(output_dir / "metrics_augmented.json", "w", encoding="utf-8") as f:
+        json.dump(metrics_augmented, f, ensure_ascii=False, indent=2)
+
+    comparison = {
+        "baseline": metrics_baseline,
+        "augmented": metrics_augmented,
+        "delta_overall_accuracy": (
+            metrics_augmented["overall_accuracy"] - metrics_baseline["overall_accuracy"]
+        ),
+    }
+    with open(output_dir / "metrics_comparison.json", "w", encoding="utf-8") as f:
+        json.dump(comparison, f, ensure_ascii=False, indent=2)
+
+    # ---- Per-sample change analysis ----
+    analysis = analyze_changes(baseline_all, augmented_all, logger)
+    with open(output_dir / "analysis_changes.json", "w", encoding="utf-8") as f:
+        json.dump(analysis, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"All results saved to: {output_dir}")
+    logger.info("Done.")
+
+
+if __name__ == "__main__":
+    main()

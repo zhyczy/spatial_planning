@@ -7,8 +7,8 @@ Architecture:
   - Critic / Judge : Qwen3.5-9B             (frozen scorer)
 
 Each iteration executes a closed loop:
-  Step A  – On-policy rollout: sample G instruction sets per question (T=0.9)
-  Step B  – Execution: generate images from instructions via Flux2Klein (multi-GPU)
+  Step A  – On-policy rollout: sample G video-generation prompts per question (T=0.9)
+  Step B  – Execution: generate videos from prompts via video generation model (multi-GPU)
   Step C  – Labeling: score generated images with Critic (multi-GPU)
   Step D  – GRPO Dataset: normalize rewards → advantages, flatten to training examples
   Step E  – GRPO Training: advantage-weighted policy gradient via train_planner_grpo.py
@@ -69,12 +69,12 @@ import torch
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from generate_dpo_data import (
+from spatial_planning.generate_image_data import (
     run_execution,
     run_labeling,
     run_rollouts,
 )
-from generate_image_instructions import DATASET_LOADERS, chunk_dataset
+from instruction_generation import DATASET_LOADERS, chunk_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ def build_grpo_dataset(
           image, conversations, advantage, group_id
     """
     # Import the system prompt used during rollout (must match training prompt)
-    from generate_image_instructions import SYSTEM_PROMPT
+    from instruction_generation import SYSTEM_PROMPT
 
     examples = []
     skipped_no_rollouts = 0
@@ -221,8 +221,9 @@ def build_grpo_dataset(
             example = {
                 "image": rec["image_paths"],
                 # raw_output contains the FULL model response including <think>
-                # reasoning tokens, so the advantage back-props through all of
-                # them (CoT-GRPO joint update).
+                # reasoning tokens and exactly one <instruction> (video-generation
+                # prompt), so the advantage back-props through all of them
+                # (CoT-GRPO joint update).
                 "conversations": [
                     {"from": "system", "value": SYSTEM_PROMPT},
                     {"from": "human",  "value": user_content},
@@ -785,7 +786,7 @@ def main():
     logger.info(f"  Run directory        : {run_dir}")
     logger.info("")
     logger.info("  Next step: evaluate the fine-tuned planner:")
-    logger.info(f"    python generate_image_instructions.py \\")
+    logger.info(f"    python instruction_generation.py \\")
     logger.info(f"      --model_path {current_model_path} \\")
     logger.info(f"      --dataset mmsibench ...")
     logger.info("=" * 70)

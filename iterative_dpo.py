@@ -60,7 +60,7 @@ import torch
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from generate_dpo_data import (
+from spatial_planning.generate_image_data import (
     build_preference_pairs,
     run_execution,
     run_labeling,

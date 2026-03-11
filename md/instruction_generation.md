@@ -1,6 +1,6 @@
 # Spatial Planning — Visual Instruction Generation
 
-This module uses a vision-language model (Qwen3-VL / Qwen2.5-VL) as a **planning model**: given the existing images and a spatial reasoning question, it decides whether additional images need to be generated, and if so, outputs a set of targeted image-generation instructions.
+This module uses a vision-language model (Qwen3-VL / Qwen2.5-VL) as a **planning model**: given the existing images and a spatial reasoning question, it decides whether a video clip needs to be generated, and if so, outputs **exactly one** video-generation description — the one the model judges will best help the downstream reasoning model.
 
 ---
 
@@ -8,7 +8,7 @@ This module uses a vision-language model (Qwen3-VL / Qwen2.5-VL) as a **planning
 
 ```
 spatial_planning/
-├── generate_image_instructions.py   # main pipeline (multi-GPU)
+├── instruction_generation.py        # main pipeline (multi-GPU)
 ├── scripts/
 │   └── run_generate_instructions.sh # convenience bash wrapper
 ├── checkpoints/
@@ -32,13 +32,13 @@ For each sample the model receives:
 It responds in two structured sections:
 
 ```xml
-<thinking>
+<think>
   Step-by-step reasoning about what spatial information is visible,
-  what is missing, and whether additional images would help.
-</thinking>
+  what is missing, whether a video would help, and which single video
+  description would best aid the downstream reasoning model.
+</think>
 <instructions>
-  <instruction>A top-down view of the room showing all furniture positions.</instruction>
-  <instruction>A view from behind the sofa facing toward the entrance door.</instruction>
+  <instruction>A slow forward dolly shot starting from directly behind the sofa, moving toward the center of the living room, revealing all objects between the sofa and the far wall.</instruction>
 </instructions>
 ```
 
@@ -46,20 +46,20 @@ It responds in two structured sections:
 | Case | Output |
 |---|---|
 | Existing images are sufficient | `<instructions></instructions>` → `"instructions": []` |
-| Extra images needed | 1–5 `<instruction>` entries, each a standalone image-generation prompt |
+| Extra visual information needed | **Exactly 1** `<instruction>` — the single video-generation prompt the model judges most helpful |
 
-Each instruction targets a specific type of missing visual information:
-- **Viewpoint change** — different camera angle / position
-- **Occlusion removal** — view from direction where object is not blocked
-- **Wider context** — wider field-of-view to reveal spatial relationships
-- **Zoom / detail** — closer view to disambiguate object identity or state
+The instruction describes a video that captures missing spatial information, e.g.:
+- **Camera movement** — dolly, pan, or flythrough to reveal hidden geometry
+- **Occlusion removal** — a trajectory where the object is unblocked
+- **Spatial traversal** — slow pan or dolly that clarifies distances and positions
+- **Sweeping context** — wide shot revealing overall spatial relationships
 
 ---
 
 ## Setup
 
 ```bash
-conda activate SPR
+conda activate spi
 cd /egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning
 ```
 
@@ -103,7 +103,7 @@ Supported `DATASET` values: `mindcube` | `sat` | `vsibench` | `mmsibench`
 ### Option 2 — Direct Python
 
 ```bash
-python generate_image_instructions.py \
+python instruction_generation.py \
   --dataset      mmsibench \
   --data_path    datasets/evaluation/MMSIBench/data/test_data_final.json \
   --image_root   datasets/evaluation/MMSIBench \
@@ -174,26 +174,25 @@ Each line of `results.jsonl` is a JSON object:
   "question": "In which direction are you moving?",
   "image_paths": ["/abs/path/sample_0_img_0.jpg", "..."],
   "gt_answer": "C",
-  "raw_output": "<thinking>...</thinking>\n<instructions>...</instructions>",
+  "raw_output": "<think>...</think>\n<instructions>...</instructions>",
   "instructions": [
-    "A view from the left side of the hallway showing the starting position.",
-    "A view from the right side showing the final position and direction of movement."
+    "A slow forward dolly shot starting from behind the hallway entrance, moving toward the far end, clearly showing the direction of travel."
   ],
-  "num_instructions": 2,
+  "num_instructions": 1,
   "meta": {}
 }
 ```
 
-- `instructions` — list of image-generation prompts (empty list = no extra images needed)
-- `num_instructions` — length of `instructions` (0–5)
-- `raw_output` — full model output including `<thinking>` reasoning
+- `instructions` — list of length 0 or 1: empty = no video needed; one entry = the video-generation prompt
+- `num_instructions` — 0 or 1
+- `raw_output` — full model output including `<think>` reasoning
 
 ---
 
 ## Quick Test
 
 ```bash
-conda activate SPR
+conda activate spi
 cd /egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning
 
 CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_generate_instructions.sh \
@@ -207,9 +206,8 @@ CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_generate_instructions.sh \
 Expected output (4 samples, ~15s total):
 ```
 [1/2] id=0  (3.4s)
-  Instructions : 2
-  [1] A view from the left side of the hallway ...
-  [2] A view from the right side of the hallway ...
+  Instructions : 1
+  [1] A slow forward dolly shot starting from behind the hallway entrance ...
 
 [2/2] id=1  (2.0s)
   Instructions : 0

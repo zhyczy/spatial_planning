@@ -28,6 +28,7 @@ Both methods share the same loaded model instance per GPU, so the model is loade
 |---|---|
 | `qwen2.5-vl` | Qwen2.5-VL (e.g. 3B, 7B, 72B) |
 | `qwen3-vl` | Qwen3-VL (e.g. 4B, 8B) |
+| `qwen3.5`  | Qwen3.5 (e.g. 4B, 9B) |
 
 Both use `AutoModelForImageTextToText` + `AutoProcessor`, so the correct architecture is selected automatically from the checkpoint config.
 
@@ -40,7 +41,7 @@ Both use `AutoModelForImageTextToText` + `AutoProcessor`, so the correct archite
 | `--model_type` | `qwen2.5-vl` | Model family (`qwen2.5-vl` or `qwen3-vl`) |
 | `--model_path` | *(required)* | Path to the model checkpoint directory |
 | `--data_dir` | `datasets/evaluation/MMSIBench` | Root directory of the MMSIBench dataset |
-| `--gen_dir` | `None` | Root directory of generated images. Sub-folder per sample index (e.g. `{gen_dir}/0/img_0.png`). If `None` or folder missing, augmented = baseline. |
+| `--gen_dir` | `None` | Root directory of generated video frames. Sub-folder per sample index (e.g. `{gen_dir}/0/vid_0_frames/frame_000.png`). If `None` or folder missing, augmented = baseline. |
 | `--limit` | `None` | Cap the number of samples (useful for smoke tests) |
 | `--batch_size` | `1` | Inference batch size (forced to 1 for variable-length multi-image inputs) |
 | `--max_new_tokens` | `128` | Maximum tokens to generate per sample |
@@ -53,11 +54,11 @@ Both use `AutoModelForImageTextToText` + `AutoProcessor`, so the correct archite
 ## Quick start
 
 ```bash
-conda activate SPR
+conda activate spi
 bash scripts/run_evaluation.sh
 ```
 
-This uses all default values: model `qwen3-vl`, checkpoint `checkpoints/Qwen3-VL-4B-Instruct`, generated images from `generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B`, output to `results/mmsibench`.
+This uses all default values: model `qwen3-vl`, checkpoint `checkpoints/Qwen3-VL-4B-Instruct`, generated video frames from `generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B`, output to `results/mmsibench`.
 
 ---
 
@@ -77,7 +78,7 @@ All three positional arguments are optional — defaults are used when omitted.
 |---|---|---|
 | 1 | `MODEL_TYPE` | `qwen3-vl` |
 | 2 | `MODEL_PATH` | `checkpoints/Qwen3-VL-4B-Instruct` |
-| 3 | `GEN_DIR` | `generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B` |
+| 3 | `GEN_DIR` | `generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B` |
 
 Any arguments after position 3 are forwarded directly to `evaluation.py` (e.g. `--limit`, `--max_new_tokens`).
 
@@ -94,20 +95,20 @@ bash scripts/run_evaluation.sh qwen3-vl checkpoints/Qwen3-VL-4B-Instruct
 bash scripts/run_evaluation.sh \
     qwen3-vl \
     checkpoints/Qwen3-VL-4B-Instruct \
-    generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B
+    generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B
 
 # Smoke test (12 samples)
 bash scripts/run_evaluation.sh \
     qwen3-vl \
     checkpoints/Qwen3-VL-4B-Instruct \
-    generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B \
+    generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B \
     --limit 12
 
 # Restrict to specific GPUs
 CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_evaluation.sh \
     qwen3-vl \
     checkpoints/Qwen3-VL-4B-Instruct \
-    generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B
+    generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B
 ```
 
 ---
@@ -117,44 +118,44 @@ CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_evaluation.sh \
 ### Smoke test (12 samples)
 
 ```bash
-conda run -n SPR python evaluation.py \
+conda run -n spi python evaluation.py \
     --model_type qwen3-vl \
     --model_path checkpoints/Qwen3-VL-4B-Instruct \
     --data_dir   datasets/evaluation/MMSIBench \
-    --gen_dir    generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B \
+    --gen_dir    generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B \
     --limit 12
 ```
 
 ### Full evaluation, all 6 GPUs
 
 ```bash
-conda run -n SPR python evaluation.py \
+conda run -n spi python evaluation.py \
     --model_type qwen3-vl \
     --model_path checkpoints/Qwen3-VL-4B-Instruct \
     --data_dir   datasets/evaluation/MMSIBench \
-    --gen_dir    generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B
+    --gen_dir    generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B
 ```
 
 ### Restrict to specific GPUs
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 conda run -n SPR python evaluation.py \
+CUDA_VISIBLE_DEVICES=0,1 conda run -n spi python evaluation.py \
     --model_type qwen2.5-vl \
     --model_path checkpoints/Qwen2.5-VL-3B-Instruct \
     --data_dir   datasets/evaluation/MMSIBench \
-    --gen_dir    generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B
+    --gen_dir    generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B
 ```
 
 ### Custom output folder name
 
 ```bash
-conda run -n SPR python evaluation.py \
+conda run -n spi python evaluation.py \
     --model_type  qwen3-vl \
     --model_path  checkpoints/Qwen3-VL-4B-Instruct \
     --data_dir    datasets/evaluation/MMSIBench \
-    --gen_dir     generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B \
+    --gen_dir     generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B \
     --output_dir  results/mmsibench \
-    --model_name  Qwen3-VL-4B-flux2-klein-4B
+    --model_name  Qwen3-VL-4B-Wan2.1-VACE-14B
 ```
 
 ### Baseline only (no generated images)
@@ -162,7 +163,7 @@ conda run -n SPR python evaluation.py \
 Omit `--gen_dir`; augmented method will be identical to baseline.
 
 ```bash
-conda run -n SPR python evaluation.py \
+conda run -n spi python evaluation.py \
     --model_type qwen3-vl \
     --model_path checkpoints/Qwen3-VL-4B-Instruct \
     --data_dir   datasets/evaluation/MMSIBench
@@ -170,22 +171,27 @@ conda run -n SPR python evaluation.py \
 
 ---
 
-## Generated images directory structure
+## Generated video frames directory structure
 
-`--gen_dir` must follow this layout (produced by `image_generation.py`):
+`--gen_dir` must follow this layout (produced by `generate_video_data.py`):
 
 ```
 gen_dir/
 ├── 0/
-│   └── img_0.png          # one or more generated images for sample id=0
+│   ├── vid_0.mp4              # complete video (80 frames, 5s, 480p)
+│   ├── vid_0_frames/          # downsampled frames (1 middle frame per 10-frame segment = 8 frames)
+│   │   ├── frame_000.png
+│   │   ├── frame_001.png
+│   │   └── ...
+│   ├── vid_1.mp4
+│   ├── vid_1_frames/
+│   └── ...
 ├── 1/
-│   ├── img_0.png
-│   └── img_1.png
-├── 2/                     # empty folder → no generation needed → falls back to baseline
+├── 2/                         # empty folder → no generation needed → falls back to baseline
 └── ...
 ```
 
-The sub-folder name is the integer sample `id` from the dataset JSON. Images are loaded in sorted filename order and appended after the original dataset images.
+The sub-folder name is the integer sample `id` from the dataset JSON. Evaluation reads `frame_*.png` from each `vid_{idx}_frames/` directory (sorted order) and appends them after the original dataset images.
 
 ---
 
@@ -227,9 +233,9 @@ EVALUATION CONFIGURATION
     max_new_tokens : 128
     batch_size     : 1
 
-  [Generation model — augmented images]
-    gen_model_name : flux2-klein-4B
-    gen_dir        : /abs/path/generated_images/mmsibench/.../flux2-klein-4B
+  [Generation model — augmented video frames]
+    gen_model_name : Wan2.1-VACE-14B
+    gen_dir        : /abs/path/generated_videos/mmsibench/.../Wan2.1-VACE-14B
 
   [Dataset]
     data_dir       : /abs/path/datasets/evaluation/MMSIBench
@@ -270,8 +276,8 @@ Saved immediately after the config header is logged, before any inference starts
     "batch_size": 1
   },
   "generation_model": {
-    "gen_model_name": "flux2-klein-4B",
-    "gen_dir": "/abs/path/generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B"
+    "gen_model_name": "Wan2.1-VACE-14B",
+    "gen_dir": "/abs/path/generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B"
   },
   "dataset": {
     "data_dir": "/abs/path/datasets/evaluation/MMSIBench",
@@ -305,12 +311,12 @@ One entry per sample:
   "output": "``C``",
   "thought_gt": "...",
   "original_images": ["/abs/path/img_0.jpg", "/abs/path/img_1.jpg"],
-  "generated_images": ["/abs/path/gen/0/img_0.png"],
+  "generated_images": ["/abs/path/gen/0/vid_0_frames/frame_000.png", "/abs/path/gen/0/vid_0_frames/frame_001.png"],
   "prompt": "<|im_start|>user\n..."
 }
 ```
 
-`generated_images` is `[]` for baseline entries and for augmented entries where no generation was produced.
+`generated_images` is `[]` for baseline entries and for augmented entries where no generation (video frames) was produced.
 
 ---
 
@@ -392,7 +398,7 @@ Per-sample breakdown into **5 mutually exclusive groups**:
         "augmented_prediction": "B",
         "baseline_output": "...",
         "augmented_output": "...",
-        "generated_images": ["/abs/path/gen/1/img_0.png"]
+        "generated_images": ["/abs/path/gen/1/vid_0_frames/frame_000.png", "/abs/path/gen/1/vid_0_frames/frame_001.png"]
       }
     ],
     "degraded": [],
@@ -415,5 +421,5 @@ CUDA_VISIBLE_DEVICES=0,1 python evaluation.py \
     --model_type qwen3-vl \
     --model_path checkpoints/Qwen3-VL-4B-Instruct \
     --data_dir   datasets/evaluation/MMSIBench \
-    --gen_dir    generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B
+    --gen_dir    generated_videos/mmsibench/Qwen3-VL-4B-Instruct/Wan2.1-VACE-14B
 ```
