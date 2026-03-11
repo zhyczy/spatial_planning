@@ -128,8 +128,8 @@ class Config:
     """HuggingFace model path or local checkpoint directory."""
     model_type: str = "qwen-vl"
     """Model family: qwen-vl | qwen3-vl  (both use the same loading logic)."""
-    max_new_tokens: int = 16384
-    """Max tokens for the generation instruction output."""
+    max_new_tokens: int = 2048
+    """Max tokens for the generation instruction output. Increase to 16384+ when enable_thinking=True."""
     temperature: float = 0.7
     top_p: float = 0.9
     do_sample: bool = True
@@ -625,6 +625,16 @@ def main():
         Config,
         description="Generate image-generation instructions from spatial QA datasets using Qwen VL (multi-GPU).",
     )
+
+    # Auto-scale max_new_tokens for thinking mode
+    _THINKING_MIN_TOKENS = 16384
+    if config.enable_thinking and config.max_new_tokens < _THINKING_MIN_TOKENS:
+        import dataclasses
+        print(
+            f"[INFO] enable_thinking=True: auto-setting max_new_tokens "
+            f"{config.max_new_tokens} → {_THINKING_MIN_TOKENS}"
+        )
+        config = dataclasses.replace(config, max_new_tokens=_THINKING_MIN_TOKENS)
 
     # ── Resolve paths ──────────────────────────────────────────────────────────
     # File lives at spatial_planning/generate_image_instructions.py, so parent = spatial_planning/
