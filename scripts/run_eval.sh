@@ -121,12 +121,14 @@ BASELINE_THINKING_ARG=""
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 2 — Generate Planning Instructions on Test Set
 # ══════════════════════════════════════════════════════════════════════════════
+DATASET="mmsibench"   # dataset name — must match --dataset arg and directory names below
+
 echo ""
 echo "── STEP 2: Generate Instructions (test set) ─────────────────────"
 conda run --no-capture-output -n spi python -u generate_image_instructions.py \
-    --dataset    mmsibench \
-    --data_path  datasets/evaluation/MMSIBench/data/test_data_final.json \
-    --image_root datasets/evaluation/MMSIBench \
+    --dataset    "${DATASET}" \
+    --data_path  "datasets/evaluation/MMSIBench/data/test_data_final.json" \
+    --image_root "datasets/evaluation/MMSIBench" \
     --model_path "$TRAINED_MODEL" \
     --model_type "$MODEL_TYPE" \
     ${EVAL_LIMIT_ARG} \
@@ -137,12 +139,19 @@ echo "── Step 2 done ──────────────────�
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 3 — Generate Images (Flux2Klein)
+#
+#  --predicted_instructions_root : must be results/${DATASET}   (one level up from
+#                                  the model-name subdir created by step 2)
+#  --output_model_name           : explicitly pins the output subdirectory to
+#                                  PLANNING_MODEL_NAME so the path stays stable
+#                                  regardless of predicted_instructions_root depth.
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "── STEP 3: Generate Images (Flux2Klein) ─────────────────────────"
 conda run --no-capture-output -n spi python -u image_generation.py \
     --planning_model              "$PLANNING_MODEL_NAME" \
-    --predicted_instructions_root results/mmsibench \
+    --predicted_instructions_root "results/${DATASET}" \
+    --output_model_name           "$PLANNING_MODEL_NAME" \
     --flux_ckpt                   "$FLUX_CKPT" \
     ${EVAL_LIMIT_ARG} \
     2>&1 | tee /tmp/eval_only_step3_${SCALE}.log
@@ -151,8 +160,11 @@ echo "── Step 3 done ──────────────────�
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 4 — Evaluate (Baseline vs Augmented)
+#
+#  GEN_DIR must match the path where step 3 saved images:
+#    generated_images/${DATASET}/${PLANNING_MODEL_NAME}/<flux_model_name>/
 # ══════════════════════════════════════════════════════════════════════════════
-GEN_DIR="generated_images/mmsibench/${PLANNING_MODEL_NAME}/$(basename "$FLUX_CKPT")"
+GEN_DIR="generated_images/${DATASET}/${PLANNING_MODEL_NAME}/$(basename "$FLUX_CKPT")"
 EVAL_OUTPUT="results/eval_only_${SCALE}_$(date +%Y%m%d_%H%M%S)"
 
 echo ""
@@ -163,7 +175,7 @@ LIMIT_ARG=""
 conda run --no-capture-output -n spi python -u evaluation.py \
     --model_type qwen3.5 \
     --model_path "$EVAL_MODEL" \
-    --data_dir   datasets/evaluation/MMSIBench \
+    --data_dir   "datasets/evaluation/MMSIBench" \
     --gen_dir    "$GEN_DIR" \
     ${LIMIT_ARG} \
     ${BASELINE_THINKING_ARG} \
@@ -172,7 +184,7 @@ conda run --no-capture-output -n spi python -u evaluation.py \
 
 echo "── Step 4 done ─────────────────────────────────────────────────"
 echo ""
-echo " Results saved to: ${EVAL_OUTPUT}"
+echo " Results saved to: ${EVAL_OUTPUT}/"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"

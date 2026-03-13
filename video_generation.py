@@ -3,13 +3,13 @@ Step 2 (Video): Generate videos with Wan2.1-VACE-14B (multi-GPU)
 
 For each planning-model result in predicted_instructions/{planning_model}/results.jsonl:
   - Load the input images recorded in image_paths (as reference frames for R2V).
-  - For each instruction/description, call WanVace once (conditioned on the first
-    reference image + the instruction text) to generate one output video.
+  - For each instruction/description, call WanVace once (conditioned on ALL valid
+    reference images + the instruction text) to generate one output video.
   - If a sample has no instructions, create an empty output folder.
 
 This script replaces image_generation.py's Flux2Klein image generator with
 Wan2.1-VACE-14B video generator.  The generation task is R2V (Reference-to-Video):
-the first original QA image is passed as the reference image and the instruction
+all original QA images are passed as reference images and the instruction
 (description from the planner model) is used as the text prompt.
 
 Samples are sharded evenly across all available GPUs (or those in
@@ -205,19 +205,22 @@ def run_worker(
             logger.info(f"[{i+1}/{len(samples)}] Sample {sample_id} ({dataset}/{planning_model}): no instructions.")
             continue
 
-        # Resolve the reference image: use the first valid QA image
-        ref_image_path: Optional[str] = None
+        # Resolve all valid QA images as reference images
+        ref_image_paths: List[str] = []
         for p in image_paths:
             resolved = _resolve_image_path(p)
             if os.path.isfile(resolved):
-                ref_image_path = resolved
-                break
+                ref_image_paths.append(resolved)
 
-        if ref_image_path is None:
+        if not ref_image_paths:
             logger.warning(
                 f"[{i+1}/{len(samples)}] Sample {sample_id}: no valid source images, skipping."
             )
             continue
+
+        logger.info(
+            f"[{i+1}/{len(samples)}] Sample {sample_id}: using {len(ref_image_paths)} reference image(s)."
+        )
 
         # One generation call per instruction
         for idx, instruction in enumerate(instructions):
@@ -235,11 +238,11 @@ def run_worker(
 
             try:
                 # R2V: src_video=None (zero-initialized), src_mask=None (full mask),
-                #       src_ref_images=[[ref_image_path]] (reference QA image)
+                #       src_ref_images=[ref_image_paths] (all original QA images)
                 src_video, src_mask, src_ref_images = wan_vace.prepare_source(
                     [None],               # no source video → zeros
                     [None],               # no source mask → full generation mask
-                    [[ref_image_path]],   # reference image from original QA
+                    [ref_image_paths],    # all valid reference images from original QA
                     frame_num,
                     size_hw,
                     f"cuda:{gpu_id}",

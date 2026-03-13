@@ -60,7 +60,7 @@ PLANNER_THINKING="${3:-false}"    # true | false — planner (our method) thinki
 BASELINE_THINKING="${4:-false}"   # true | false — baseline reasoning thinking mode
 
 if [[ "$SCALE" == "smoke" ]]; then
-    EVAL_LIMIT=-1
+    EVAL_LIMIT=16
 elif [[ "$SCALE" == "full" ]]; then
     EVAL_LIMIT=-1
 else

@@ -728,8 +728,7 @@ def main() -> None:
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_name = args.model_name or args.model_type
-    experiment_name = f"{model_name}_{timestamp}"
-    output_dir = Path(args.output_dir).resolve() / model_name / experiment_name
+    output_dir = Path(args.output_dir).resolve() / f"{model_name}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = output_dir / "run.log"

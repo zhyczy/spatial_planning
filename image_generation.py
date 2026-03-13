@@ -155,16 +155,19 @@ def run_worker(
         sample_id      = sample["id"]
         dataset        = sample["dataset"]
         planning_model = sample["planning_model"]
+        # output_model_name allows overriding the subdirectory name used in the
+        # output path so it stays stable regardless of predicted_instructions_root depth.
+        output_model_name = sample.get("output_model_name", planning_model)
         image_paths    = sample.get("image_paths", [])
         instructions   = sample.get("instructions", [])
 
-        # generated_images/{dataset}/{planning_model}/{gen_model}/{id}/
-        out_dir = out_root / dataset / planning_model / gen_model / str(sample_id)
+        # generated_images/{dataset}/{output_model_name}/{gen_model}/{id}/
+        out_dir = out_root / dataset / output_model_name / gen_model / str(sample_id)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # No instructions → empty folder, skip generation
         if not instructions:
-            logger.info(f"[{i+1}/{len(samples)}] Sample {sample_id} ({dataset}/{planning_model}): no instructions.")
+            logger.info(f"[{i+1}/{len(samples)}] Sample {sample_id} ({dataset}/{output_model_name}): no instructions.")
             continue
 
         # Load source conditioning images
@@ -231,6 +234,15 @@ def parse_args():
         "--all_planning_models",
         action="store_true",
         help="Process all planning-model folders found under predicted_instructions/.",
+    )
+    parser.add_argument(
+        "--output_model_name",
+        type=str,
+        default=None,
+        help="Override the planning-model name used in the output path "
+             "(generated_images/{dataset}/{output_model_name}/{gen_model}/{id}/). "
+             "Defaults to the folder name from --planning_model / --predicted_instructions_root. "
+             "Use this to keep output paths stable regardless of predicted_instructions_root depth.",
     )
 
     # --- Paths ---
@@ -336,9 +348,10 @@ def main():
             logger.warning(f"results.jsonl not found: {results_jsonl}")
             # Pre-create the expected output dir so downstream evaluation steps
             # don't mistake a missing dir for "no generated images" and fall back
-            # to baseline.  Dataset name is inferred from predicted_instructions_root.
+            # to baseline.  Use output_model_name if provided, else pm.
+            out_model_name = args.output_model_name or pm
             dataset_name = instr_root.name   # e.g. results/mmsibench → "mmsibench"
-            pre_gen_dir = out_root / dataset_name / pm / flux_ckpt.name
+            pre_gen_dir = out_root / dataset_name / out_model_name / flux_ckpt.name
             pre_gen_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Pre-created output dir: {pre_gen_dir}")
             continue
@@ -348,6 +361,11 @@ def main():
                 if line:
                     rec = json.loads(line)
                     rec["planning_model"] = pm   # tag for output path
+                    # output_model_name overrides the subdirectory name used in the
+                    # generated_images output path.  Defaults to pm (the folder name
+                    # under predicted_instructions_root), but can be set explicitly
+                    # via --output_model_name to keep paths stable regardless of root depth.
+                    rec["output_model_name"] = args.output_model_name or pm
                     all_samples.append(rec)
 
     logger.info(f"Total samples   : {len(all_samples)}")
@@ -416,14 +434,16 @@ def main():
     from collections import defaultdict  # noqa: PLC0415
     gen_model = flux_ckpt.name
 
-    # Group samples by (dataset, planning_model) to write one stats file each
+    # Group samples by (dataset, output_model_name) to write one stats file each.
+    # output_model_name is the name used for the output subdirectory (may differ from
+    # planning_model when --output_model_name is explicitly set).
     dest_dirs: list = []
     group_map: dict = defaultdict(list)
     for sample in all_samples:
-        group_map[(sample["dataset"], sample["planning_model"])].append(sample)
+        group_map[(sample["dataset"], sample.get("output_model_name", sample["planning_model"]))].append(sample)
 
-    for (dataset, pm), samples in sorted(group_map.items()):
-        dest_dir = out_root / dataset / pm / gen_model
+    for (dataset, out_model_name), samples in sorted(group_map.items()):
+        dest_dir = out_root / dataset / out_model_name / gen_model
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_dirs.append(dest_dir)
 
@@ -460,7 +480,7 @@ def main():
             json.dump(stats, f, indent=2)
 
         logger.info(
-            f"[{dataset}/{pm}/{gen_model}] "
+            f"[{dataset}/{out_model_name}/{gen_model}] "
             f"questions={n_total} | needed={total_needed} | generated={total_generated} | "
             + " | ".join(f"{k}: {v}" for k, v in summary.items())
             + f" → {stats_path}"
