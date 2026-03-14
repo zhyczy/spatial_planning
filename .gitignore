@@ -13,6 +13,7 @@ predicted_instructions/
 generated_images/
 results_single/
 data_annotation/
+generated_videos/
 
 # C extensions
 *.so

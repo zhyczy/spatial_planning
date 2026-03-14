@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import torch
+import torchvision.io as tvio
 from PIL import Image
 
 
@@ -67,6 +68,7 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent
 VACE_DIR = SCRIPT_DIR / "external" / "VACE" / "vace"
+WAN21_DIR = SCRIPT_DIR / "external" / "Wan21"
 
 
 def _add_vace_to_path():
@@ -74,18 +76,26 @@ def _add_vace_to_path():
     vace_str = str(VACE_DIR)
     if vace_str not in sys.path:
         sys.path.insert(0, vace_str)
-    # Also add the wan package root (Wan2.2 or similar) if present alongside VACE
+    # Add VACE repository root so its relative imports resolve.
     wan_root = SCRIPT_DIR / "external" / "VACE"
     wan_str = str(wan_root)
     if wan_str not in sys.path:
         sys.path.insert(0, wan_str)
+
+    # Prefer Wan2.1 runtime package for VACE-Wan2.1 models.
+    if WAN21_DIR.is_dir():
+        wan21_str = str(WAN21_DIR)
+        if wan21_str not in sys.path:
+            sys.path.insert(0, wan21_str)
 
 
 # ---------------------------------------------------------------------------
 # Helper: split list into N roughly equal chunks
 # ---------------------------------------------------------------------------
 def chunk_dataset(samples: list, n: int) -> List[list]:
-    size = max(1, len(samples))
+    size = len(samples)
+    if size == 0 or n <= 0:
+        return []
     k, rem = divmod(size, n)
     chunks, start = [], 0
     for i in range(n):
@@ -151,22 +161,40 @@ def run_worker(
     logger.info(f"Frame num     : {frame_num}")
     logger.info("=" * 60)
 
+    if not samples:
+        logger.info("No samples assigned to this worker; skip model loading.")
+        return
+
+    if not any(sample.get("instructions", []) for sample in samples):
+        logger.info("All assigned samples have zero instructions; skip model loading.")
+        return
+
     # ── Load VACE model ──────────────────────────────────────────────────────
     _add_vace_to_path()
 
     from models.wan import WanVace  # noqa: PLC0415
     from models.wan.configs import WAN_CONFIGS, SIZE_CONFIGS  # noqa: PLC0415
 
-    try:
-        import wan  # noqa: PLC0415
-        from wan.utils.utils import cache_video  # noqa: PLC0415
-    except ImportError:
-        # Fallback: try importing from the bundled Wan2.2 directory
-        wan2_path = str(SCRIPT_DIR / "external" / "Wan2.2")
-        if wan2_path not in sys.path:
-            sys.path.insert(0, wan2_path)
-        import wan  # noqa: PLC0415
-        from wan.utils.utils import cache_video  # noqa: PLC0415
+    wan_import_error = None
+    wan_loaded = False
+    for candidate in [WAN21_DIR, None]:
+        try:
+            if candidate is not None and candidate.is_dir():
+                candidate_str = str(candidate)
+                if candidate_str not in sys.path:
+                    sys.path.insert(0, candidate_str)
+
+            import wan  # noqa: PLC0415
+            logger.info(f"Using wan package from: {Path(wan.__file__).resolve()}")
+            wan_loaded = True
+            break
+        except ImportError as e:
+            wan_import_error = e
+
+    if not wan_loaded:
+        raise ImportError(
+            "Unable to import 'wan' for VACE-Wan2.1. Tried external/Wan21 and current sys.path."
+        ) from wan_import_error
 
     cfg = WAN_CONFIGS[model_name]
     size_hw = SIZE_CONFIGS[size]  # (height, width)
@@ -200,9 +228,17 @@ def run_worker(
         out_dir = out_root / dataset / planning_model / gen_model_name / str(sample_id)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # No instructions → empty folder, skip generation
+        # No instructions → save meta and skip generation
         if not instructions:
             logger.info(f"[{i+1}/{len(samples)}] Sample {sample_id} ({dataset}/{planning_model}): no instructions.")
+            meta_path = out_dir / "meta.json"
+            with open(meta_path, "w", encoding="utf-8") as _f:
+                json.dump({
+                    "id": sample_id,
+                    "question": sample.get("question", ""),
+                    "image_paths": image_paths,
+                    "instructions": [],
+                }, _f, indent=2, ensure_ascii=False)
             continue
 
         # Resolve all valid QA images as reference images
@@ -226,7 +262,7 @@ def run_worker(
         for idx, instruction in enumerate(instructions):
             out_path = out_dir / f"vid_{idx}.mp4"
 
-            if skip_existing and out_path.is_file():
+            if skip_existing and out_path.is_file() and out_path.stat().st_size > 0:
                 logger.info(f"  Skip existing: {out_path.name}")
                 continue
 
@@ -263,14 +299,11 @@ def run_worker(
                     offload_model=True,
                 )
 
-                cache_video(
-                    tensor=video[None],
-                    save_file=str(out_path),
-                    fps=cfg.sample_fps,
-                    nrow=1,
-                    normalize=True,
-                    value_range=(-1, 1),
-                )
+                # video: [C, T, H, W], values in (-1, 1) → [T, H, W, C] uint8
+                frames_uint8 = (
+                    (video.clamp(-1, 1) + 1) / 2 * 255
+                ).clamp(0, 255).to(torch.uint8).permute(1, 2, 3, 0).cpu()
+                tvio.write_video(str(out_path), frames_uint8, fps=cfg.sample_fps, video_codec="h264")
                 logger.info(f"    Saved ({time.time()-t0:.1f}s) → {out_path}")
 
                 # ── Downsample: one middle frame per 10-frame segment ────────
@@ -290,6 +323,16 @@ def run_worker(
                     img.save(str(frames_dir / f"frame_{saved_frame_count:03d}.png"))
                     saved_frame_count += 1
                 logger.info(f"    Saved {saved_frame_count} frames → {frames_dir}")
+
+                # ── Save per-video metadata ──────────────────────────────────
+                vid_meta_path = out_dir / f"vid_{idx}_meta.json"
+                with open(vid_meta_path, "w", encoding="utf-8") as _f:
+                    json.dump({
+                        "id": sample_id,
+                        "question": sample.get("question", ""),
+                        "image_paths": image_paths,
+                        "instruction": instruction,
+                    }, _f, indent=2, ensure_ascii=False)
 
             except Exception as e:
                 logger.error(f"  Sample {sample_id}, instr {idx} FAILED: {e}", exc_info=True)
@@ -472,6 +515,67 @@ def main():
         all_samples = all_samples[: args.max_samples]
         logger.info(f"max_samples     : {args.max_samples} (truncated to {len(all_samples)})")
 
+    # Pre-create empty output folders for samples with no instructions, then
+    # remove them from generation tasks so we don't load model unnecessarily.
+    samples_to_generate: list = []
+    no_instruction_count = 0
+    for rec in all_samples:
+        instructions = rec.get("instructions", [])
+        sample_id = rec["id"]
+        dataset = rec["dataset"]
+        planning_model = rec["planning_model"]
+        out_dir = out_root / dataset / planning_model / gen_model_name / str(sample_id)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if instructions:
+            samples_to_generate.append(rec)
+        else:
+            no_instruction_count += 1
+            meta_path = out_dir / "meta.json"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "id": sample_id,
+                    "question": rec.get("question", ""),
+                    "image_paths": rec.get("image_paths", []),
+                    "instructions": [],
+                }, f, indent=2, ensure_ascii=False)
+
+    logger.info(f"Samples with instructions    : {len(samples_to_generate)}")
+    logger.info(f"Samples with zero instruction: {no_instruction_count}")
+
+    if len(samples_to_generate) == 0:
+        logger.info("No instructions to generate. Skip loading video generation model.")
+
+        # Still write per-question video-count statistics.
+        group_map: dict = defaultdict(list)
+        for sample in all_samples:
+            group_map[(sample["dataset"], sample["planning_model"])].append(sample)
+
+        for (dataset, pm), samples in sorted(group_map.items()):
+            dest_dir = out_root / dataset / pm / gen_model_name
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            count_to_ids: dict = defaultdict(list)
+            for rec in samples:
+                sample_id = rec["id"]
+                vid_dir = dest_dir / str(sample_id)
+                n_vids = len(list(vid_dir.glob("vid_*.mp4"))) if vid_dir.is_dir() else 0
+                count_to_ids[n_vids].append(sample_id)
+
+            stats_path = dest_dir / "video_counts.json"
+            with open(stats_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {str(k): v for k, v in sorted(count_to_ids.items())},
+                    f,
+                    indent=2,
+                )
+            logger.info(
+                f"Stats written → {stats_path}  "
+                f"(total {len(samples)} samples, "
+                f"distribution: {{ {', '.join([f'{k}: {len(v)}' for k, v in sorted(count_to_ids.items())])} }})"
+            )
+        return
+
     # ── Determine GPU IDs ────────────────────────────────────────────────────
     n_available = torch.cuda.device_count()
     if n_available == 0:
@@ -495,7 +599,7 @@ def main():
     logger.info(f"Model name      : {args.model_name}")
     logger.info(f"Instructions    : {instr_root}")
     logger.info(f"Output root     : {out_root}")
-    logger.info(f"Samples         : {len(all_samples)}")
+    logger.info(f"Samples         : {len(samples_to_generate)}")
     logger.info(f"GPUs in use     : {n_gpu}  {all_gpu_ids}")
     logger.info(f"Resolution      : {args.size}")
     logger.info(f"Frames          : {args.frame_num}")
@@ -505,10 +609,13 @@ def main():
     logger.info("=" * 60)
 
     # ── Shard and spawn ──────────────────────────────────────────────────────
-    chunks    = chunk_dataset(all_samples, n_gpu)
+    chunks    = chunk_dataset(samples_to_generate, n_gpu)
     processes = []
 
     for idx, (gpu_id, chunk) in enumerate(zip(all_gpu_ids, chunks)):
+        if not chunk:
+            logger.info(f"Skip worker {idx} on GPU {gpu_id}: no samples in shard")
+            continue
         p = mp.Process(
             target=run_worker,
             args=(
@@ -532,6 +639,11 @@ def main():
 
     for p in processes:
         p.join()
+
+    failed_workers = [p.pid for p in processes if p.exitcode not in (0, None)]
+    if failed_workers:
+        logger.error(f"Worker failures detected (PIDs): {failed_workers}")
+        raise SystemExit(1)
 
     logger.info("All workers finished. Done.")
 
