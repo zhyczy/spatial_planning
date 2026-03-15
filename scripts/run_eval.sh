@@ -121,14 +121,39 @@ BASELINE_THINKING_ARG=""
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 2 — Generate Planning Instructions on Test Set
 # ══════════════════════════════════════════════════════════════════════════════
-DATASET="mmsibench"   # dataset name — must match --dataset arg and directory names below
+# *** CONFIGURE: Change DATASET here — all paths sync automatically. ***
+# Supported: mindcube | sat | vsibench | mmsibench
+DATASET="mindcube"
+
+case "$DATASET" in
+  mindcube)
+    DATA_PATH="datasets/evaluation/MindCube/MindCube_tinybench.jsonl"
+    IMAGE_ROOT="datasets/evaluation/MindCube"
+    ;;
+  sat)
+    DATA_PATH="datasets/evaluation/SAT/test.json"
+    IMAGE_ROOT="datasets/evaluation/SAT"
+    ;;
+  vsibench)
+    DATA_PATH="datasets/evaluation/vsibench/test.jsonl"
+    IMAGE_ROOT="datasets/evaluation/vsibench"
+    ;;
+  mmsibench)
+    DATA_PATH="datasets/evaluation/MMSIBench/data/test_data_final.json"
+    IMAGE_ROOT="datasets/evaluation/MMSIBench"
+    ;;
+  *)
+    echo "ERROR: Unknown DATASET '${DATASET}'. Choose: mindcube | sat | vsibench | mmsibench"
+    exit 1
+    ;;
+esac
 
 echo ""
 echo "── STEP 2: Generate Instructions (test set) ─────────────────────"
 conda run --no-capture-output -n spi python -u generate_image_instructions.py \
     --dataset    "${DATASET}" \
-    --data_path  "datasets/evaluation/MMSIBench/data/test_data_final.json" \
-    --image_root "datasets/evaluation/MMSIBench" \
+    --data_path  "${DATA_PATH}" \
+    --image_root "${IMAGE_ROOT}" \
     --model_path "$TRAINED_MODEL" \
     --model_type "$MODEL_TYPE" \
     ${EVAL_LIMIT_ARG} \
@@ -173,9 +198,10 @@ LIMIT_ARG=""
 [[ "$EVAL_LIMIT" != "-1" ]] && LIMIT_ARG="--limit ${EVAL_LIMIT}"
 
 conda run --no-capture-output -n spi python -u evaluation.py \
+    --dataset    "${DATASET}" \
     --model_type qwen3.5 \
     --model_path "$EVAL_MODEL" \
-    --data_dir   "datasets/evaluation/MMSIBench" \
+    --data_dir   "${IMAGE_ROOT}" \
     --gen_dir    "$GEN_DIR" \
     ${LIMIT_ARG} \
     ${BASELINE_THINKING_ARG} \

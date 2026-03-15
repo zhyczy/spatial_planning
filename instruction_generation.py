@@ -88,19 +88,59 @@ Rules for the instruction:
       * Spatial traversal: a slow pan or dolly that clarifies distances and positions
       * Surrounding context: a wide sweeping shot to reveal spatial relationships
   - The instruction must be self-contained and directly usable as a video-generation prompt.
-  - Do NOT include question text, answer choices, or meta-commentary.
+  - Do NOT include the original question, meta-commentary, reasoning, or predicted answers inside the <video_prompt> tag.
 
 Example output format:
-<think>
+<reasoning>
 The question asks what is behind the sofa. Images 1–4 show the front and sides
 but not the back wall. The X-axis offset between the sofa and the far wall is
 unclear from the current angles. A slow camera dolly from behind the sofa moving
 forward toward the center of the room would best reveal the hidden objects and
 resolve the occlusion for the reasoning model.
-</think>
-<instructions>
+</reasoning>
+<video_prompt>
 <instruction>A slow forward dolly shot starting from directly behind the sofa, moving toward the center of the living room, revealing all objects between the sofa and the far wall.</instruction>
-</instructions>"""
+</video_prompt>"""
+# SYSTEM_PROMPT="""
+# You are a spatial reasoning analyst and a video-generation director.
+
+# You will be provided with:
+#   1. One or more images of a scene.
+#   2. A spatial reasoning question about that scene.
+
+# Your job is to decide whether the existing images are sufficient to answer the
+# # question, or whether a video clip needs to be generated to provide missing
+# # visual information. If a video would help, you must produce exactly ONE description
+# # that will be used directly as a video-generation prompt.
+
+# After closing the </reasoning> tag, you must output exactly ONE video instruction inside a <video_prompt> tag.
+
+# Rules for the <video_prompt>:
+#   - If your Confidence Check was YES (the images are sufficient), output EXACTLY: <video_prompt>NONE</video_prompt>
+#   - If your Confidence Check was NO (information is missing), output a single, self-contained video-generation prompt.
+#   - The prompt must describe ONE specific continuous camera movement or action. 
+#   - Focus purely on visual descriptions (e.g., "A slow forward dolly shot...", "A wide sweeping pan...").
+#   - Do NOT include the original question, meta-commentary, reasoning, or predicted answers inside the <video_prompt> tag.
+
+# Example Output 1 (Information Missing):
+# <reasoning>
+# Required Information: To know what is behind the sofa, I need to see the space between the back of the sofa and the far wall.
+# Visible Information: Images 1-4 show the front and side profiles of the sofa.
+# Missing Information: The back of the sofa is entirely hidden from the current camera angles.
+# Video Strategy: A slow camera dolly starting from behind the sofa, moving forward to reveal the hidden X-axis offset and objects on the floor.
+# </reasoning>
+# <video_prompt>A slow forward dolly shot starting from directly behind the sofa, moving toward the center of the living room, clearly revealing all objects and floor space between the back of the sofa and the far wall.</video_prompt>
+
+# Example Output 1 (Information Sufficient):
+# <reasoning>
+# # The question asks what is behind the sofa. Images 1–4 show the front and sides
+# # but not the back wall. The X-axis offset between the sofa and the far wall is
+# # unclear from the current angles. A slow camera dolly from behind the sofa moving
+# # forward toward the center of the room would best reveal the hidden objects and
+# # resolve the occlusion for the reasoning model.
+# </reasoning>
+# <video_prompt>NONE</video_prompt>
+# """
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -420,39 +460,40 @@ def load_model_and_processor(model_path: str, model_type: str, device: str):
 def parse_instructions(model_output: str) -> List[str]:
     """Extract the single video-generation instruction from model output.
 
-    Strips any <think>...</think> CoT block first (Step B of CoT-GRPO), so that
-    only clean instruction text is forwarded to the video generator.
-    Parses <instruction>...</instruction> tags inside <instructions>...</instructions>.
-    Returns an empty list when the model decides no additional video is needed.
-    Returns at most 1 entry (the best instruction chosen by the planning model).
+    Strips any <think>...</think> and <reasoning>...</reasoning> CoT blocks first,
+    then looks for an <instruction> tag inside <video_prompt>...</video_prompt>.
+    Falls back to treating the raw <video_prompt> content as the instruction when
+    no inner <instruction> tag is present.
+    Returns an empty list when the model decides no additional video is needed
+    (empty <instructions></instructions> or missing <video_prompt>).
+    Returns at most 1 entry.
     """
     import re
 
-    # Step B (CoT-GRPO): remove <think> block so Flux never sees reasoning text.
-    # The raw_output (including <think>) is preserved separately for GRPO training.
+    # Remove CoT blocks so the video generator never sees reasoning text.
     stripped = re.sub(r"<think>.*?</think>", "", model_output,
                       flags=re.DOTALL | re.IGNORECASE)
+    stripped = re.sub(r"<reasoning>.*?</reasoning>", "", stripped,
+                      flags=re.DOTALL | re.IGNORECASE)
 
-    # Locate the <instructions> block
+    # Locate the <video_prompt> block.
     block_match = re.search(
-        r"<instructions>(.*?)</instructions>",
+        r"<video_prompt>(.*?)</video_prompt>",
         stripped,
         re.DOTALL | re.IGNORECASE,
     )
     if not block_match:
         return []
 
-    block = block_match.group(1)
+    block = block_match.group(1).strip()
+    if not block:
+        return []
 
-    # Extract individual <instruction> tags
-    items = re.findall(
-        r"<instruction>(.*?)</instruction>",
-        block,
-        re.DOTALL | re.IGNORECASE,
-    )
-    # Clean and cap at 1 — the planning model selects the single best description
-    instructions = [item.strip() for item in items if item.strip()]
-    return instructions[:1]
+    # Prefer an inner <instruction> tag; fall back to the raw block content.
+    inner = re.search(r"<instruction>(.*?)</instruction>", block,
+                      re.DOTALL | re.IGNORECASE)
+    text = inner.group(1).strip() if inner else block
+    return [text] if text else []
 
 
 def build_message(question: str, image_paths: List[str]) -> dict:

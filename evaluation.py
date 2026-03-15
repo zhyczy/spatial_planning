@@ -59,8 +59,14 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 QUESTION_TEMPLATE = "{Question}"
 ANSWER_INSTRUCTION = (
-    "Answer with the option's letter from the given choices directly. "
-    "Enclose the option's letter within ``."
+    "First output your answer as <answer>X</answer> where X is the option letter, "
+    "then explain your reasoning."
+)
+EVAL_SYSTEM_PROMPT = (
+    "You are a spatial reasoning expert. "
+    "IMPORTANT: Begin your response by outputting your answer in the format "
+    "<answer>X</answer> where X is the option letter (e.g. <answer>A</answer>). "
+    "Then provide your step-by-step reasoning."
 )
 
 
@@ -68,51 +74,108 @@ ANSWER_INSTRUCTION = (
 # Dataset utilities
 # ===========================================================================
 
-def load_dataset(data_dir: Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Load MMSIBench dataset from *test_data_final.json*.
+def load_dataset(data_dir: Path, limit: Optional[int] = None,
+                 dataset: str = "mmsibench") -> List[Dict[str, Any]]:
+    """Load evaluation dataset.
 
-    Image paths stored in the JSON (`local_images`) are relative to the
-    dataset root (the directory that contains the ``data/`` sub-folder, i.e.
-    ``data_dir`` itself).  We resolve them to absolute paths here so that
-    worker processes don't need to know the working directory.
+    Supports:
+      - mmsibench : JSON array at data/test_data_final.json
+      - mindcube  : JSONL at MindCube_tinybench.jsonl
+      - sat       : JSON array at test.json
+      - vsibench  : JSONL at test.jsonl
 
-    Args:
-        data_dir: Root of the MMSIBench dataset directory.
-        limit:    Optional cap on the number of samples to load.
-
-    Returns:
-        List of dicts with keys: index, image (list[str]), question, answer,
-        category, thought.
+    Image paths are relative to data_dir and resolved to absolute paths.
     """
-    json_file = data_dir / "data" / "test_data_final.json"
-    if not json_file.exists():
-        raise FileNotFoundError(
-            f"Dataset file not found: {json_file}\n"
-            "Run datasets/evaluation/MMSIBench/download.py first."
+    samples: List[Dict[str, Any]] = []
+
+    if dataset == "mmsibench":
+        json_file = data_dir / "data" / "test_data_final.json"
+        if not json_file.exists():
+            raise FileNotFoundError(
+                f"Dataset file not found: {json_file}\n"
+                "Run datasets/evaluation/MMSIBench/download.py first."
+            )
+        with open(json_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if limit is not None:
+            raw = raw[:limit]
+        for item in raw:
+            local_images = item.get("local_images", [])
+            image_paths = [str((data_dir / p).resolve()) for p in local_images]
+            samples.append({
+                "index": item.get("id", len(samples)),
+                "image": image_paths,
+                "question": item.get("question", ""),
+                "answer": item.get("answer", ""),
+                "category": item.get("type", "unknown"),
+                "thought": item.get("thought_gt", ""),
+            })
+
+    elif dataset == "mindcube":
+        jsonl_file = data_dir / "MindCube_tinybench.jsonl"
+        if not jsonl_file.exists():
+            raise FileNotFoundError(f"Dataset file not found: {jsonl_file}")
+        with open(jsonl_file, "r", encoding="utf-8") as f:
+            raw = [json.loads(line) for line in f if line.strip()]
+        if limit is not None:
+            raw = raw[:limit]
+        for item in raw:
+            image_paths = [str((data_dir / p).resolve()) for p in item.get("images", [])]
+            category = item.get("category", [])
+            samples.append({
+                "index": item.get("id", len(samples)),
+                "image": image_paths,
+                "question": item.get("question", ""),
+                "answer": item.get("gt_answer", ""),
+                "category": category[0] if category else "unknown",
+                "thought": "",
+            })
+
+    elif dataset == "sat":
+        json_file = data_dir / "test.json"
+        if not json_file.exists():
+            raise FileNotFoundError(f"Dataset file not found: {json_file}")
+        with open(json_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if limit is not None:
+            raw = raw[:limit]
+        for item in raw:
+            image_paths = [str((data_dir / p).resolve()) for p in item.get("images", [])]
+            samples.append({
+                "index": item.get("id", len(samples)),
+                "image": image_paths,
+                "question": item.get("question", ""),
+                "answer": item.get("answer", item.get("gt_answer", "")),
+                "category": item.get("type", "unknown"),
+                "thought": item.get("thought_gt", ""),
+            })
+
+    elif dataset == "vsibench":
+        jsonl_file = data_dir / "test.jsonl"
+        if not jsonl_file.exists():
+            raise FileNotFoundError(f"Dataset file not found: {jsonl_file}")
+        with open(jsonl_file, "r", encoding="utf-8") as f:
+            raw = [json.loads(line) for line in f if line.strip()]
+        if limit is not None:
+            raw = raw[:limit]
+        for item in raw:
+            image_paths = [str((data_dir / p).resolve()) for p in item.get("images", [])]
+            samples.append({
+                "index": item.get("id", len(samples)),
+                "image": image_paths,
+                "question": item.get("question", ""),
+                "answer": item.get("answer", item.get("gt_answer", "")),
+                "category": item.get("type", "unknown"),
+                "thought": "",
+            })
+
+    else:
+        raise ValueError(
+            f"Unknown dataset '{dataset}'. "
+            "Choose: mmsibench | mindcube | sat | vsibench"
         )
 
-    with open(json_file, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    if limit is not None:
-        raw = raw[:limit]
-
-    dataset: List[Dict[str, Any]] = []
-    for item in raw:
-        local_images = item.get("local_images", [])
-        # Paths in the JSON are relative to data_dir (the MMSIBench root).
-        image_paths = [str((data_dir / p).resolve()) for p in local_images]
-
-        dataset.append({
-            "index": item.get("id", len(dataset)),
-            "image": image_paths,
-            "question": item.get("question", ""),
-            "answer": item.get("answer", ""),
-            "category": item.get("type", "unknown"),
-            "thought": item.get("thought_gt", ""),
-        })
-
-    return dataset
+    return samples
 
 
 def chunk_dataset(dataset: List[Dict], num_shards: int) -> List[List[Dict]]:
@@ -145,30 +208,33 @@ def get_generated_images(sample_index: int, gen_dir: Optional[Path]) -> List[str
 # ===========================================================================
 
 def extract_answer_letter(text: str) -> str:
-    """Extract the answer letter (A-D) from raw model output.
+    """Extract the answer letter from raw model output.
 
     Priority order:
-    1. Content between double back-ticks ``X``
-    2. Content between single back-ticks `X`
-    3. Isolated A/B/C/D token (word boundary, not an article like "A bike")
+    1. <answer>X</answer> tag (the requested format).
+    2. Explicit phrases like "answer is X", "The answer is X", "Option X".
+    3. Last standalone option letter A-D in the text (fallback).
     """
     if not text or not isinstance(text, str):
         return ""
 
-    # ``X``
-    m = re.search(r"``([^`]*)``", text)
+    # 1. <answer>X</answer> tag
+    m = re.search(r"<answer>\s*([A-Za-z])\s*</answer>", text, re.IGNORECASE)
     if m:
-        text = m.group(1)
+        return m.group(1).upper()
 
-    # `X`
-    m = re.search(r"`([^`]*)`", text)
+    # 2. Explicit answer phrases (case-insensitive)
+    m = re.search(
+        r"(?:the\s+)?(?:answer|option|choice)\s+(?:is\s+)?[:\s]*([A-Za-z])\b",
+        text, re.IGNORECASE,
+    )
     if m:
-        text = m.group(1)
+        return m.group(1).upper()
 
-    # Bare letter with word boundary (not followed immediately by a lowercase word)
-    m = re.search(r"\b[A-D]\b(?!\s[a-zA-Z])", text)
-    if m:
-        return m.group()
+    # 3. Last standalone option letter A-D in the text (fallback).
+    matches = re.findall(r"\b([A-D])\b", text)
+    if matches:
+        return matches[-1]
 
     return ""
 
@@ -275,15 +341,19 @@ def prepare_batch(
     from qwen_vl_utils import process_vision_info
 
     batch_messages = [
-        [build_user_message(item, extra)]
+        [{"role": "system", "content": EVAL_SYSTEM_PROMPT},
+         build_user_message(item, extra)]
         for item, extra in zip(batch_data, extra_images_list)
     ]
 
+    # Append "<answer>" as a forced prefix so the model's first tokens are the
+    # answer letter + "</answer>", guaranteeing extractable output even when
+    # the subsequent reasoning is truncated by max_new_tokens.
     prompts_text = [
         processor.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=True,
             enable_thinking=enable_thinking,
-        )
+        ) + "<answer>"
         for msgs in batch_messages
     ]
 
@@ -347,14 +417,17 @@ def postprocess(
     """Package raw outputs into result dicts."""
     results = []
     for item, output, prompt, extra in zip(batch_data, outputs, prompts, extra_images_list):
+        # Restore the forced "<answer>" prefix stripped by the decoder so that
+        # extract_answer_letter can find the complete "<answer>X</answer>" tag.
+        full_output = "<answer>" + output
         results.append({
             "method": method,
             "index": item.get("index", ""),
             "category": item.get("category", "unknown"),
             "question": item.get("question", ""),
             "answer": item.get("answer", ""),
-            "prediction": extract_answer_letter(output),
-            "output": output,
+            "prediction": extract_answer_letter(full_output),
+            "output": full_output,
             "thought_gt": item.get("thought", ""),
             "original_images": item["image"],
             "generated_images": extra,
@@ -687,6 +760,9 @@ def main() -> None:
                         choices=["qwen2.5-vl", "qwen3-vl", "qwen3.5"])
     parser.add_argument("--model_path", type=str, required=True)
     # Data
+    parser.add_argument("--dataset", type=str, default="mmsibench",
+                        choices=["mmsibench", "mindcube", "sat", "vsibench"],
+                        help="Dataset name, controls how data files are parsed.")
     parser.add_argument("--data_dir", type=str,
                         default="datasets/evaluation/MMSIBench")
     parser.add_argument("--gen_dir", type=str, default=None,
@@ -696,7 +772,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     # Inference
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=128)
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
     # Output
     parser.add_argument("--output_dir", type=str, default="results/mmsibench")
     parser.add_argument("--model_name", type=str, default=None,
@@ -741,7 +817,7 @@ def main() -> None:
 
     # ---- Load dataset ----
     data_dir = Path(args.data_dir).resolve()
-    dataset = load_dataset(data_dir, limit=args.limit)
+    dataset = load_dataset(data_dir, limit=args.limit, dataset=args.dataset)
 
     # ---- Resolve gen_dir ----
     gen_dir: Optional[Path] = None

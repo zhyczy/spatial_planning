@@ -9,7 +9,7 @@
 # Positional args (all optional, in order):
 #   MODEL_TYPE   qwen2.5-vl | qwen3-vl          (default: qwen3-vl)
 #   MODEL_PATH   path to checkpoint directory    (default: checkpoints/Qwen3.5-4B)
-#   GEN_DIR      path to generated images root   (default: generated_images/mmsibench/Qwen3.5-4B/flux2-klein-4B)
+#   GEN_DIR      path to generated images root   (default: generated_images/mindcube/Qwen3.5-4B/flux2-klein-4B)
 #
 # Examples:
 #   bash scripts/run_evaluation.sh
@@ -27,7 +27,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 MODEL_TYPE="${1:-qwen3-vl}"
 MODEL_PATH="${2:-checkpoints/Qwen3.5-4B}"
-GEN_DIR="${3:-generated_images/mmsibench/Qwen3.5-4B/flux2-klein-4B}"
+GEN_DIR="${3:-generated_images/mindcube/Qwen3.5-4B/flux2-klein-4B}"
 shift 3 2>/dev/null || true   # pass remaining args to python
 
 # Resolve relative paths against workspace root
@@ -38,8 +38,22 @@ if [[ "$GEN_DIR" != /* ]]; then
     GEN_DIR="$ROOT_DIR/$GEN_DIR"
 fi
 
-DATA_DIR="$ROOT_DIR/datasets/evaluation/MMSIBench"
-OUTPUT_DIR="$ROOT_DIR/results/mmsibench"
+# *** CONFIGURE: Change DATASET here — all paths sync automatically. ***
+# Supported: mindcube | sat | vsibench | mmsibench
+DATASET="mindcube"
+
+case "$DATASET" in
+  mindcube)  DATA_DIR="$ROOT_DIR/datasets/evaluation/MindCube" ;;
+  sat)       DATA_DIR="$ROOT_DIR/datasets/evaluation/SAT" ;;
+  vsibench)  DATA_DIR="$ROOT_DIR/datasets/evaluation/vsibench" ;;
+  mmsibench) DATA_DIR="$ROOT_DIR/datasets/evaluation/MMSIBench" ;;
+  *)
+    echo "ERROR: Unknown DATASET '${DATASET}'. Choose: mindcube | sat | vsibench | mmsibench"
+    exit 1
+    ;;
+esac
+
+OUTPUT_DIR="$ROOT_DIR/results/${DATASET}"
 
 NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "?")
 CUDA_INFO="${CUDA_VISIBLE_DEVICES:-all $NUM_GPUS GPUs}"

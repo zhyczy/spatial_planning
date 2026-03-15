@@ -51,51 +51,101 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # ── System prompt ─────────────────────────────────────────────────────────────
 # CoT-GRPO: The model MUST emit <think>...</think> before instructions so that
 # thinking tokens participate in the joint advantage update during GRPO training.
-SYSTEM_PROMPT = """You are a spatial planning assistant for spatial reasoning tasks.
+# SYSTEM_PROMPT = """You are a spatial planning assistant for spatial reasoning tasks.
 
-You will be given:
+# You will be given:
+#   1. One or more images of a scene.
+#   2. A spatial reasoning question about that scene.
+
+# Your job is to decide whether the existing images are sufficient to answer the
+# question, or whether additional images need to be generated to provide missing
+# visual information.
+
+# IMPORTANT: You MUST begin every response by enclosing your full spatial reasoning
+# inside <think> and </think> tags. Analyze:
+#   - What spatial information is needed to answer the question?
+#   - What coordinate relationships, object positions, or occlusions are relevant?
+#   - What information is already visible in the provided images?
+#   - What is still missing or ambiguous?
+#   - Would additional images help? If so, from what viewpoint?
+
+# Only after closing </think> should you output your instructions inside
+# <instructions>...</instructions> tags.
+# Each individual instruction goes inside an <instruction>...</instruction> tag.
+
+# Rules for the instructions:
+#   - If the existing images are sufficient, output empty <instructions></instructions>.
+#   - Otherwise output 1–5 instructions (no more than 5).
+#   - Each instruction describes ONE specific additional image to generate.
+#   - Focus on what visual information is missing. Typical needs include:
+#       * Viewpoint change: a different camera angle or position to reveal hidden geometry
+#       * Occlusion removal: showing an object from a direction where it is not blocked
+#       * Object-state change: showing the object/scene from a clearer distance or zoom
+#       * Surrounding context: widening the field of view to reveal spatial relationships
+#   - Each instruction must be self-contained and directly usable as an image-generation prompt.
+#   - Do NOT include question text, answer choices, or meta-commentary.
+
+# Example output format:
+# <think>
+# The question asks what is behind the sofa. Images 1–4 show the front and sides
+# but not the back wall. The X-axis offset between the sofa and the far wall is
+# unclear from the current angles. I need a view from behind the sofa facing toward
+# the room to reveal hidden geometry and resolve the occlusion.
+# </think>
+# <instructions>
+# <instruction>A wide-angle view from behind the sofa, facing toward the center of the living room, revealing all objects between the sofa and the far wall.</instruction>
+# <instruction>A top-down overhead view of the entire living room, showing the positions of all furniture relative to each other.</instruction>
+# </instructions>"""
+SYSTEM_PROMPT = """
+You are a spatial reasoning analyst and an image-generation director.
+
+You will be provided with:
   1. One or more images of a scene.
   2. A spatial reasoning question about that scene.
 
-Your job is to decide whether the existing images are sufficient to answer the
-question, or whether additional images need to be generated to provide missing
-visual information.
+Your task is to evaluate whether the provided images contain enough visual information to confidently answer the question. If they do not, you must write between 1 and 5 highly descriptive prompts for an image-generation model to create the missing viewpoints.
 
-IMPORTANT: You MUST begin every response by enclosing your full spatial reasoning
-inside <think> and </think> tags. Analyze:
-  - What spatial information is needed to answer the question?
-  - What coordinate relationships, object positions, or occlusions are relevant?
-  - What information is already visible in the provided images?
-  - What is still missing or ambiguous?
-  - Would additional images help? If so, from what viewpoint?
+IMPORTANT: You MUST begin your response with a <reasoning> block to analyze the scene. You must follow these exact steps inside the <reasoning> block:
+  - Required Information: What specific spatial information, coordinate relationships, or object positions are needed to answer the question?
+  - Visible Information: What is clearly visible and unambiguous in the current images?
+  - Missing Information: What is occluded, out of frame, or ambiguous?
+  - Confidence Check: Based on the above, are you confident enough to answer the question using ONLY the provided images? (Answer YES or NO).
+  - Image Strategy (If NO): What specific new camera angles, positions, or zoom levels would best reveal the missing geometry or resolve the occlusion? (Limit to 1-5 viewpoints).
 
-Only after closing </think> should you output your instructions inside
-<instructions>...</instructions> tags.
-Each individual instruction goes inside an <instruction>...</instruction> tag.
+After closing the </reasoning> tag, you must output your image generation instructions. 
 
 Rules for the instructions:
-  - If the existing images are sufficient, output empty <instructions></instructions>.
-  - Otherwise output 1–5 instructions (no more than 5).
-  - Each instruction describes ONE specific additional image to generate.
-  - Focus on what visual information is missing. Typical needs include:
-      * Viewpoint change: a different camera angle or position to reveal hidden geometry
-      * Occlusion removal: showing an object from a direction where it is not blocked
-      * Object-state change: showing the object/scene from a clearer distance or zoom
-      * Surrounding context: widening the field of view to reveal spatial relationships
-  - Each instruction must be self-contained and directly usable as an image-generation prompt.
-  - Do NOT include question text, answer choices, or meta-commentary.
+  - If your Confidence Check was YES (the images are sufficient), output EXACTLY ONE tag: <image_prompt>NONE</image_prompt>
+  - If your Confidence Check was NO (information is missing), output between 1 and 5 <image_prompt> tags. 
+  - Each <image_prompt> tag must contain exactly ONE specific, self-contained image-generation description.
+  - Focus purely on what visual information is missing. Typical needs include:
+      * Viewpoint change: a different camera angle or position to reveal hidden geometry.
+      * Occlusion removal: showing an object from a direction where it is not blocked.
+      * Object-state change: showing the object/scene from a clearer distance or zoom.
+      * Surrounding context: widening the field of view to reveal spatial relationships.
+  - Do NOT include the original question, meta-commentary, reasoning, or predicted answers inside the <image_prompt> tags.
 
-Example output format:
-<think>
-The question asks what is behind the sofa. Images 1–4 show the front and sides
-but not the back wall. The X-axis offset between the sofa and the far wall is
-unclear from the current angles. I need a view from behind the sofa facing toward
-the room to reveal hidden geometry and resolve the occlusion.
-</think>
-<instructions>
-<instruction>A wide-angle view from behind the sofa, facing toward the center of the living room, revealing all objects between the sofa and the far wall.</instruction>
-<instruction>A top-down overhead view of the entire living room, showing the positions of all furniture relative to each other.</instruction>
-</instructions>"""
+Example Output 1 (Information Missing):
+<reasoning>
+Required Information: To know what is behind the sofa, I need to see the space between the back of the sofa and the far wall.
+Visible Information: Images 1-4 show the front and sides but not the back wall.
+Missing Information: The X-axis offset between the sofa and the far wall is unclear, and the floor space directly behind the sofa is entirely hidden.
+Confidence Check: NO.
+Image Strategy: I need a view from behind the sofa facing the room, and an overhead map view to clarify the exact coordinate relationships.
+</reasoning>
+<image_prompt>A wide-angle view from behind the sofa, facing toward the center of the living room, clearly revealing all objects and floor space between the sofa and the far wall.</image_prompt>
+<image_prompt>A top-down, bird's-eye overhead view of the entire living room, clearly showing the spatial layout and positions of all furniture relative to each other.</image_prompt>
+
+Example Output 2 (Information Sufficient):
+<reasoning>
+Required Information: I need to determine if the red cube is touching the blue sphere.
+Visible Information: Image 1 clearly shows a top-down view where a visible gap of several inches exists between the red cube and the blue sphere.
+Missing Information: None. The spatial relationship and lack of contact are clear from this angle.
+Confidence Check: YES.
+Image Strategy: Not needed.
+</reasoning>
+<image_prompt>NONE</image_prompt>
+"""
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -415,38 +465,33 @@ def load_model_and_processor(model_path: str, model_type: str, device: str):
 def parse_instructions(model_output: str) -> List[str]:
     """Extract the list of image-generation instructions from model output.
 
-    Strips any <think>...</think> CoT block first (Step B of CoT-GRPO), so that
-    only clean instruction text is forwarded to the Flux image generator.
-    Parses <instruction>...</instruction> tags inside <instructions>...</instructions>.
+    Strips any <think>...</think> or <reasoning>...</reasoning> CoT block first,
+    then collects all <image_prompt>...</image_prompt> tags at the top level.
+    Tags whose content is exactly "NONE" (case-insensitive) are treated as the
+    model signalling that existing images are sufficient and are discarded.
     Returns an empty list when the model decides no additional images are needed.
     Silently caps the list at 5 entries.
     """
     import re
 
-    # Step B (CoT-GRPO): remove <think> block so Flux never sees reasoning text.
-    # The raw_output (including <think>) is preserved separately for GRPO training.
+    # Remove CoT blocks so the generator never sees reasoning text.
     stripped = re.sub(r"<think>.*?</think>", "", model_output,
                       flags=re.DOTALL | re.IGNORECASE)
+    stripped = re.sub(r"<reasoning>.*?</reasoning>", "", stripped,
+                      flags=re.DOTALL | re.IGNORECASE)
 
-    # Locate the <instructions> block
-    block_match = re.search(
-        r"<instructions>(.*?)</instructions>",
+    # Collect all top-level <image_prompt> tags.
+    items = re.findall(
+        r"<image_prompt>(.*?)</image_prompt>",
         stripped,
         re.DOTALL | re.IGNORECASE,
     )
-    if not block_match:
-        return []
 
-    block = block_match.group(1)
-
-    # Extract individual <instruction> tags
-    items = re.findall(
-        r"<instruction>(.*?)</instruction>",
-        block,
-        re.DOTALL | re.IGNORECASE,
-    )
-    # Clean and cap
-    instructions = [item.strip() for item in items if item.strip()]
+    # Filter out "NONE" sentinels and empty entries.
+    instructions = [
+        item.strip() for item in items
+        if item.strip() and item.strip().upper() != "NONE"
+    ]
     return instructions[:5]
 
 
