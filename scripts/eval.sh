@@ -51,7 +51,8 @@ EVAL_MODEL="checkpoints/Qwen3.5-4B"
 #  Change DATASET here — all paths below will sync automatically.
 #  Supported: mindcube | sat | vsibench | mmsibench
 # ══════════════════════════════════════════════════════════════════════════════
-DATASET="mindcube"
+# DATASET="mindcube"
+DATASET="mmsibench"
 
 case "$DATASET" in
   mindcube)
