@@ -15,6 +15,7 @@ results_single/
 data_annotation/
 generated_videos/
 coord_results/
+vis_results/
 
 # C extensions
 *.so
