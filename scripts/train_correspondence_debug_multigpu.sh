@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# train_correspondence_debug.sh
+# train_correspondence_debug_multigpu.sh
 #
-# Quick smoke-test: 6 training samples, 2 epochs, tiny grad-accum.
-# Runs on a single GPU via torchrun --nproc_per_node 1.
-# Output and log saved to train_records/correspondence_debug/.
+# Multi-GPU smoke-test: 6 training samples, 2 epochs, tiny grad-accum.
+# Runs on N GPUs via torchrun --nproc_per_node N.
+# Output and log saved to train_records/correspondence_debug_multigpu/.
 #
 # Usage:
-#   bash scripts/train_correspondence_debug.sh
+#   bash scripts/train_correspondence_debug_multigpu.sh [num_gpus]
+#   e.g. bash scripts/train_correspondence_debug_multigpu.sh 2
 # =============================================================================
 
 set -euo pipefail
@@ -18,6 +19,15 @@ SPATIAL_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$SPATIAL_DIR"
 
 # =============================================================================
+# GPU count from argument (default: 2)
+# =============================================================================
+
+NPROC="${1:-2}"
+
+# Build CUDA_VISIBLE_DEVICES string: 0,1,...,N-1
+CUDA_IDS=$(seq -s ',' 0 $((NPROC - 1)))
+
+# =============================================================================
 # Hyperparameters (debug-scale)
 # =============================================================================
 
@@ -25,20 +35,19 @@ MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
 JSON_PATH="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/train_debug6.json"
 POS3D_DIR="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/3D_pos"
 
-RUN_NAME="correspondence_debug"
+RUN_NAME="correspondence_debug_multigpu"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 EPOCHS=2
 LR=2e-4
 LORA_RANK=16
 MAX_IMAGES=4
-GRAD_ACCUM=2          # smaller so optimizer steps happen within 6 samples
+GRAD_ACCUM=2
 NUM_WORKERS=0
 
-# SKIP_LAYERS="-8 -4 -1"
 SKIP_LAYERS="-1"
 CYCLE_WEIGHT=0.1
-SAVE_STEPS=5          # save every 5 steps so we get at least one checkpoint
+SAVE_STEPS=5
 
 # =============================================================================
 # Setup
@@ -46,19 +55,19 @@ SAVE_STEPS=5          # save every 5 steps so we get at least one checkpoint
 
 mkdir -p "$OUTPUT_DIR"
 
-export CUDA_VISIBLE_DEVICES=0     # single GPU for debug
-export CUDA_LAUNCH_BLOCKING=1     # synchronous kernel launch → accurate stack traces
-echo "[INFO] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-echo "[INFO] Output dir : $OUTPUT_DIR"
-echo "[INFO] Starting   : $(date '+%Y-%m-%d %H:%M:%S')"
+export CUDA_VISIBLE_DEVICES="$CUDA_IDS"
+echo "[INFO] NPROC_PER_NODE   = $NPROC"
+echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
+echo "[INFO] Output dir       : $OUTPUT_DIR"
+echo "[INFO] Starting         : $(date '+%Y-%m-%d %H:%M:%S')"
 
 # =============================================================================
-# Run via torchrun (single GPU)
+# Run via torchrun (multi-GPU DDP)
 # =============================================================================
 
 conda run --no-capture-output -n spc torchrun \
-    --nproc_per_node 1 \
-    --master_port    29501 \
+    --nproc_per_node "$NPROC" \
+    --master_port    29502 \
     train_correspondence.py \
     --model_path     "$MODEL_PATH"    \
     --json_path      "$JSON_PATH"     \

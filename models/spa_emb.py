@@ -47,10 +47,15 @@ import torch.nn.functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5PreTrainedModel,
     Qwen3_5TextModel,
+    Qwen3_5TextRotaryEmbedding,
     Qwen3_5VisionModel,
     Qwen3_5Model,
     Qwen3_5ForConditionalGeneration,
+    Qwen3_5DynamicCache,
+    Qwen3_5ModelOutputWithPast,
 )
+from transformers.masking_utils import create_causal_mask
+from transformers.utils.generic import maybe_autocast
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +233,167 @@ class SpaVisionModel(Qwen3_5VisionModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Part 2a: 4D interleaved M-RoPE (text model rotary embedding + language model)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SpaTextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
+    """
+    Extends Qwen3.5 M-RoPE from 3D to N-D using interleaved frequency assignment.
+
+    With mrope_section = [s0, s1, ..., s_{N-1}] (sum = head_dim // 2):
+        freq index i → dimension (i % N)
+
+    For [8, 8, 8, 8] with N=4 and head_dim=64 (32 freq components):
+        dim 0 (t):   indices 0, 4, 8, 12, 16, 20, 24, 28  (8 freqs)
+        dim 1 (x3d): indices 1, 5, 9, 13, 17, 21, 25, 29  (8 freqs)
+        dim 2 (y3d): indices 2, 6,10, 14, 18, 22, 26, 30  (8 freqs)
+        dim 3 (z3d): indices 3, 7,11, 15, 19, 23, 27, 31  (8 freqs)
+
+    Text tokens: all N dims = sequential pos → all 32 freqs encode the same pos
+    → mathematically identical to original [11,11,10] 3D text RoPE.
+    """
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        # position_ids: (N, bs, seq_len) where N = len(mrope_section)
+        num_dims = len(self.mrope_section)
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(num_dims, position_ids.shape[0], -1)
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None]
+            .float()
+            .expand(num_dims, position_ids.shape[1], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, :, None, :].float()  # (N, bs, 1, seq_len)
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with maybe_autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+            # freqs: (N, bs, seq_len, head_dim//2)
+            freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+    def apply_interleaved_mrope(self, freqs, mrope_section):
+        """
+        Interleaved N-D M-RoPE.  Dim d uses freq indices d, d+N, d+2N, ... (stride N).
+
+        Args:
+            freqs:        (N, bs, seq_len, head_dim//2)
+            mrope_section: list of N equal ints, e.g. [8, 8, 8, 8]
+        Returns:
+            (bs, seq_len, head_dim//2)
+        """
+        num_dims = len(mrope_section)
+        freqs_out = freqs[0].clone()           # start: dim-0 fills all slots
+        for dim in range(1, num_dims):
+            length = mrope_section[dim] * num_dims
+            idx = slice(dim, length, num_dims)
+            freqs_out[..., idx] = freqs[dim, ..., idx]
+        return freqs_out
+
+
+class SpaTextModel(Qwen3_5TextModel):
+    """
+    Qwen3.5 text model patched to support 5D position_ids (seq, t, x, y, z).
+
+    The only change from the parent is that the position_ids split condition
+    accepts shape[0] >= 4 instead of exactly 4, allowing 5D input where:
+        position_ids[0]  = sequential position  (→ causal mask)
+        position_ids[1:] = (t, x3d, y3d, z3d)  (→ 4D interleaved RoPE)
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.rotary_emb = SpaTextRotaryEmbedding(config=config)
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_hidden_states=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("Specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            past_key_values = Qwen3_5DynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
+
+        # Accept 5D (seq, t, x3d, y3d, z3d) in addition to original 4D
+        if position_ids is None:
+            position_ids = cache_position.view(1, 1, -1).expand(5, inputs_embeds.shape[0], -1)
+        elif position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(5, position_ids.shape[0], -1)
+
+        # ← only change from parent: >= 4 instead of == 4
+        if position_ids.ndim == 3 and position_ids.shape[0] >= 4:
+            text_position_ids = position_ids[0]    # seq dim → causal mask
+            position_ids = position_ids[1:]        # (t, x3d, y3d, z3d) → rotary
+        else:
+            text_position_ids = None
+
+        causal_mask = create_causal_mask(
+            config=self.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=text_position_ids,
+        )
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
+
+        hidden_states = inputs_embeds
+        all_hidden_states = (hidden_states,) if output_hidden_states else None
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            layer_mask = (
+                linear_attn_mask if decoder_layer.layer_type == "linear_attention" else causal_mask
+            )
+            hidden_states = decoder_layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=layer_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+        hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        return Qwen3_5ModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Part 2: LLM visual token positional embeddings (M-RoPE)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -245,10 +411,10 @@ class SpaModel(Qwen3_5Model):
     """
 
     def __init__(self, config):
-        # Replicate Qwen3_5Model.__init__ exactly, but swap VisionModel for SpaVisionModel
+        # Replicate Qwen3_5Model.__init__ but use SpaVisionModel and SpaTextModel
         Qwen3_5PreTrainedModel.__init__(self, config)
         self.visual = SpaVisionModel._from_config(config.vision_config)
-        self.language_model = Qwen3_5TextModel._from_config(config.text_config)
+        self.language_model = SpaTextModel._from_config(config.text_config)
         self.rope_deltas = None
         self.post_init()
 
@@ -287,11 +453,12 @@ class SpaModel(Qwen3_5Model):
             device: torch device.
 
         Returns:
-            vision_position_ids: (4, llm_grid_t * llm_grid_h * llm_grid_w)
-                [0] = t  — start_position (same for every token in this image)
-                [1] = x  — per-patch discretized x coordinate
-                [2] = y  — per-patch discretized y coordinate
-                [3] = z  — per-patch discretized z coordinate
+            vision_position_ids: (5, llm_grid_t * llm_grid_h * llm_grid_w)
+                [0] = seq — sequential position in sequence (for causal mask)
+                [1] = t   — start_position (same for every token in this image)
+                [2] = x   — per-patch discretized x coordinate
+                [3] = y   — per-patch discretized y coordinate
+                [4] = z   — per-patch discretized z coordinate
 
         ── MODIFY BELOW ──────────────────────────────────────────────────────
         Ideas:
@@ -318,7 +485,9 @@ class SpaModel(Qwen3_5Model):
         pos_y = xyz_int[:, 1]
         pos_z = xyz_int[:, 2]
 
-        return torch.stack([pos_t, pos_x, pos_y, pos_z], dim=0)  # (4, num_tokens)
+        # seq row filled in by get_rope_index() after this call (needs actual seq offset)
+        pos_seq = pos_t.clone()  # placeholder; overwritten in get_rope_index
+        return torch.stack([pos_seq, pos_t, pos_x, pos_y, pos_z], dim=0)  # (5, num_tokens)
 
     def get_rope_index(
         self,
@@ -354,8 +523,8 @@ class SpaModel(Qwen3_5Model):
                 Default 100 maps ±10 m → ±1000.
 
         Returns:
-            position_ids: (4, batch, seq_len)
-                Dimension ordering: [t-dim, x-dim, y-dim, z-dim]
+            position_ids: (5, batch, seq_len)
+                Dimension ordering: [seq-dim, t-dim, x-dim, y-dim, z-dim]
             mrope_position_deltas: (batch, 1)
                 Delta between max position and sequence length, used during
                 auto-regressive generation to offset next-token positions.
@@ -378,7 +547,7 @@ class SpaModel(Qwen3_5Model):
 
         mrope_position_deltas = []
         position_ids = torch.zeros(
-            4,                      # ← 4D: (t, x, y, z)
+            5,                      # ← 5D: (seq, t, x, y, z)
             input_ids.shape[0],
             input_ids.shape[1],
             dtype=input_ids.dtype,
@@ -403,18 +572,20 @@ class SpaModel(Qwen3_5Model):
                 group = list(group)
                 input_type_group.append((key, group[0][0], group[-1][0] + 1))
 
-            current_pos = 0
+            current_pos = 0      # RoPE position budget (t coordinate for images)
+            actual_seq  = 0      # true sequential position (for causal mask, dim 0)
             llm_pos_ids_list = []
 
             for modality_type, start_idx, end_idx in input_type_group:
                 if modality_type == 0:  # text
                     text_len = end_idx - start_idx
-                    # Text: t = x = y = z = sequential position (4 identical rows)
+                    # Text: seq=t=x=y=z = sequential position (5 identical rows)
                     llm_pos_ids_list.append(
                         torch.arange(text_len, device=input_ids.device)
-                        .view(1, -1).expand(4, -1) + current_pos
+                        .view(1, -1).expand(5, -1) + current_pos
                     )
                     current_pos += text_len
+                    actual_seq  += text_len
 
                 else:  # image (1) or video (2)
                     grid_thw = next(grid_iters[modality_type])
@@ -436,13 +607,20 @@ class SpaModel(Qwen3_5Model):
                         spatial_merge_size=spatial_merge_size,
                         coord_scale=coord_scale,
                         device=input_ids.device,
-                    )                                        # (4, num_tokens)
+                    )                                        # (5, num_tokens)
+
+                    # Fix dim-0 (seq): sequential positions for causal mask
+                    num_img_tokens = vision_position_ids.shape[1]
+                    vision_position_ids[0] = (
+                        torch.arange(num_img_tokens, device=input_ids.device) + actual_seq
+                    )
                     llm_pos_ids_list.append(vision_position_ids)
 
-                    # Advance position budget by max(H, W) / merge_size (same as original)
+                    # Advance RoPE budget by max(H,W)/merge (same as original)
                     current_pos += max(grid_thw[1], grid_thw[2]) // spatial_merge_size
+                    actual_seq  += num_img_tokens
 
-            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(4, -1)
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(5, -1)
 
             if attention_mask is not None:
                 position_ids[:, batch_idx, attention_mask[batch_idx].bool()] = (

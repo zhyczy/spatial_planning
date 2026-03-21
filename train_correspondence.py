@@ -35,8 +35,16 @@ import os
 import sys
 from itertools import combinations
 
-import wandb
-_WANDB_AVAILABLE = True
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None          # type: ignore[assignment]
+    _WANDB_AVAILABLE = False
 
 
 import numpy as np
@@ -53,12 +61,27 @@ sys.path.insert(0, _ROOT)
 
 from models.spa_emb import SpaForConditionalGeneration
 
+# Re-use dataset detection logic from the data processing pipeline
+sys.path.insert(0, os.path.join(_ROOT, "src", "data_process"))
+from reconstruct_3d import detect_dataset, _scene_id_from_path  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+# ── DDP helpers ───────────────────────────────────────────────────────────────
+
+local_rank: int = 0
+world_size: int = 1
+
+
+def rank0_print(*args):
+    if local_rank == 0:
+        print(*args)
+
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 SPAR_ROOT = os.path.join(
@@ -132,13 +155,16 @@ def rot6d_to_rotmat(r6d: torch.Tensor) -> torch.Tensor:
     Reference: Zhou et al., "On the Continuity of Rotation Representations in
     Neural Networks", CVPR 2019.
     """
+    # Cast to float32: bfloat16 lacks precision for Gram-Schmidt (eps=1e-6 ≈ 0
+    # in bf16, causing 0/0 NaN when a1 ∥ a2 at random initialisation).
+    orig_dtype = r6d.dtype
+    r6d = r6d.float()
     a1, a2 = r6d[..., :3], r6d[..., 3:6]
-    # eps=1e-6 guards against near-zero vectors at initialisation
     b1 = F.normalize(a1, dim=-1, eps=1e-6)
     b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1, eps=1e-6)
     b3 = torch.cross(b1, b2, dim=-1)
-    # Stack as columns: R = [b1 | b2 | b3]
-    return torch.stack([b1, b2, b3], dim=-1)          # (..., 3, 3)
+    # Stack as columns: R = [b1 | b2 | b3], restore original dtype
+    return torch.stack([b1, b2, b3], dim=-1).to(orig_dtype)   # (..., 3, 3)
 
 
 def geodesic_loss(
@@ -150,7 +176,9 @@ def geodesic_loss(
     Mean rotation-angle loss between predicted and GT rotation matrices.
     R_pred, R_gt: (N, 3, 3)
     """
-    # R_diff = R_pred @ R_gt^T  (should be I when perfect)
+    # Compute in float32: acos gradient blows up near ±1 in bfloat16
+    R_pred = R_pred.float()
+    R_gt   = R_gt.float()
     R_diff = torch.bmm(R_pred, R_gt.transpose(-1, -2))         # (N, 3, 3)
     trace  = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)         # (N,)
     cos    = ((trace - 1.0) / 2.0).clamp(-1.0 + eps, 1.0 - eps)
@@ -290,7 +318,7 @@ class SpaCorrespondenceModel(nn.Module):
             return preds_9d, None
 
         K  = preds_9d.shape[0]
-        gt = gt_transforms[:K].to(preds_9d.device)  # (K, 4, 4)
+        gt = gt_transforms[:K].to(preds_9d.device, dtype=preds_9d.dtype)  # (K, 4, 4)
 
         R_gt   = gt[:, :3, :3]                       # (K, 3, 3)
         t_gt   = gt[:, :3,  3]                       # (K, 3)
@@ -339,6 +367,7 @@ class SPARDataset(Dataset):
         max_images:          int = 4,
         pos3d_dir:           str | None = None,
         spatial_merge_size:  int = 2,
+        max_samples:         int | None = None,
     ):
         import json
         with open(json_path) as fh:
@@ -359,6 +388,9 @@ class SPARDataset(Dataset):
                 p3d = None
             self.samples.append((e, npz, p3d))
 
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
+
         self.spar_root           = spar_root
         self.processor           = processor
         self.pose_token_id       = pose_token_id
@@ -375,9 +407,13 @@ class SPARDataset(Dataset):
         entry, npz_path, p3d_path = self.samples[idx]
 
         # ── load images ───────────────────────────────────────────────────────
+        # Paths in the JSON are relative to {dataset}/images/; resolve using
+        # detect_dataset() (scannet / scannetpp / structured3d).
         images = []
         for rel in entry["image"]:
-            full = os.path.join(self.spar_root, rel)
+            scene_id = _scene_id_from_path(rel)
+            dataset  = detect_dataset(scene_id)
+            full = os.path.join(self.spar_root, dataset, "images", rel)
             try:
                 images.append(Image.open(full).convert("RGB"))
             except (FileNotFoundError, OSError):
@@ -391,7 +427,10 @@ class SPARDataset(Dataset):
         N        = min(len(images), n_stored)
 
         if N < 2:
-            return self.__getitem__((idx + 1) % len(self))
+            raise RuntimeError(
+                f"Sample {idx} (id={entry.get('id')}) has only {N} valid "
+                f"images after loading; skipping. Check image paths."
+            )
 
         images = images[:N]
 
@@ -506,12 +545,14 @@ def build_model(
     )
 
     # ── load model ─────────────────────────────────────────────────────────────
+    # device_map is intentionally omitted: the caller places the full model on
+    # a single GPU (required for DDP; device_map="auto" is incompatible).
+    # Use sdpa (safe on Blackwell sm_120); flash_attention_2 segfaults there.
     spa = SpaForConditionalGeneration.from_pretrained(
         model_path,
         config             = config,
         torch_dtype        = torch.bfloat16,
-        device_map         = "auto",
-        attn_implementation= "flash_attention_2",
+        attn_implementation= "sdpa",
     )
 
     # ── resize embedding table for new <pose> token ───────────────────────────
@@ -543,7 +584,7 @@ def build_model(
     # ── pose regression head ──────────────────────────────────────────────────
     hidden_dim = config.text_config.hidden_size
     input_dim  = hidden_dim * len(skip_layers)   # concat of skip_layers features
-    pose_head  = PoseRegressionHead(input_dim=input_dim)
+    pose_head  = PoseRegressionHead(input_dim=input_dim).to(torch.bfloat16)
     log.info(f"PoseRegressionHead input_dim={input_dim} "
              f"(skip_layers={list(skip_layers)}, hidden={hidden_dim})")
 
@@ -554,6 +595,23 @@ def build_model(
 # ── training loop ─────────────────────────────────────────────────────────────
 
 def train(args: argparse.Namespace) -> None:
+    global local_rank, world_size
+
+    # ── DDP initialisation ────────────────────────────────────────────────────
+    _env_rank = os.environ.get("LOCAL_RANK")
+    if _env_rank is not None:
+        local_rank = int(_env_rank)
+        dist.init_process_group(backend="nccl")
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        log.info(f"DDP: local_rank={local_rank}  world_size={world_size}")
+    else:
+        local_rank = 0
+        world_size = 1
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        log.info("Single-GPU / CPU mode")
+
     # ── processor + tokeniser ─────────────────────────────────────────────────
     processor = AutoProcessor.from_pretrained(
         args.model_path, trust_remote_code=True
@@ -561,7 +619,7 @@ def train(args: argparse.Namespace) -> None:
     tokenizer = processor.tokenizer
     tokenizer.add_special_tokens({"additional_special_tokens": [POSE_TOKEN]})
     pose_token_id = tokenizer.convert_tokens_to_ids(POSE_TOKEN)
-    log.info(f"<pose> token id = {pose_token_id}")
+    rank0_print(f"<pose> token id = {pose_token_id}")
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = build_model(
@@ -571,23 +629,31 @@ def train(args: argparse.Namespace) -> None:
         freeze_vision  = not args.train_vision,
         skip_layers    = tuple(args.skip_layers),
     )
-    # Move pose head to device (backbone is already placed by device_map)
-    first_param_device = next(
-        p.device for p in model.spa_model.parameters() if p.requires_grad
-    )
-    model.pose_head = model.pose_head.to(first_param_device)
+    model = model.to(device)
 
     # Normalise --pos3d_dir (empty string → None to disable 3D pos loading)
     if args.pos3d_dir == "":
         args.pos3d_dir = None
-    log.info(f"pos3d_dir = {args.pos3d_dir}")
+    rank0_print(f"pos3d_dir = {args.pos3d_dir}")
 
     # ── resolve spatial_merge_size from vision config ─────────────────────────
     import json as _json
     _vcfg = _json.load(open(os.path.join(args.model_path, "config.json"))
                        ).get("vision_config", {})
     spatial_merge_size = int(_vcfg.get("spatial_merge_size", 2))
-    log.info(f"spatial_merge_size = {spatial_merge_size}")
+    rank0_print(f"spatial_merge_size = {spatial_merge_size}")
+
+    # ── DDP wrapping ──────────────────────────────────────────────────────────
+    # find_unused_parameters=False: DDP only tracks requires_grad=True params;
+    # frozen backbone weights are invisible to it. All trainable params (LoRA +
+    # PoseHead) participate in every forward pass, so the extra graph traversal
+    # from True is unnecessary.
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank],
+                    find_unused_parameters=False)
+        _model = model.module   # unwrapped reference for checkpointing
+    else:
+        _model = model
 
     # ── dataset / loader ──────────────────────────────────────────────────────
     dataset = SPARDataset(
@@ -599,13 +665,20 @@ def train(args: argparse.Namespace) -> None:
         max_images          = args.max_images,
         pos3d_dir           = args.pos3d_dir,
         spatial_merge_size  = spatial_merge_size,
+        max_samples         = args.max_samples,
+    )
+    sampler = (
+        DistributedSampler(dataset, num_replicas=world_size,
+                           rank=local_rank, shuffle=True)
+        if world_size > 1 else None
     )
     loader = DataLoader(
         dataset,
         batch_size  = 1,
-        shuffle     = True,
+        shuffle     = (sampler is None),
         num_workers = args.num_workers,
         collate_fn  = collate_fn,
+        sampler     = sampler,
     )
 
     # ── optimiser ─────────────────────────────────────────────────────────────
@@ -616,10 +689,11 @@ def train(args: argparse.Namespace) -> None:
         optimizer, T_max=max(total_steps, 1)
     )
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    if local_rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
 
-    # ── WandB ─────────────────────────────────────────────────────────────────
-    use_wandb = _WANDB_AVAILABLE and args.wandb_project
+    # ── WandB (rank 0 only) ───────────────────────────────────────────────────
+    use_wandb = _WANDB_AVAILABLE and args.wandb_project and local_rank == 0
     if use_wandb:
         wandb.init(
             entity  = args.wandb_entity or None,
@@ -629,7 +703,7 @@ def train(args: argparse.Namespace) -> None:
             dir     = args.output_dir,
         )
         log.info(f"WandB run: {wandb.run.name}  project: {args.wandb_project}")
-    elif args.wandb_project and not _WANDB_AVAILABLE:
+    elif args.wandb_project and not _WANDB_AVAILABLE and local_rank == 0:
         log.warning("wandb not installed — logging disabled. `pip install wandb`")
 
     global_step = 0
@@ -637,24 +711,27 @@ def train(args: argparse.Namespace) -> None:
     optimizer.zero_grad()
 
     for epoch in range(args.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
         for step, batch in enumerate(loader):
 
             # ── move batch to device ──────────────────────────────────────────
-            input_ids      = batch["input_ids"].to(first_param_device)
-            attention_mask = batch["attention_mask"].to(first_param_device)
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
             pixel_values   = batch.get("pixel_values")
             image_grid_thw = batch.get("image_grid_thw")
-            gt_transforms  = batch["gt_transforms"].to(first_param_device)
+            gt_transforms  = batch["gt_transforms"].to(device)
 
             if pixel_values is not None:
-                pixel_values = pixel_values.to(first_param_device)
+                pixel_values = pixel_values.to(device, dtype=torch.bfloat16)
             if image_grid_thw is not None:
-                image_grid_thw = image_grid_thw.to(first_param_device)
+                image_grid_thw = image_grid_thw.to(device)
 
             # Move 3D position maps to device (list of tensors or None)
             image_xyz = batch.get("image_xyz")
             if image_xyz is not None:
-                image_xyz = [xyz.to(first_param_device) for xyz in image_xyz]
+                image_xyz = [xyz.to(device) for xyz in image_xyz]
 
             # ── forward + loss ────────────────────────────────────────────────
             try:
@@ -668,11 +745,11 @@ def train(args: argparse.Namespace) -> None:
                     cycle_weight   = args.cycle_weight,
                 )
             except Exception as exc:
-                log.warning(f"Step {step} skipped: {exc}")
+                log.warning(f"[rank{local_rank}] Step {step} skipped: {exc}")
                 continue
 
             if loss is None:
-                log.warning(f"Step {step}: no <pose> token found, skipping.")
+                log.warning(f"[rank{local_rank}] Step {step}: no <pose> token found, skipping.")
                 continue
 
             (loss / args.grad_accum).backward()
@@ -686,35 +763,41 @@ def train(args: argparse.Namespace) -> None:
                 optimizer.zero_grad()
                 global_step += 1
 
-                avg_loss = running_loss / args.grad_accum
-                running_loss = 0.0
-                current_lr = scheduler.get_last_lr()[0]
-                log.info(
-                    f"epoch={epoch+1:02d}  step={global_step:05d}  "
-                    f"loss={avg_loss:.4f}  "
-                    f"lr={current_lr:.2e}"
-                )
-                if use_wandb:
-                    wandb.log(
-                        {
-                            "train/loss": avg_loss,
-                            "train/lr":   current_lr,
-                            "epoch":      epoch + 1,
-                        },
-                        step=global_step,
+                if local_rank == 0:
+                    avg_loss = running_loss / args.grad_accum
+                    running_loss = 0.0
+                    current_lr = scheduler.get_last_lr()[0]
+                    log.info(
+                        f"epoch={epoch+1:02d}  step={global_step:05d}  "
+                        f"loss={avg_loss:.4f}  "
+                        f"lr={current_lr:.2e}"
                     )
+                    if use_wandb:
+                        wandb.log(
+                            {
+                                "train/loss": avg_loss,
+                                "train/lr":   current_lr,
+                                "epoch":      epoch + 1,
+                            },
+                            step=global_step,
+                        )
 
-                # ── checkpoint ────────────────────────────────────────────────
-                if global_step % args.save_steps == 0:
-                    _save_checkpoint(model, tokenizer, args.output_dir,
-                                     global_step)
+                    # ── checkpoint ────────────────────────────────────────────
+                    if global_step % args.save_steps == 0:
+                        _save_checkpoint(_model, tokenizer, args.output_dir,
+                                         global_step)
+                else:
+                    running_loss = 0.0
 
-    # Final checkpoint
-    _save_checkpoint(model, tokenizer, args.output_dir, global_step,
-                     suffix="final")
-    log.info("Training complete.")
+    # Final checkpoint (rank 0 only)
+    if local_rank == 0:
+        _save_checkpoint(_model, tokenizer, args.output_dir, global_step,
+                         suffix="final")
+    log.info(f"[rank{local_rank}] Training complete.")
     if use_wandb:
         wandb.finish()
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 def _save_checkpoint(
@@ -768,6 +851,8 @@ def parse_args() -> argparse.Namespace:
                    help="Gradient accumulation steps")
     p.add_argument("--save_steps",   type=int,   default=200)
     p.add_argument("--num_workers",  type=int,   default=4)
+    p.add_argument("--max_samples",  type=int,   default=None,
+                   help="Truncate dataset to this many samples (None = use all)")
     p.add_argument(
         "--train_vision",
         action="store_true",
