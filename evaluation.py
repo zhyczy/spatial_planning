@@ -720,16 +720,35 @@ def run_inference_spa(
     if image_xyz is not None:
         xyz_on_device = [xyz.to(device) for xyz in image_xyz]
 
-    # mm_token_type_ids is produced by the base processor but not used by SPA
-    inputs_dev.pop("mm_token_type_ids", None)
+    # Pre-compute 5D position_ids (seq, t, x, y, z) so that generate()'s
+    # _prepare_position_ids_for_generation is bypassed.  Without this,
+    # SpaForConditionalGeneration.forward uses *args/**kwargs and
+    # inspect.signature can't see "position_ids", so accepts_position_ids=False
+    # and the model falls back to compute_3d_position_ids() → 3D → shape
+    # mismatch in Spa4DRotaryEmbedding ("4 vs 3" error).
+    with torch.no_grad():
+        position_ids, _ = model.model.get_rope_index(
+            input_ids=inputs_dev["input_ids"],
+            mm_token_type_ids=inputs_dev["mm_token_type_ids"],
+            image_grid_thw=inputs_dev.get("image_grid_thw"),
+            video_grid_thw=inputs_dev.get("video_grid_thw"),
+            attention_mask=inputs_dev.get("attention_mask"),
+            image_xyz=xyz_on_device,
+            coord_scale=coord_scale,
+        )
 
     gen_kwargs: Dict[str, Any] = dict(
         **inputs_dev,
+        position_ids=position_ids,
         max_new_tokens=max_new_tokens,
         do_sample=False,
         pad_token_id=processor.tokenizer.eos_token_id,
         coord_scale=coord_scale,
     )
+    # mm_token_type_ids was already consumed to pre-compute position_ids above.
+    # HuggingFace's _validate_model_kwargs would reject it because it's not in
+    # SpaForConditionalGeneration.prepare_inputs_for_generation's signature.
+    gen_kwargs.pop("mm_token_type_ids", None)
     if xyz_on_device is not None:
         gen_kwargs["image_xyz"] = xyz_on_device
 
