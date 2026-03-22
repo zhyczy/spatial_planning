@@ -16,6 +16,7 @@ data_annotation/
 generated_videos/
 coord_results/
 vis_results/
+historical_results/
 
 # C extensions
 *.so
@@ -88,6 +89,7 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+used/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -194,3 +196,4 @@ wandb/
 checkpoints/
 results/
 train_records/
+eval_results/

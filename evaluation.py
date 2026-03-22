@@ -1,40 +1,51 @@
 """
-Dual-method reasoning evaluation on MMSIBench.
+evaluation.py
 
-For every sample, runs inference with TWO methods in a single pass:
+Two-method QA evaluation:
 
-  Method A – Baseline
-      Input: original dataset images + question
+  Method A — baseline
+      Model : Qwen3.5-VL loaded as AutoModelForImageTextToText
+      Input : original dataset images + question (standard VLM inference)
 
-  Method B – Augmented
-      Input: original dataset images + generated images (from --gen_dir)
-             + question
-      If no generated images exist for a sample (empty/missing folder),
-      the augmented method falls back to the same input as baseline.
+  Method B — correspondence
+      Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA adapter from
+              --correspondence_ckpt, evaluated WITHOUT the PoseRegressionHead
+      Input : original dataset images + question
+      3D pos: CoordEstimator (MapAnything) estimates per-pixel XYZ for each
+              image, aligns all frames to the first-frame camera coordinate
+              system, and passes image_xyz to the 4D M-RoPE position embedding.
 
-Both methods share the same model instance per GPU worker.
+Run a single method or both:
+  --method baseline          → only Method A
+  --method correspondence    → only Method B
+  --method both              → both (default)
 
 Usage
 -----
+# baseline only
 python evaluation.py \\
-    --model_type  qwen3-vl \\
-    --model_path  checkpoints/Qwen3-VL-4B-Instruct \\
-    --data_dir    datasets/evaluation/MMSIBench \\
-    --gen_dir     generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B
+    --method baseline \\
+    --model_path checkpoints/Qwen3.5-4B \\
+    --data_dir  datasets/evaluation/MMSIBench
+
+# correspondence only
+python evaluation.py \\
+    --method correspondence \\
+    --model_path            checkpoints/Qwen3.5-4B \\
+    --correspondence_ckpt   train_records/correspondence/final \\
+    --data_dir              datasets/evaluation/MMSIBench
+
+# both
+python evaluation.py \\
+    --model_path            checkpoints/Qwen3.5-4B \\
+    --correspondence_ckpt   train_records/correspondence/final \\
+    --data_dir              datasets/evaluation/MMSIBench
 
 Multi-GPU (auto-shards across all visible GPUs):
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python evaluation.py \\
-        --model_type qwen3-vl \\
-        --model_path checkpoints/Qwen3-VL-4B-Instruct \\
-        --data_dir   datasets/evaluation/MMSIBench \\
-        --gen_dir    generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python evaluation.py --method both ...
 
 Smoke test:
-    python evaluation.py --limit 12 \\
-        --model_type qwen3-vl \\
-        --model_path checkpoints/Qwen3-VL-4B-Instruct \\
-        --data_dir   datasets/evaluation/MMSIBench \\
-        --gen_dir    generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B
+    python evaluation.py --limit 6 --method both ...
 """
 from __future__ import annotations
 
@@ -50,14 +61,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
 
+# ── sys.path: ensure spatial_planning/ root is importable ──────────────────
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 # ---------------------------------------------------------------------------
-# Prompt templates (same convention as Spatial_RAI eval)
+# Prompt templates
 # ---------------------------------------------------------------------------
 QUESTION_TEMPLATE = "{Question}"
+
+# ── Non-thinking mode: answer first, then reasoning ──────────────────────────
 ANSWER_INSTRUCTION = (
     "First output your answer as <answer>X</answer> where X is the option letter, "
     "then explain your reasoning."
@@ -69,22 +88,32 @@ EVAL_SYSTEM_PROMPT = (
     "Then provide your step-by-step reasoning."
 )
 
+# ── Thinking mode: model reasons first, then outputs answer ──────────────────
+ANSWER_INSTRUCTION_THINKING = (
+    "After your reasoning, output your final answer as <answer>X</answer> "
+    "where X is the option letter (e.g. <answer>A</answer>)."
+)
+EVAL_SYSTEM_PROMPT_THINKING = (
+    "You are a spatial reasoning expert. "
+    "Think step by step about the question. "
+    "After your reasoning, output your final answer in the format "
+    "<answer>X</answer> where X is the option letter (e.g. <answer>A</answer>)."
+)
+
 
 # ===========================================================================
-# Dataset utilities
+# Dataset utilities  (unchanged from previous version)
 # ===========================================================================
 
-def load_dataset(data_dir: Path, limit: Optional[int] = None,
-                 dataset: str = "mmsibench") -> List[Dict[str, Any]]:
+def load_dataset(
+    data_dir: Path,
+    limit: Optional[int] = None,
+    dataset: str = "mmsibench",
+) -> List[Dict[str, Any]]:
     """Load evaluation dataset.
 
-    Supports:
-      - mmsibench : JSON array at data/test_data_final.json
-      - mindcube  : JSONL at MindCube_tinybench.jsonl
-      - sat       : JSON array at test.json
-      - vsibench  : JSONL at test.jsonl
-
-    Image paths are relative to data_dir and resolved to absolute paths.
+    Supports: mmsibench | mindcube | sat | vsibench
+    Image paths are resolved to absolute paths.
     """
     samples: List[Dict[str, Any]] = []
 
@@ -109,6 +138,7 @@ def load_dataset(data_dir: Path, limit: Optional[int] = None,
                 "answer": item.get("answer", ""),
                 "category": item.get("type", "unknown"),
                 "thought": item.get("thought_gt", ""),
+                "data_dir": str(data_dir),
             })
 
     elif dataset == "mindcube":
@@ -129,9 +159,12 @@ def load_dataset(data_dir: Path, limit: Optional[int] = None,
                 "answer": item.get("gt_answer", ""),
                 "category": category[0] if category else "unknown",
                 "thought": "",
+                "data_dir": str(data_dir),
             })
 
-    elif dataset == "sat":
+    elif dataset in ("sat", "sat_real"):
+        # SAT (Spatial Awareness Tasks) — real image dataset.
+        # Keys: database_idx, question_type, question, answer_choices, correct_answer, img_paths
         json_file = data_dir / "test.json"
         if not json_file.exists():
             raise FileNotFoundError(f"Dataset file not found: {json_file}")
@@ -139,15 +172,33 @@ def load_dataset(data_dir: Path, limit: Optional[int] = None,
             raw = json.load(f)
         if limit is not None:
             raw = raw[:limit]
+        _letters = "ABCDEFGHIJ"
         for item in raw:
-            image_paths = [str((data_dir / p).resolve()) for p in item.get("images", [])]
+            img_paths = item.get("img_paths", item.get("images", []))
+            image_paths = [str((data_dir / p).resolve()) for p in img_paths]
+            choices = item.get("answer_choices", [])
+            correct = item.get("correct_answer", item.get("answer", ""))
+            # Format as "A. choice\nB. choice\n..." and store letter as answer
+            if choices:
+                formatted = "\n".join(
+                    f"{_letters[i]}. {c}" for i, c in enumerate(choices)
+                )
+                question_text = item.get("question", "") + "\n" + formatted
+                try:
+                    answer_letter = _letters[choices.index(correct)]
+                except ValueError:
+                    answer_letter = correct  # fallback: store raw text
+            else:
+                question_text = item.get("question", "")
+                answer_letter = correct
             samples.append({
-                "index": item.get("id", len(samples)),
+                "index": item.get("database_idx", item.get("id", len(samples))),
                 "image": image_paths,
-                "question": item.get("question", ""),
-                "answer": item.get("answer", item.get("gt_answer", "")),
-                "category": item.get("type", "unknown"),
-                "thought": item.get("thought_gt", ""),
+                "question": question_text,
+                "answer": answer_letter,
+                "category": item.get("question_type", item.get("type", "unknown")),
+                "thought": "",
+                "data_dir": str(data_dir),
             })
 
     elif dataset == "vsibench":
@@ -167,12 +218,47 @@ def load_dataset(data_dir: Path, limit: Optional[int] = None,
                 "answer": item.get("answer", item.get("gt_answer", "")),
                 "category": item.get("type", "unknown"),
                 "thought": "",
+                "data_dir": str(data_dir),
+            })
+
+    elif dataset in ("sparbench_multi_view", "sparbench_single_view"):
+        # SPARBench — images are base64-encoded JPEG strings embedded in the JSON.
+        # Keys: id, img_type, format_type, task, source, question, answer, images
+        import base64, tempfile
+        suffix = "multi_view" if dataset == "sparbench_multi_view" else "single_view"
+        json_file = data_dir / f"sparbench_{suffix}.json"
+        if not json_file.exists():
+            raise FileNotFoundError(f"Dataset file not found: {json_file}")
+        with open(json_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if limit is not None:
+            raw = raw[:limit]
+        # Create a single temp dir per dataset load; images persist for the process lifetime.
+        _tmp_dir = Path(tempfile.mkdtemp(prefix=f"sparbench_{suffix}_"))
+        for item in raw:
+            b64_images = item.get("images", [])
+            image_paths = []
+            item_id = item.get("id", len(samples))
+            for img_idx, b64 in enumerate(b64_images):
+                img_bytes = base64.b64decode(b64)
+                img_path = _tmp_dir / f"{item_id}_{img_idx}.jpg"
+                img_path.write_bytes(img_bytes)
+                image_paths.append(str(img_path))
+            samples.append({
+                "index": item_id,
+                "image": image_paths,
+                "question": item.get("question", ""),
+                "answer": item.get("answer", ""),
+                "category": item.get("task", "unknown"),
+                "thought": "",
+                "data_dir": str(data_dir),
             })
 
     else:
         raise ValueError(
             f"Unknown dataset '{dataset}'. "
-            "Choose: mmsibench | mindcube | sat | vsibench"
+            "Choose: mmsibench | mindcube | sat | sat_real | vsibench | "
+            "sparbench_multi_view | sparbench_single_view"
         )
 
     return samples
@@ -185,57 +271,25 @@ def chunk_dataset(dataset: List[Dict], num_shards: int) -> List[List[Dict]]:
     return [dataset[s : s + chunk_size] for s in range(0, len(dataset), chunk_size)]
 
 
-def get_generated_images(sample_index: int, gen_dir: Optional[Path]) -> List[str]:
-    """Return sorted list of generated image paths for *sample_index*.
-
-    Returns an empty list if gen_dir is None, the sub-folder doesn't exist,
-    or the sub-folder is empty (meaning no image generation was needed).
-    """
-    if gen_dir is None:
-        return []
-    sample_dir = gen_dir / str(sample_index)
-    if not sample_dir.is_dir():
-        return []
-    imgs = sorted(
-        p for p in sample_dir.iterdir()
-        if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
-    )
-    return [str(p) for p in imgs]
-
-
 # ===========================================================================
 # Answer extraction
 # ===========================================================================
 
 def extract_answer_letter(text: str) -> str:
-    """Extract the answer letter from raw model output.
-
-    Priority order:
-    1. <answer>X</answer> tag (the requested format).
-    2. Explicit phrases like "answer is X", "The answer is X", "Option X".
-    3. Last standalone option letter A-D in the text (fallback).
-    """
     if not text or not isinstance(text, str):
         return ""
-
-    # 1. <answer>X</answer> tag
     m = re.search(r"<answer>\s*([A-Za-z])\s*</answer>", text, re.IGNORECASE)
     if m:
         return m.group(1).upper()
-
-    # 2. Explicit answer phrases (case-insensitive)
     m = re.search(
         r"(?:the\s+)?(?:answer|option|choice)\s+(?:is\s+)?[:\s]*([A-Za-z])\b",
         text, re.IGNORECASE,
     )
     if m:
         return m.group(1).upper()
-
-    # 3. Last standalone option letter A-D in the text (fallback).
     matches = re.findall(r"\b([A-D])\b", text)
     if matches:
         return matches[-1]
-
     return ""
 
 
@@ -243,122 +297,287 @@ def extract_answer_letter(text: str) -> str:
 # Model loading
 # ===========================================================================
 
-def load_model_and_processor(
-    model_type: str,
+def load_baseline_model(
     model_path: str,
     device: str = "cuda:0",
 ) -> Tuple[Any, Any]:
-    """Load model and processor for the given *model_type*.
+    """Load standard Qwen3.5-VL for baseline evaluation."""
+    logger = logging.getLogger(__name__)
+    logger.info(f"[baseline] Loading from '{model_path}' onto {device}")
 
-    Supported model types
-    ---------------------
-    ``qwen2.5-vl``   – Qwen2.5-VL family (baseline)
-    ``qwen3-vl``     – Qwen3-VL family (uses same API as Qwen2.5-VL)
+    from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    The model is first loaded on CPU and then moved to *device* explicitly so
-    that multi-GPU workers can each own a single GPU without relying on
-    ``CUDA_VISIBLE_DEVICES`` tricks.
+    attn_impls = ["sdpa"]
+    try:
+        import fla  # noqa: F401
+        logger.info("flash-linear-attention available (linear-attn fast path active)")
+    except Exception:
+        pass
+
+    last_exc = None
+    model = None
+    for attn_impl in attn_impls:
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_path,
+                dtype=torch.bfloat16,
+                device_map="cpu",
+                attn_implementation=attn_impl,
+                local_files_only=True,
+            )
+            logger.info(f"[baseline] attn_implementation={attn_impl}")
+            break
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    if model is None:
+        raise RuntimeError(f"Failed to load baseline model from {model_path}") from last_exc
+
+    model = model.to(device).eval()
+    processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
+    logger.info(f"[baseline] Model ready on {next(model.parameters()).device}")
+    return model, processor
+
+
+def load_spa_model(
+    base_model_path: str,
+    ckpt_path: str,
+    device: str = "cuda:0",
+) -> Tuple[Any, Any]:
+    """Load SpaForConditionalGeneration with LoRA adapter for correspondence evaluation.
+
+    Steps:
+      1. Load config and set mrope_section to 4 equal parts (4D M-RoPE).
+      2. Load base SpaForConditionalGeneration from base_model_path.
+      3. Load processor/tokenizer from ckpt_path (has <pose> in vocab).
+      4. Resize embedding table to match the saved tokenizer.
+      5. Load PEFT LoRA adapter from ckpt_path, then merge into base weights.
     """
     logger = logging.getLogger(__name__)
-    logger.info(f"Loading model type='{model_type}' from '{model_path}' onto {device}")
+    logger.info(f"[correspondence] Loading SPA model: base={base_model_path}  ckpt={ckpt_path}")
 
-    if model_type in ("qwen2.5-vl", "qwen3-vl", "qwen3.5"):
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+    from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+    from peft import PeftModel
+    from models.spa_emb import SpaForConditionalGeneration
 
-        # Qwen3.5: sdpa for transformer blocks; linear attention layers use
-        # flash-linear-attention automatically when the library is installed.
-        if model_type == "qwen3.5":
-            attn_impls = ["sdpa"]
-            try:
-                import fla  # noqa: F401
-                logger.info("flash-linear-attention: available ✓ (linear-attn fast path active)")
-            except Exception as fla_exc:
-                logger.warning(
-                    f"flash-linear-attention import failed ({type(fla_exc).__name__}: {fla_exc}) "
-                    "— Qwen3.5 linear-attention layers will use slow torch fallback. "
-                    "Install with: pip install flash-linear-attention"
-                )
-        else:
-            attn_impls = ["flash_attention_2", "sdpa"]
+    # 1. Config: switch to 4D mrope_section
+    config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
+    orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
+    section_size = sum(orig_section) // 4
+    config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
+    logger.info(f"[correspondence] mrope_section: {orig_section} → {[section_size]*4}")
 
-        last_exc = None
-        for attn_impl in attn_impls:
-            try:
-                model = AutoModelForImageTextToText.from_pretrained(
-                    model_path,
-                    dtype=torch.bfloat16,
-                    device_map="cpu",
-                    attn_implementation=attn_impl,
-                    local_files_only=True,
-                )
-                break
-            except Exception as exc:
-                last_exc = exc
-                continue
-        else:
-            raise RuntimeError(
-                f"Failed to load model from {model_path}"
-            ) from last_exc
-
-        model = model.to(device)
-        processor = AutoProcessor.from_pretrained(
-            model_path,
-            local_files_only=True,
-        )
-
-        model_device = next(model.parameters()).device
-        logger.info(f"Model loaded on device: {model_device} (attn={attn_impl})")
-        return model, processor
-
-    raise ValueError(
-        f"Unknown model_type '{model_type}'. "
-        "Supported: 'qwen2.5-vl', 'qwen3-vl', 'qwen3.5'"
+    # 2. Load base model
+    spa = SpaForConditionalGeneration.from_pretrained(
+        base_model_path,
+        config=config,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",
     )
 
+    # 3. Processor from base model; swap in the checkpoint tokenizer (<pose> token added during training)
+    processor = AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(ckpt_path, local_files_only=True)
+    processor.tokenizer = tokenizer
+
+    # 4. Resize embedding table to match saved tokenizer vocab
+    new_vocab = len(tokenizer)
+    old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
+    if new_vocab > old_vocab:
+        spa.resize_token_embeddings(new_vocab)
+        logger.info(f"[correspondence] Embedding: {old_vocab} → {new_vocab}")
+
+    # 5. Load LoRA adapter and merge
+    spa = PeftModel.from_pretrained(spa, ckpt_path, is_trainable=False)
+    spa = spa.merge_and_unload()
+    logger.info("[correspondence] LoRA adapter merged.")
+
+    spa = spa.to(device).eval()
+    logger.info(f"[correspondence] Model ready on {next(spa.parameters()).device}")
+    return spa, processor
+
 
 # ===========================================================================
-# Inference helpers
+# 3D coordinate estimation helpers
 # ===========================================================================
 
-def build_user_message(item: Dict[str, Any], extra_images: List[str]) -> Dict:
-    """Build a Qwen-VL chat message.
+def _resize_xyz(
+    xyz: np.ndarray,
+    target_h: int,
+    target_w: int,
+    valid: Optional[np.ndarray] = None,
+) -> torch.Tensor:
+    """Average-pool per-pixel XYZ map to (target_h, target_w, 3).
 
-    Image order: original dataset images → extra (generated) images → question text.
+    Mirrors resize_xyz() in train_correspondence.py exactly so that the
+    image_xyz format matches what the model was trained with.
     """
-    all_images = item["image"] + extra_images
-    image_contents = [{"type": "image", "image": p} for p in all_images]
-    text = f"{QUESTION_TEMPLATE.format(Question=item['question'])}\n{ANSWER_INSTRUCTION}"
+    H, W = xyz.shape[:2]
+    xyz_f = xyz.astype(np.float32)
+
+    if valid is None:
+        valid = np.ones((H, W), dtype=bool)
+
+    stride_h = H // target_h
+    stride_w = W // target_w
+    H_crop = target_h * stride_h
+    W_crop = target_w * stride_w
+    xyz_f = xyz_f[:H_crop, :W_crop]
+    valid_f = valid[:H_crop, :W_crop].astype(np.float32)
+
+    xyz_blocks   = xyz_f.reshape(target_h, stride_h, target_w, stride_w, 3)
+    valid_blocks = valid_f.reshape(target_h, stride_h, target_w, stride_w)
+
+    xyz_sum   = (xyz_blocks * valid_blocks[..., None]).sum(axis=(1, 3))  # (th, tw, 3)
+    valid_cnt = valid_blocks.sum(axis=(1, 3))                            # (th, tw)
+    denom     = np.maximum(valid_cnt, 1)[..., None]
+    xyz_mean  = xyz_sum / denom
+    xyz_mean[valid_cnt == 0] = 0.0
+
+    return torch.from_numpy(xyz_mean)  # (target_h, target_w, 3)
+
+
+def load_precomputed_coords(item: Dict[str, Any]) -> Optional[List[Dict]]:
+    """Load precomputed per-pixel 3D coordinates from 3d_results/<index>/view_XXXX/.
+
+    Returns a list of dicts (one per image view) with keys:
+        pts3d       : np.ndarray (H, W, 3)
+        camera_pose : np.ndarray (4, 4)
+        mask        : np.ndarray (H, W) bool
+    Returns None if the 3d_results directory for this sample does not exist.
+    """
+    data_dir = item.get("data_dir")
+    index = item.get("index")
+    if data_dir is None or index is None:
+        return None
+
+    sample_dir = Path(data_dir) / "3d_results" / str(index)
+    if not sample_dir.exists():
+        return None
+
+    view_dirs = sorted(sample_dir.glob("view_*"))
+    if not view_dirs:
+        return None
+
+    results = []
+    for vd in view_dirs:
+        pts3d_path = vd / "pts3d.npy"
+        mask_path  = vd / "mask.npy"
+        pose_path  = vd / "camera_pose.npy"
+        if not pts3d_path.exists():
+            continue
+        pts3d = np.load(str(pts3d_path))          # (H, W, 3)
+        mask  = np.load(str(mask_path)).astype(bool) if mask_path.exists() else np.ones(pts3d.shape[:2], dtype=bool)
+        pose  = np.load(str(pose_path)) if pose_path.exists() else np.eye(4, dtype=np.float64)
+        results.append({"pts3d": pts3d, "camera_pose": pose, "mask": mask})
+
+    return results if results else None
+
+
+def build_image_xyz(
+    coord_results: List[Dict],
+    image_grid_thw: torch.Tensor,
+    spatial_merge_size: int = 2,
+) -> List[torch.Tensor]:
+    """Convert CoordEstimator output to image_xyz list for SpaForConditionalGeneration.
+
+    1. Aligns all frames to the first-frame camera coordinate system
+       (T0_inv = inv(camera_pose[0])).
+    2. Resizes each per-pixel XYZ map to the LLM patch grid resolution
+       (grid_thw[i, 1:] // spatial_merge_size).
+
+    Parameters
+    ----------
+    coord_results : list of dicts from CoordEstimator.estimate(), one per image.
+        Each dict has: pts3d (H,W,3), camera_pose (4,4), mask (H,W).
+    image_grid_thw : (N, 3) int tensor from the processor output.
+    spatial_merge_size : from vision_config (typically 2).
+
+    Returns
+    -------
+    List of N tensors, each (llm_H_i, llm_W_i, 3) float32.
+    """
+    N = image_grid_thw.shape[0]
+
+    # World-to-first-frame transform
+    T0_inv = np.linalg.inv(coord_results[0]["camera_pose"].astype(np.float64))  # (4,4)
+
+    xyz_list: List[torch.Tensor] = []
+    for k in range(N):
+        thw_k = image_grid_thw[k]                      # (T, H_patches, W_patches)
+        llm_h = int(thw_k[1]) // spatial_merge_size
+        llm_w = int(thw_k[2]) // spatial_merge_size
+
+        if k < len(coord_results):
+            r    = coord_results[k]
+            pts  = r["pts3d"].astype(np.float64)        # (H, W, 3)
+            mask = r["mask"]                            # (H, W) bool
+            H, W = pts.shape[:2]
+
+            # Transform pts to first-frame coords
+            pts_flat = pts.reshape(-1, 3)
+            ones     = np.ones((H * W, 1), dtype=np.float64)
+            pts_hom  = np.concatenate([pts_flat, ones], axis=1)  # (H*W, 4)
+            pts_ff   = (T0_inv @ pts_hom.T).T[:, :3].reshape(H, W, 3).astype(np.float32)
+
+            xyz_list.append(_resize_xyz(pts_ff, llm_h, llm_w, valid=mask))
+        else:
+            # Fallback: zero coords (no coord estimate available for this frame)
+            xyz_list.append(torch.zeros(llm_h, llm_w, 3))
+
+    return xyz_list
+
+
+# ===========================================================================
+# Inference helpers — baseline
+# ===========================================================================
+
+def _build_user_message(item: Dict[str, Any], thinking: bool = False) -> Dict:
+    image_contents = [{"type": "image", "image": p} for p in item["image"]]
+    instruction = ANSWER_INSTRUCTION_THINKING if thinking else ANSWER_INSTRUCTION
+    text = (
+        f"{QUESTION_TEMPLATE.format(Question=item['question'])}\n"
+        f"{instruction}"
+    )
     return {"role": "user", "content": image_contents + [{"type": "text", "text": text}]}
 
 
-def prepare_batch(
+def prepare_batch_baseline(
     batch_data: List[Dict],
-    extra_images_list: List[List[str]],
     processor: Any,
-    enable_thinking: bool = False,
+    thinking: bool = False,
 ) -> Tuple[Dict, List[str]]:
-    """Tokenise a batch. *extra_images_list[i]* are generated images for batch_data[i]."""
+    """Tokenise a batch for the standard Qwen3.5-VL baseline."""
     from qwen_vl_utils import process_vision_info
 
+    system_prompt = EVAL_SYSTEM_PROMPT_THINKING if thinking else EVAL_SYSTEM_PROMPT
     batch_messages = [
-        [{"role": "system", "content": EVAL_SYSTEM_PROMPT},
-         build_user_message(item, extra)]
-        for item, extra in zip(batch_data, extra_images_list)
+        [{"role": "system", "content": system_prompt},
+         _build_user_message(item, thinking=thinking)]
+        for item in batch_data
     ]
 
-    # Append "<answer>" as a forced prefix so the model's first tokens are the
-    # answer letter + "</answer>", guaranteeing extractable output even when
-    # the subsequent reasoning is truncated by max_new_tokens.
-    prompts_text = [
-        processor.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-        ) + "<answer>"
-        for msgs in batch_messages
-    ]
+    if thinking:
+        # enable_thinking=True lets the model emit <think>...</think> before answering.
+        # Do NOT append "<answer>" — that would suppress the thinking block.
+        prompts_text = [
+            processor.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for msgs in batch_messages
+        ]
+    else:
+        # Append "<answer>" to force the model to start its output with the answer.
+        prompts_text = [
+            processor.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True,
+            ) + "<answer>"
+            for msgs in batch_messages
+        ]
 
-    all_image_inputs: List[Any] = []
-    all_video_inputs: List[Any] = []
+    all_image_inputs, all_video_inputs = [], []
     for msgs in batch_messages:
         imgs, vids = process_vision_info(msgs)
         all_image_inputs.extend(imgs or [])
@@ -375,18 +594,16 @@ def prepare_batch(
     return batch_inputs, prompts_text
 
 
-def run_inference(
+def run_inference_baseline(
     batch_inputs: Dict,
     model: Any,
     processor: Any,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 512,
 ) -> List[str]:
-    """Run generation and return decoded strings for each sample in the batch."""
     batch_inputs = {
         k: v.to(model.device) if isinstance(v, torch.Tensor) else v
         for k, v in batch_inputs.items()
     }
-
     with torch.no_grad():
         generated_ids = model.generate(
             **batch_inputs,
@@ -394,49 +611,168 @@ def run_inference(
             do_sample=False,
             pad_token_id=processor.tokenizer.eos_token_id,
         )
-
-    # Trim input tokens from output
     trimmed = [
         out[len(inp):]
         for inp, out in zip(batch_inputs["input_ids"], generated_ids)
     ]
     return processor.batch_decode(
-        trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
+        trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False,
     )
 
 
-def postprocess(
-    batch_data: List[Dict],
-    outputs: List[str],
-    prompts: List[str],
-    extra_images_list: List[List[str]],
+# ===========================================================================
+# Inference helpers — correspondence (SpaForConditionalGeneration)
+# ===========================================================================
+
+def prepare_batch_spa(
+    item: Dict[str, Any],
+    processor: Any,
+    spatial_merge_size: int,
+    use_coord: bool,
+    coord_scale: float,
+    thinking: bool = False,
+) -> Tuple[Dict, str, List[torch.Tensor]]:
+    """Tokenise one sample and build image_xyz for SPA model inference.
+
+    Returns
+    -------
+    inputs     : processor output dict (input_ids, attention_mask, pixel_values, image_grid_thw)
+    prompt_str : prompt text (used for logging)
+    image_xyz  : list of (llm_H, llm_W, 3) tensors, or None if use_coord=False
+    """
+    from qwen_vl_utils import process_vision_info
+
+    system_prompt = EVAL_SYSTEM_PROMPT_THINKING if thinking else EVAL_SYSTEM_PROMPT
+    messages = [
+        {"role": "system", "content": system_prompt},
+        _build_user_message(item, thinking=thinking),
+    ]
+    if thinking:
+        prompt_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=True,
+        )
+    else:
+        prompt_text = (
+            processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            ) + "<answer>"
+        )
+
+    image_inputs, video_inputs = process_vision_info(messages)
+
+    inputs = processor(
+        text=[prompt_text],
+        images=image_inputs if image_inputs else None,
+        videos=video_inputs if video_inputs else None,
+        return_tensors="pt",
+        padding=False,
+    )
+
+    # Build image_xyz from precomputed 3d_results
+    image_xyz: Optional[List[torch.Tensor]] = None
+    if use_coord and item["image"]:
+        try:
+            coord_results = load_precomputed_coords(item)
+            image_grid_thw = inputs.get("image_grid_thw")
+            if coord_results is not None and image_grid_thw is not None and len(coord_results) > 0:
+                image_xyz = build_image_xyz(
+                    coord_results,
+                    image_grid_thw,
+                    spatial_merge_size=spatial_merge_size,
+                )
+            else:
+                logging.getLogger(__name__).warning(
+                    f"No precomputed 3D coords for sample {item.get('index')} "
+                    f"(data_dir={item.get('data_dir')}). Falling back to zero xyz."
+                )
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                f"Failed to load precomputed coords for sample {item.get('index')}: {exc}. "
+                "Falling back to zero xyz."
+            )
+
+    return inputs, prompt_text, image_xyz
+
+
+def run_inference_spa(
+    inputs: Dict,
+    image_xyz: Optional[List[torch.Tensor]],
+    model: Any,
+    processor: Any,
+    max_new_tokens: int = 512,
+    coord_scale: float = 100.0,
+) -> str:
+    """Run generation with SpaForConditionalGeneration.
+
+    image_xyz (if provided) is passed as a kwarg to model.generate() which
+    forwards it to forward() → get_rope_index() for 4D M-RoPE.
+    The PoseRegressionHead is NOT used; we only call generate() for QA.
+    """
+    device = next(model.parameters()).device
+    inputs_dev = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in inputs.items()
+    }
+
+    # Move image_xyz to device
+    xyz_on_device = None
+    if image_xyz is not None:
+        xyz_on_device = [xyz.to(device) for xyz in image_xyz]
+
+    # mm_token_type_ids is produced by the base processor but not used by SPA
+    inputs_dev.pop("mm_token_type_ids", None)
+
+    gen_kwargs: Dict[str, Any] = dict(
+        **inputs_dev,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=processor.tokenizer.eos_token_id,
+        coord_scale=coord_scale,
+    )
+    if xyz_on_device is not None:
+        gen_kwargs["image_xyz"] = xyz_on_device
+
+    with torch.no_grad():
+        generated_ids = model.generate(**gen_kwargs)
+
+    trimmed = generated_ids[0][inputs_dev["input_ids"].shape[1]:]
+    return processor.decode(
+        trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+    )
+
+
+# ===========================================================================
+# Result packaging
+# ===========================================================================
+
+def _make_result(
+    item: Dict,
+    output: str,
+    prompt: str,
     method: str,
-) -> List[Dict]:
-    """Package raw outputs into result dicts."""
-    results = []
-    for item, output, prompt, extra in zip(batch_data, outputs, prompts, extra_images_list):
-        # Restore the forced "<answer>" prefix stripped by the decoder so that
-        # extract_answer_letter can find the complete "<answer>X</answer>" tag.
-        full_output = "<answer>" + output
-        results.append({
-            "method": method,
-            "index": item.get("index", ""),
-            "category": item.get("category", "unknown"),
-            "question": item.get("question", ""),
-            "answer": item.get("answer", ""),
-            "prediction": extract_answer_letter(full_output),
-            "output": full_output,
-            "thought_gt": item.get("thought", ""),
-            "original_images": item["image"],
-            "generated_images": extra,
-            "prompt": prompt,
-        })
-    return results
+    thinking: bool = False,
+) -> Dict:
+    # Non-thinking: model output starts right after the "<answer>" prefix we
+    # injected into the prompt, so we prepend it back for a complete tag.
+    # Thinking: model generates the full response (including <think>...</think>
+    # and <answer>X</answer>) — no prefix needed.
+    full_output = output if thinking else "<answer>" + output
+    return {
+        "method": method,
+        "index": item.get("index", ""),
+        "category": item.get("category", "unknown"),
+        "question": item.get("question", ""),
+        "answer": item.get("answer", ""),
+        "prediction": extract_answer_letter(full_output),
+        "output": full_output,
+        "thought_gt": item.get("thought", ""),
+        "image_paths": item["image"],
+        "prompt": prompt,
+    }
 
 
-def _error_result(item: Dict, exc: Exception, method: str, extra: List[str]) -> Dict:
+def _error_result(item: Dict, exc: Exception, method: str) -> Dict:
     return {
         "method": method,
         "index": item.get("index", ""),
@@ -446,8 +782,7 @@ def _error_result(item: Dict, exc: Exception, method: str, extra: List[str]) -> 
         "prediction": "",
         "output": f"ERROR: {exc}",
         "thought_gt": item.get("thought", ""),
-        "original_images": item.get("image", []),
-        "generated_images": extra,
+        "image_paths": item.get("image", []),
         "prompt": "",
     }
 
@@ -457,23 +792,19 @@ def _error_result(item: Dict, exc: Exception, method: str, extra: List[str]) -> 
 # ===========================================================================
 
 def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
-    """Compute overall and per-category accuracy from *results*."""
     total = len(results)
     correct = 0
     cat_correct: dict = defaultdict(int)
     cat_total: dict = defaultdict(int)
-
     for r in results:
         pred = r.get("prediction", "").lower().strip()
-        gt = r.get("answer", "").lower().strip()
-        cat = r.get("category", "unknown")
+        gt   = r.get("answer", "").lower().strip()
+        cat  = r.get("category", "unknown")
         cat_total[cat] += 1
         if pred == gt:
             correct += 1
             cat_correct[cat] += 1
-
     cat_accuracy = {cat: cat_correct[cat] / cat_total[cat] for cat in cat_total}
-
     return {
         "overall_accuracy": correct / total if total else 0.0,
         "total_samples": total,
@@ -490,7 +821,6 @@ def log_metrics(metrics: Dict, label: str, logger: logging.Logger) -> None:
     logger.info(f"  Total   : {metrics['total_samples']}")
     logger.info(f"  Correct : {metrics['correct_samples']}")
     logger.info(f"  Accuracy: {metrics['overall_accuracy']:.2%}")
-    logger.info("")
     logger.info("  Per-category accuracy:")
     for cat, acc in sorted(metrics["category_accuracy"].items()):
         n = metrics["category_counts"].get(cat, 0)
@@ -499,94 +829,109 @@ def log_metrics(metrics: Dict, label: str, logger: logging.Logger) -> None:
 
 
 # ===========================================================================
-# Core evaluation function (runs on one GPU)
+# Core evaluation loop (runs on one GPU)
 # ===========================================================================
 
 def evaluate(
     data: List[Dict],
-    model_type: str,
-    model_path: str,
-    batch_size: int,
+    method: str,
+    # baseline args
+    baseline_model_path: str,
+    # correspondence args
+    spa_base_model_path: str,
+    correspondence_ckpt: Optional[str],
+    use_coord: bool,
+    coord_scale: float,
+    # common
     max_new_tokens: int,
-    gen_dir: Optional[Path],
-    output_path_baseline: Path,
-    output_path_augmented: Path,
+    output_dir: Path,
     device: str = "cuda:0",
-    baseline_thinking: bool = False,
-) -> Tuple[List[Dict], List[Dict]]:
-    """Run both methods for every sample in *data*.
+    thinking: bool = False,
+) -> Dict[str, List[Dict]]:
+    """Run evaluation for the requested method(s) on *data*.
 
-    The model is loaded once and reused for both inference passes.
-    Returns (baseline_results, augmented_results).
+    Returns dict mapping method name → list of result dicts.
     """
     logger = logging.getLogger(__name__)
 
-    if batch_size != 1:
-        logger.warning("batch_size > 1 not supported; forcing to 1.")
-        batch_size = 1
+    run_baseline = method in ("baseline", "both")
+    run_correspondence = method in ("correspondence", "both")
 
-    model, processor = load_model_and_processor(model_type, model_path, device)
+    # Lazy-load only what we need
+    baseline_model = baseline_proc = None
+    spa_model = spa_proc = None
 
-    baseline_results: List[Dict] = []
-    augmented_results: List[Dict] = []
+    if run_baseline:
+        baseline_model, baseline_proc = load_baseline_model(baseline_model_path, device)
 
-    n_with_gen = sum(1 for item in data if get_generated_images(item["index"], gen_dir))
-    logger.info(
-        f"[{device}] {len(data)} samples total, "
-        f"{n_with_gen} have generated images, "
-        f"{len(data) - n_with_gen} will use baseline images for both methods."
-    )
+    if run_correspondence:
+        if correspondence_ckpt is None:
+            raise ValueError("--correspondence_ckpt is required for method='correspondence'/'both'")
+        spa_model, spa_proc = load_spa_model(spa_base_model_path, correspondence_ckpt, device)
 
-    n_batches = math.ceil(len(data) / batch_size)
-    for i in tqdm(range(0, len(data), batch_size), total=n_batches, desc=f"[{device}]"):
-        batch_data = data[i : i + batch_size]
+        # Resolve spatial_merge_size from base model config
+        cfg_path = Path(spa_base_model_path) / "config.json"
+        with open(cfg_path) as f:
+            _vcfg = json.load(f).get("vision_config", {})
+        spatial_merge_size = int(_vcfg.get("spatial_merge_size", 2))
+        logger.info(f"[correspondence] spatial_merge_size={spatial_merge_size}")
 
-        # ---- Method A: Baseline (original images only) ----
-        try:
-            no_extra = [[] for _ in batch_data]
-            b_inputs, b_prompts = prepare_batch(batch_data, no_extra, processor,
-                                                enable_thinking=baseline_thinking)
-            b_outputs = run_inference(b_inputs, model, processor, max_new_tokens)
-            baseline_results.extend(
-                postprocess(batch_data, b_outputs, b_prompts, no_extra, "baseline")
-            )
-        except Exception as exc:
-            logger.error(
-                f"[baseline] Error on idx={batch_data[0].get('index','?')}: {exc}",
-                exc_info=True,
-            )
-            for item in batch_data:
-                baseline_results.append(_error_result(item, exc, "baseline", []))
+        if not use_coord:
+            logger.info("[correspondence] --no_coord set: using zero image_xyz")
 
-        # ---- Method B: Augmented (original + generated images) ----
-        try:
-            gen_extra = [
-                get_generated_images(item["index"], gen_dir) for item in batch_data
-            ]
-            a_inputs, a_prompts = prepare_batch(batch_data, gen_extra, processor,
-                                                enable_thinking=False)
-            a_outputs = run_inference(a_inputs, model, processor, max_new_tokens)
-            augmented_results.extend(
-                postprocess(batch_data, a_outputs, a_prompts, gen_extra, "augmented")
-            )
-        except Exception as exc:
-            logger.error(
-                f"[augmented] Error on idx={batch_data[0].get('index','?')}: {exc}",
-                exc_info=True,
-            )
-            for item, extra in zip(batch_data, gen_extra):
-                augmented_results.append(_error_result(item, exc, "augmented", extra))
+    results_map: Dict[str, List[Dict]] = {
+        "baseline": [],
+        "correspondence": [],
+    }
 
-    for path, results in [
-        (output_path_baseline, baseline_results),
-        (output_path_augmented, augmented_results),
-    ]:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        logger.info(f"Saved {len(results)} results → {path}")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    return baseline_results, augmented_results
+    for item in tqdm(data, desc=f"[{device}]"):
+
+        # ---- Baseline ----
+        if run_baseline:
+            try:
+                inputs, prompt = prepare_batch_baseline([item], baseline_proc,
+                                                         thinking=thinking)
+                outputs = run_inference_baseline(inputs, baseline_model, baseline_proc,
+                                                 max_new_tokens)
+                results_map["baseline"].append(
+                    _make_result(item, outputs[0], prompt[0], "baseline",
+                                 thinking=thinking)
+                )
+            except Exception as exc:
+                logger.error(f"[baseline] idx={item.get('index')}: {exc}", exc_info=True)
+                results_map["baseline"].append(_error_result(item, exc, "baseline"))
+
+        # ---- Correspondence ----
+        if run_correspondence:
+            try:
+                inputs, prompt, image_xyz = prepare_batch_spa(
+                    item, spa_proc,
+                    spatial_merge_size, use_coord, coord_scale,
+                    thinking=thinking,
+                )
+                output = run_inference_spa(
+                    inputs, image_xyz, spa_model, spa_proc,
+                    max_new_tokens, coord_scale,
+                )
+                results_map["correspondence"].append(
+                    _make_result(item, output, prompt, "correspondence",
+                                 thinking=thinking)
+                )
+            except Exception as exc:
+                logger.error(f"[correspondence] idx={item.get('index')}: {exc}", exc_info=True)
+                results_map["correspondence"].append(_error_result(item, exc, "correspondence"))
+
+    # Save per-worker partial results
+    for mname, mresults in results_map.items():
+        if mresults:
+            partial_path = output_dir / f"{mname}_{device.replace(':', '')}.json"
+            with open(partial_path, "w", encoding="utf-8") as f:
+                json.dump(mresults, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(mresults)} {mname} results → {partial_path}")
+
+    return results_map
 
 
 # ===========================================================================
@@ -596,17 +941,17 @@ def evaluate(
 def _worker(
     gpu_id: str,
     data_shard: List[Dict],
-    model_type: str,
-    model_path: str,
-    batch_size: int,
+    method: str,
+    baseline_model_path: str,
+    spa_base_model_path: str,
+    correspondence_ckpt: Optional[str],
+    use_coord: bool,
+    coord_scale: float,
     max_new_tokens: int,
-    gen_dir: Optional[str],
-    out_baseline: Path,
-    out_augmented: Path,
+    output_dir: str,
     log_file: Optional[str],
-    baseline_thinking: bool = False,
+    thinking: bool = False,
 ) -> None:
-    """Entry point for each subprocess (one per GPU)."""
     if log_file:
         logging.basicConfig(
             level=logging.INFO,
@@ -614,127 +959,90 @@ def _worker(
             handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
             force=True,
         )
-
     logger = logging.getLogger(__name__)
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(int(gpu_id))
+    logger.info(f"[Worker {gpu_id}] Starting — {len(data_shard)} samples on {device}")
 
-    logger.info(f"[Worker {gpu_id}] Starting – {len(data_shard)} samples on {device}")
     evaluate(
-        data_shard,
-        model_type,
-        model_path,
-        batch_size,
-        max_new_tokens,
-        Path(gen_dir) if gen_dir else None,
-        out_baseline,
-        out_augmented,
-        device,
-        baseline_thinking=baseline_thinking,
+        data=data_shard,
+        method=method,
+        baseline_model_path=baseline_model_path,
+        spa_base_model_path=spa_base_model_path,
+        correspondence_ckpt=correspondence_ckpt,
+        use_coord=use_coord,
+        coord_scale=coord_scale,
+        max_new_tokens=max_new_tokens,
+        output_dir=Path(output_dir),
+        device=device,
+        thinking=thinking,
     )
     logger.info(f"[Worker {gpu_id}] Done.")
 
 
 # ===========================================================================
-# Per-sample change analysis
+# Change analysis (baseline vs correspondence)
 # ===========================================================================
 
 def analyze_changes(
     baseline_results: List[Dict],
-    augmented_results: List[Dict],
+    correspondence_results: List[Dict],
     logger: logging.Logger,
 ) -> Dict[str, Any]:
-    """Categorise every sample into one of five mutually exclusive groups.
+    """Categorise per-sample changes between baseline and correspondence."""
+    corr_by_idx = {r["index"]: r for r in correspondence_results}
 
-    Groups
-    ------
-    degraded
-        Baseline correct, augmented wrong.
-        Generated images hurt performance on this sample.
-
-    improved
-        Baseline wrong, augmented correct.
-        Generated images helped performance on this sample.
-
-    correct_no_gen
-        Baseline correct, no generated images were produced for this sample
-        (augmented input == baseline input, augmented prediction == baseline).
-
-    correct_with_gen
-        Baseline correct, generated images existed, augmented also correct.
-
-    always_wrong
-        Both baseline and augmented wrong.
-
-    Returns a dict with per-group sample lists, counts, and proportions.
-    """
-    # Index augmented results by sample index for O(1) lookup
-    aug_by_idx = {r["index"]: r for r in augmented_results}
-
-    groups: Dict[str, List[Dict]] = {
-        "degraded": [],
-        "improved": [],
-        "correct_no_gen": [],
-        "correct_with_gen": [],
-        "always_wrong": [],
+    groups: Dict[str, List] = {
+        "improved":    [],   # baseline ✗, correspondence ✓
+        "degraded":    [],   # baseline ✓, correspondence ✗
+        "both_correct": [],  # both ✓
+        "both_wrong":  [],   # both ✗
     }
 
     for b in baseline_results:
         idx = b["index"]
-        a = aug_by_idx.get(idx)
-        if a is None:
-            logger.warning(f"No augmented result found for index {idx}, skipping.")
+        c = corr_by_idx.get(idx)
+        if c is None:
+            logger.warning(f"No correspondence result for index {idx}, skipping.")
             continue
 
-        b_correct = b.get("prediction", "").lower().strip() == b.get("answer", "").lower().strip()
-        a_correct = a.get("prediction", "").lower().strip() == a.get("answer", "").lower().strip()
-        has_gen = bool(a.get("generated_images"))  # non-empty list → images were added
+        b_ok = b.get("prediction", "").lower() == b.get("answer", "").lower()
+        c_ok = c.get("prediction", "").lower() == c.get("answer", "").lower()
 
         entry = {
             "index": idx,
-            "category": b.get("category", "unknown"),
+            "category": b.get("category", ""),
             "question": b.get("question", ""),
             "answer": b.get("answer", ""),
             "baseline_prediction": b.get("prediction", ""),
-            "augmented_prediction": a.get("prediction", ""),
-            "baseline_output": b.get("output", ""),
-            "augmented_output": a.get("output", ""),
-            "generated_images": a.get("generated_images", []),
+            "correspondence_prediction": c.get("prediction", ""),
         }
 
-        if b_correct and not a_correct:
-            groups["degraded"].append(entry)
-        elif not b_correct and a_correct:
+        if not b_ok and c_ok:
             groups["improved"].append(entry)
-        elif b_correct and not has_gen:
-            groups["correct_no_gen"].append(entry)
-        elif b_correct and has_gen and a_correct:
-            groups["correct_with_gen"].append(entry)
+        elif b_ok and not c_ok:
+            groups["degraded"].append(entry)
+        elif b_ok and c_ok:
+            groups["both_correct"].append(entry)
         else:
-            # covers: baseline wrong + augmented wrong (with or without gen images)
-            groups["always_wrong"].append(entry)
+            groups["both_wrong"].append(entry)
 
     total = sum(len(v) for v in groups.values())
-
     counts = {k: len(v) for k, v in groups.items()}
     proportions = {k: len(v) / total if total else 0.0 for k, v in groups.items()}
 
-    # Log summary
     logger.info("")
     logger.info("=" * 60)
-    logger.info("PER-SAMPLE CHANGE ANALYSIS")
+    logger.info("BASELINE vs CORRESPONDENCE — change analysis")
     logger.info("=" * 60)
-    descriptions = {
-        "degraded":       "Baseline ✓ → Augmented ✗  (gen images hurt)",
-        "improved":       "Baseline ✗ → Augmented ✓  (gen images helped)",
-        "correct_no_gen": "Baseline ✓, no gen images, Augmented ✓",
-        "correct_with_gen":"Baseline ✓, has gen images, Augmented ✓",
-        "always_wrong":   "Baseline ✗ & Augmented ✗  (both wrong)",
+    descs = {
+        "improved":     "Baseline ✗ → Correspondence ✓  (3D helps)",
+        "degraded":     "Baseline ✓ → Correspondence ✗  (3D hurts)",
+        "both_correct": "Both correct",
+        "both_wrong":   "Both wrong",
     }
-    for key, desc in descriptions.items():
-        n = counts[key]
-        pct = proportions[key]
-        logger.info(f"  {desc:<50s}: {n:4d}  ({pct:.1%})")
+    for k, desc in descs.items():
+        logger.info(f"  {desc:<50s}: {counts[k]:4d}  ({proportions[k]:.1%})")
     logger.info(f"  {'Total':<50s}: {total:4d}")
     logger.info("=" * 60)
 
@@ -742,7 +1050,6 @@ def analyze_changes(
         "total": total,
         "counts": counts,
         "proportions": proportions,
-        "descriptions": descriptions,
         "samples": {k: v for k, v in groups.items()},
     }
 
@@ -753,58 +1060,82 @@ def analyze_changes(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Dual-method QwenVL evaluation on MMSIBench (baseline vs augmented)."
+        description="Evaluation: Qwen3.5-VL baseline vs SPA correspondence model."
     )
-    # Model
-    parser.add_argument("--model_type", type=str, default="qwen2.5-vl",
-                        choices=["qwen2.5-vl", "qwen3-vl", "qwen3.5"])
-    parser.add_argument("--model_path", type=str, required=True)
-    # Data
-    parser.add_argument("--dataset", type=str, default="mmsibench",
-                        choices=["mmsibench", "mindcube", "sat", "vsibench"],
-                        help="Dataset name, controls how data files are parsed.")
-    parser.add_argument("--data_dir", type=str,
-                        default="datasets/evaluation/MMSIBench")
-    parser.add_argument("--gen_dir", type=str, default=None,
-                        help="Root of generated images, e.g. "
-                             "generated_images/mmsibench/Qwen3-VL-4B-Instruct/flux2-klein-4B. "
-                             "Sub-folder per sample index containing img_*.png files.")
+
+    # ── method ────────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--method", type=str, default="both",
+        choices=["baseline", "correspondence", "both"],
+        help="Which method(s) to run.",
+    )
+
+    # ── model paths ───────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--model_path", type=str, required=True,
+        help="Path to Qwen3.5-VL base model (used as baseline model AND as "
+             "base for loading the SPA correspondence model).",
+    )
+    parser.add_argument(
+        "--correspondence_ckpt", type=str, default=None,
+        help="Path to the LoRA checkpoint saved by train_correspondence.py "
+             "(contains adapter_model.safetensors + tokenizer). "
+             "Required when --method is 'correspondence' or 'both'.",
+    )
+
+    # ── 3D coordinate estimation ──────────────────────────────────────────────
+    parser.add_argument(
+        "--no_coord", action="store_true", default=False,
+        help="Skip CoordEstimator; pass zero image_xyz to the SPA model. "
+             "Useful for ablation or debugging without MapAnything.",
+    )
+    parser.add_argument(
+        "--coord_scale", type=float, default=100.0,
+        help="Scale applied to XYZ values before discretisation in M-RoPE "
+             "(must match the value used during training, default: 100.0).",
+    )
+
+    # ── data ──────────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--dataset", type=str, default="mmsibench",
+        choices=[
+            "mmsibench", "mindcube",
+            "sat", "sat_real",
+            "sparbench_multi_view", "sparbench_single_view",
+            "vsibench",
+        ],
+    )
+    parser.add_argument("--data_dir", type=str, default="datasets/evaluation/MMSIBench")
     parser.add_argument("--limit", type=int, default=None)
-    # Inference
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=2048)
-    # Output
-    parser.add_argument("--output_dir", type=str, default="results/mmsibench")
-    parser.add_argument("--model_name", type=str, default=None,
-                        help="Sub-folder name for this run (default: model_type).")
-    parser.add_argument("--gen_model_name", type=str, default=None,
-                        help="Human-readable name for the image generation model "
-                             "(defaults to the last path component of --gen_dir).")
-    # Thinking mode
-    parser.add_argument("--baseline_thinking", action="store_true", default=False,
-                        help="Enable Qwen3.5 thinking mode for the baseline method. "
-                             "Augmented (our method) always uses thinking=False.")
+
+    # ── inference ─────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--thinking", action="store_true", default=False,
+        help="Enable Qwen3 thinking mode (enable_thinking=True in chat template). "
+             "The model reasons in a <think>...</think> block before outputting "
+             "<answer>X</answer>. Increases generation length significantly; "
+             "raise --max_new_tokens to at least 4096 (recommend 8192).",
+    )
+    parser.add_argument("--max_new_tokens", type=int, default=512,
+                        help="Max new tokens for generation. "
+                             "Use ≥4096 (recommend 8192) with --thinking.")
+
+    # ── output ────────────────────────────────────────────────────────────────
+    parser.add_argument("--output_dir", type=str, default="results/eval")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="Sub-folder name (default: auto-generated timestamp).")
 
     args = parser.parse_args()
 
-    # Auto-scale max_new_tokens for thinking mode
-    _THINKING_MIN_TOKENS = 16384
-    if args.baseline_thinking and args.max_new_tokens < _THINKING_MIN_TOKENS:
-        print(
-            f"[INFO] baseline_thinking=True: auto-setting max_new_tokens "
-            f"{args.max_new_tokens} → {_THINKING_MIN_TOKENS}"
-        )
-        args.max_new_tokens = _THINKING_MIN_TOKENS
-
-    # ---- Setup ----
+    # ── setup ─────────────────────────────────────────────────────────────────
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_name = args.model_name or args.model_type
-    output_dir = Path(args.output_dir).resolve() / f"{model_name}_{timestamp}"
+    run_name = args.run_name or f"{args.method}_{timestamp}"
+    output_dir = Path(args.output_dir).resolve() / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = output_dir / "run.log"
@@ -815,25 +1146,14 @@ def main() -> None:
     )
     logger = logging.getLogger(__name__)
 
-    # ---- Load dataset ----
+    # ── load dataset ──────────────────────────────────────────────────────────
     data_dir = Path(args.data_dir).resolve()
     dataset = load_dataset(data_dir, limit=args.limit, dataset=args.dataset)
 
-    # ---- Resolve gen_dir ----
-    gen_dir: Optional[Path] = None
-    if args.gen_dir:
-        gen_dir = Path(args.gen_dir)
-        if not gen_dir.is_absolute():
-            gen_dir = Path.cwd() / gen_dir
-        gen_dir = gen_dir.resolve()
-        if not gen_dir.exists():
-            logger.warning(f"gen_dir does not exist: {gen_dir}. Augmented method = baseline.")
-
-    # ---- GPU setup ----
+    # ── GPU setup ─────────────────────────────────────────────────────────────
     n_gpu = torch.cuda.device_count()
     if n_gpu <= 0:
         raise RuntimeError("At least one CUDA device is required.")
-
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     gpu_ids = (
         [x.strip() for x in cuda_visible.split(",") if x.strip()]
@@ -841,109 +1161,53 @@ def main() -> None:
         else [str(i) for i in range(n_gpu)]
     )
 
-    n_with_gen = sum(1 for item in dataset if get_generated_images(item["index"], gen_dir))
-
-    # Resolve generation model display name
-    if args.gen_model_name:
-        gen_model_display = args.gen_model_name
-    elif gen_dir is not None:
-        gen_model_display = gen_dir.name  # last path component
-    else:
-        gen_model_display = "(none — augmented = baseline)"
-
+    # ── log config ────────────────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("EVALUATION CONFIGURATION")
     logger.info("=" * 60)
-    logger.info("")
-    planning_model_path = Path(args.model_path).resolve()
-    planning_model_display = args.model_name or planning_model_path.name
-
-    logger.info("  [Planning model — VQA inference]")
-    logger.info(f"    model_name     : {planning_model_display}")
-    logger.info(f"    model_type     : {args.model_type}")
-    logger.info(f"    model_path     : {planning_model_path}")
-    logger.info(f"    max_new_tokens : {args.max_new_tokens}")
-    logger.info(f"    batch_size     : {args.batch_size}")
-    logger.info(f"    baseline_thinking: {args.baseline_thinking}")
-    logger.info("")
-    logger.info("  [Generation model — augmented images]")
-    logger.info(f"    gen_model_name : {gen_model_display}")
-    logger.info(f"    gen_dir        : {gen_dir}")
-    logger.info("")
-    logger.info("  [Dataset]")
-    logger.info(f"    data_dir       : {data_dir}")
-    logger.info(f"    samples        : {len(dataset)}")
-    logger.info(f"    w/ gen images  : {n_with_gen} / {len(dataset)}")
-    logger.info("")
-    logger.info("  [Runtime]")
-    logger.info(f"    GPUs           : {gpu_ids}")
-    logger.info(f"    output_dir     : {output_dir}")
-    logger.info(f"    log_file       : {log_file}")
-    logger.info("")
+    logger.info(f"  method              : {args.method}")
+    logger.info(f"  thinking            : {args.thinking}")
+    logger.info(f"  model_path          : {args.model_path}")
+    logger.info(f"  correspondence_ckpt : {args.correspondence_ckpt}")
+    logger.info(f"  use_coord           : {not args.no_coord}")
+    logger.info(f"  coord_scale         : {args.coord_scale}")
+    logger.info(f"  dataset             : {args.dataset}  ({len(dataset)} samples)")
+    logger.info(f"  max_new_tokens      : {args.max_new_tokens}")
+    logger.info(f"  GPUs                : {gpu_ids}")
+    logger.info(f"  output_dir          : {output_dir}")
     logger.info("=" * 60)
 
-    # ---- Save configuration.json ----
-    config_record = {
-        "planning_model": {
-            "model_name": planning_model_display,
-            "model_type": args.model_type,
-            "model_path": str(planning_model_path),
-            "max_new_tokens": args.max_new_tokens,
-            "batch_size": args.batch_size,
-            "baseline_thinking": args.baseline_thinking,
-        },
-        "reasoning_model": {
-            "model_name": planning_model_display,
-            "model_type": args.model_type,
-            "model_path": str(planning_model_path),
-            "max_new_tokens": args.max_new_tokens,
-            "batch_size": args.batch_size,
-            "baseline_thinking": args.baseline_thinking,
-        },
-        "generation_model": {
-            "gen_model_name": gen_model_display,
-            "gen_dir": str(gen_dir) if gen_dir else None,
-        },
-        "dataset": {
-            "data_dir": str(data_dir),
-            "limit": args.limit,
-            "total_samples": len(dataset),
-            "samples_with_gen_images": n_with_gen,
-        },
-        "runtime": {
-            "gpus": gpu_ids,
-            "output_dir": str(output_dir),
-            "log_file": str(log_file),
-            "timestamp": timestamp,
-        },
-    }
-    config_path = output_dir / "configuration.json"
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config_record, f, indent=2, ensure_ascii=False)
-    logger.info(f"Configuration saved → {config_path}")
+    if args.thinking and args.max_new_tokens < 4096:
+        logger.warning(
+            f"--thinking is enabled but --max_new_tokens={args.max_new_tokens} "
+            "is likely too small (recommend ≥4096, ideally 8192). "
+            "The model may truncate mid-thought and produce no <answer> tag."
+        )
 
-    # ---- Launch workers ----
+    # ── save config ───────────────────────────────────────────────────────────
+    with open(output_dir / "configuration.json", "w", encoding="utf-8") as f:
+        json.dump(vars(args) | {"output_dir": str(output_dir), "gpus": gpu_ids,
+                                 "timestamp": timestamp}, f, indent=2, ensure_ascii=False)
+
+    # ── launch workers ────────────────────────────────────────────────────────
     shards = chunk_dataset(dataset, len(gpu_ids))
-    out_baseline_paths: List[Path] = []
-    out_augmented_paths: List[Path] = []
     processes: List[mp.Process] = []
 
     for gpu_id, shard in zip(gpu_ids, shards):
-        ob = output_dir / f"baseline_gpu{gpu_id}.json"
-        oa = output_dir / f"augmented_gpu{gpu_id}.json"
-        out_baseline_paths.append(ob)
-        out_augmented_paths.append(oa)
-
         p = mp.Process(
             target=_worker,
             args=(
                 gpu_id, shard,
-                args.model_type, args.model_path,
-                args.batch_size, args.max_new_tokens,
-                str(gen_dir) if gen_dir else None,
-                ob, oa,
+                args.method,
+                args.model_path,     # baseline + spa base
+                args.model_path,     # spa_base_model_path (same base)
+                args.correspondence_ckpt,
+                not args.no_coord,
+                args.coord_scale,
+                args.max_new_tokens,
+                str(output_dir),
                 str(log_file),
-                args.baseline_thinking,
+                args.thinking,
             ),
         )
         p.start()
@@ -952,12 +1216,13 @@ def main() -> None:
     for p in processes:
         p.join()
 
-    # ---- Merge results ----
+    # ── merge results ─────────────────────────────────────────────────────────
     logger.info("Merging results from all workers…")
 
-    def merge(paths: List[Path]) -> List[Dict]:
+    def merge(prefix: str) -> List[Dict]:
         merged = []
-        for path in paths:
+        for gpu_id in gpu_ids:
+            path = output_dir / f"{prefix}_cuda{gpu_id}.json"
             if path.exists():
                 with open(path, "r", encoding="utf-8") as f:
                     merged.extend(json.load(f))
@@ -966,57 +1231,62 @@ def main() -> None:
         merged.sort(key=lambda r: r.get("index", 0))
         return merged
 
-    baseline_all = merge(out_baseline_paths)
-    augmented_all = merge(out_augmented_paths)
+    all_results: Dict[str, List[Dict]] = {}
 
-    # ---- Compute & log metrics ----
-    metrics_baseline = compute_metrics(baseline_all)
-    metrics_augmented = compute_metrics(augmented_all)
+    run_baseline = args.method in ("baseline", "both")
+    run_correspondence = args.method in ("correspondence", "both")
 
-    log_metrics(metrics_baseline, "BASELINE  (original images only)", logger)
-    log_metrics(metrics_augmented, "AUGMENTED (original + generated images)", logger)
+    if run_baseline:
+        all_results["baseline"] = merge("baseline")
+    if run_correspondence:
+        all_results["correspondence"] = merge("correspondence")
 
-    # Side-by-side summary
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("SUMMARY COMPARISON")
-    logger.info("=" * 60)
-    logger.info(f"  {'Method':<45} {'Accuracy':>8}  {'Correct':>8} / Total")
-    logger.info(f"  {'-'*45}  {'-'*8}  {'-'*14}")
-    logger.info(
-        f"  {'Baseline  (original images only)':<45} "
-        f"{metrics_baseline['overall_accuracy']:>8.2%}  "
-        f"{metrics_baseline['correct_samples']:>8} / {metrics_baseline['total_samples']}"
-    )
-    logger.info(
-        f"  {'Augmented (original + generated images)':<45} "
-        f"{metrics_augmented['overall_accuracy']:>8.2%}  "
-        f"{metrics_augmented['correct_samples']:>8} / {metrics_augmented['total_samples']}"
-    )
-    logger.info("=" * 60)
+    # ── metrics ───────────────────────────────────────────────────────────────
+    for mname, mresults in all_results.items():
+        if mresults:
+            m = compute_metrics(mresults)
+            label = "BASELINE  (Qwen3.5-VL)" if mname == "baseline" else "CORRESPONDENCE  (SPA + CoordEst)"
+            log_metrics(m, label, logger)
+            with open(output_dir / f"metrics_{mname}.json", "w", encoding="utf-8") as f:
+                json.dump(m, f, ensure_ascii=False, indent=2)
+            with open(output_dir / f"results_{mname}.json", "w", encoding="utf-8") as f:
+                json.dump(mresults, f, ensure_ascii=False, indent=2)
 
-    # ---- Save outputs ----
-    with open(output_dir / "eval_result_baseline.json", "w", encoding="utf-8") as f:
-        json.dump(baseline_all, f, ensure_ascii=False, indent=2)
-    with open(output_dir / "eval_result_augmented.json", "w", encoding="utf-8") as f:
-        json.dump(augmented_all, f, ensure_ascii=False, indent=2)
-    with open(output_dir / "metrics_baseline.json", "w", encoding="utf-8") as f:
-        json.dump(metrics_baseline, f, ensure_ascii=False, indent=2)
-    with open(output_dir / "metrics_augmented.json", "w", encoding="utf-8") as f:
-        json.dump(metrics_augmented, f, ensure_ascii=False, indent=2)
+    # ── side-by-side summary + change analysis ────────────────────────────────
+    if run_baseline and run_correspondence and all_results.get("baseline") and all_results.get("correspondence"):
+        mb = compute_metrics(all_results["baseline"])
+        mc = compute_metrics(all_results["correspondence"])
 
-    comparison = {
-        "baseline": metrics_baseline,
-        "augmented": metrics_augmented,
-        "delta_overall_accuracy": metrics_augmented["overall_accuracy"] - metrics_baseline["overall_accuracy"],
-    }
-    with open(output_dir / "metrics_comparison.json", "w", encoding="utf-8") as f:
-        json.dump(comparison, f, ensure_ascii=False, indent=2)
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("SUMMARY COMPARISON")
+        logger.info("=" * 60)
+        logger.info(f"  {'Method':<45} {'Accuracy':>8}  {'Correct':>8} / Total")
+        logger.info(f"  {'-'*45}  {'-'*8}  {'-'*14}")
+        logger.info(
+            f"  {'Baseline  (Qwen3.5-VL)':<45} "
+            f"{mb['overall_accuracy']:>8.2%}  "
+            f"{mb['correct_samples']:>8} / {mb['total_samples']}"
+        )
+        logger.info(
+            f"  {'Correspondence  (SPA + CoordEst)':<45} "
+            f"{mc['overall_accuracy']:>8.2%}  "
+            f"{mc['correct_samples']:>8} / {mc['total_samples']}"
+        )
+        logger.info(f"  {'Delta':<45} {mc['overall_accuracy'] - mb['overall_accuracy']:>+8.2%}")
+        logger.info("=" * 60)
 
-    # ---- Per-sample change analysis ----
-    analysis = analyze_changes(baseline_all, augmented_all, logger)
-    with open(output_dir / "analysis_changes.json", "w", encoding="utf-8") as f:
-        json.dump(analysis, f, ensure_ascii=False, indent=2)
+        comparison = {
+            "baseline": mb,
+            "correspondence": mc,
+            "delta_overall_accuracy": mc["overall_accuracy"] - mb["overall_accuracy"],
+        }
+        with open(output_dir / "metrics_comparison.json", "w", encoding="utf-8") as f:
+            json.dump(comparison, f, ensure_ascii=False, indent=2)
+
+        analysis = analyze_changes(all_results["baseline"], all_results["correspondence"], logger)
+        with open(output_dir / "analysis_changes.json", "w", encoding="utf-8") as f:
+            json.dump(analysis, f, ensure_ascii=False, indent=2)
 
     logger.info(f"All results saved to: {output_dir}")
     logger.info("Done.")

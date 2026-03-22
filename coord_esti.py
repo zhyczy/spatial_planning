@@ -1,5 +1,9 @@
 """
-3D Coordinate and Camera Pose Estimation using MapAnything.
+3D Coordinate and Camera Pose Estimation.
+
+Routing:
+  - Multi-view (≥2 images) → MapAnything  (multi-view stereo)
+  - Single-view (1 image)  → Depth Pro    (monocular metric depth)
 
 For each input image frame, estimates:
   - Per-pixel 3D world coordinates  (H x W x 3, float32)
@@ -47,11 +51,18 @@ import torch
 _THIS_DIR = Path(__file__).resolve().parent
 _MAP_ANYTHING_DIR = _THIS_DIR / "external" / "map-anything"
 _CHECKPOINT_DIR   = _THIS_DIR / "checkpoints" / "map-anything-weights"
+_DEPTH_PRO_DIR    = _THIS_DIR / "external" / "ml-depth-pro" / "src"
+_DEPTH_PRO_CKPT   = _THIS_DIR / "checkpoints" / "depth_pro" / "depth_pro.pt"
 
 # Add map-anything to the Python path so its modules can be imported.
 _MAP_ANYTHING_STR = str(_MAP_ANYTHING_DIR)
 if _MAP_ANYTHING_STR not in sys.path:
     sys.path.insert(0, _MAP_ANYTHING_STR)
+
+# Add depth-pro src to the Python path.
+_DEPTH_PRO_STR = str(_DEPTH_PRO_DIR)
+if _DEPTH_PRO_STR not in sys.path:
+    sys.path.insert(0, _DEPTH_PRO_STR)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -84,7 +95,12 @@ _LOCAL_CONFIG = {
 
 
 class CoordEstimator:
-    """Load MapAnything once and run per-frame 3-D coordinate estimation."""
+    """Load MapAnything once and run per-frame 3-D coordinate estimation.
+
+    Routing:
+      - Multi-view (≥2 images) → MapAnything
+      - Single-view (1 image)  → Depth Pro (monocular metric depth)
+    """
 
     def __init__(
         self,
@@ -96,6 +112,8 @@ class CoordEstimator:
         self.memory_efficient = memory_efficient
         self.amp_dtype = amp_dtype
         self._model = self._load_model()
+        self._depth_pro_model = None
+        self._depth_pro_transform = None
 
     # ------------------------------------------------------------------
     # Model initialisation
@@ -110,6 +128,29 @@ class CoordEstimator:
         print("[CoordEstimator] Model ready.")
         return model
 
+    def _load_depth_pro(self):
+        """Lazy-load Depth Pro model (only when a single-view input is encountered)."""
+        if self._depth_pro_model is not None:
+            return
+
+        import depth_pro
+        from depth_pro.depth_pro import DepthProConfig
+
+        config = DepthProConfig(
+            patch_encoder_preset="dinov2l16_384",
+            image_encoder_preset="dinov2l16_384",
+            checkpoint_uri=str(_DEPTH_PRO_CKPT),
+            decoder_features=256,
+            use_fov_head=True,
+            fov_encoder_preset="dinov2l16_384",
+        )
+        print(f"[CoordEstimator] Loading Depth Pro from {_DEPTH_PRO_CKPT} on {self.device} …")
+        model, transform = depth_pro.create_model_and_transforms(config=config)
+        model = model.to(self.device).eval()
+        self._depth_pro_model = model
+        self._depth_pro_transform = transform
+        print("[CoordEstimator] Depth Pro ready.")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -117,9 +158,9 @@ class CoordEstimator:
     def estimate(
         self,
         images: Union[str, List[str], List[np.ndarray]],
-        save_dir: Optional[Union[str, Path]] = _RESULTS_DIR,
+        save_dir: Optional[Union[str, Path]] = None,
         run_name: Optional[str] = None,
-        visualize: bool = True,
+        visualize: bool = False,
     ) -> List[Dict]:
         """Estimate per-pixel 3-D coordinates and camera parameters.
 
@@ -147,32 +188,133 @@ class CoordEstimator:
             mask       – (H, W)    bool      valid (non-masked) pixels
             image      – (H, W, 3) uint8     original image (0-255)
         """
+        # ---- determine if single-view or multi-view --------------------
+        import PIL.Image as PILImage
+
+        if isinstance(images, list) and len(images) == 1:
+            # single image path or array
+            img = images[0]
+            if isinstance(img, str):
+                if run_name is None:
+                    run_name = Path(img).parent.name or "run"
+                img = np.array(PILImage.open(img).convert("RGB"), dtype=np.uint8)
+            elif run_name is None:
+                run_name = "run"
+            results = self._estimate_single_view(img)
+        else:
+            # multi-view: original MapAnything path
+            results = self._estimate_multi_view(images, run_name)
+            if run_name is None:
+                run_name = "run"
+
+        if not results:
+            raise ValueError("No valid images found.")
+
+        # ---- save to disk ----------------------------------------------
+        if save_dir is not None:
+            out_dir = save_results(results, save_dir=save_dir, run_name=run_name)
+            if visualize:
+                visualize_results(results, out_dir=out_dir)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Single-view path: Depth Pro
+    # ------------------------------------------------------------------
+
+    def _estimate_single_view(self, image_np: np.ndarray) -> List[Dict]:
+        """Use Depth Pro to estimate per-pixel 3-D coords for one image.
+
+        Parameters
+        ----------
+        image_np : (H, W, 3) uint8 RGB array
+
+        Returns
+        -------
+        List with one result dict (same schema as multi-view output).
+        """
+        import PIL.Image
+        import depth_pro
+
+        self._load_depth_pro()
+
+        pil_img = PIL.Image.fromarray(image_np).convert("RGB")
+        W, H = pil_img.size
+
+        # Preprocess and run inference
+        img_tensor = self._depth_pro_transform(pil_img).to(self.device)  # (3, H', W')
+        with torch.no_grad():
+            prediction = self._depth_pro_model.infer(img_tensor, f_px=None)
+
+        depth = prediction["depth"]          # (H', W') tensor, metric metres
+        focallength_px = prediction["focallength_px"].item()
+
+        # Resize depth back to original image size if needed
+        dH, dW = depth.shape[-2], depth.shape[-1]
+        if (dH, dW) != (H, W):
+            depth = torch.nn.functional.interpolate(
+                depth.unsqueeze(0).unsqueeze(0),
+                size=(H, W),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze()
+
+        depth_np = depth.cpu().float().numpy()  # (H, W)
+
+        # Build intrinsic matrix K (pinhole, principal point at image centre)
+        cx, cy = W / 2.0, H / 2.0
+        fx = fy = focallength_px
+        K = np.array([[fx, 0.0, cx],
+                      [0.0, fy, cy],
+                      [0.0, 0.0, 1.0]], dtype=np.float32)
+
+        # Back-project depth to 3-D camera-frame coordinates
+        us = np.arange(W, dtype=np.float32)
+        vs = np.arange(H, dtype=np.float32)
+        uu, vv = np.meshgrid(us, vs)          # (H, W)
+
+        X = (uu - cx) * depth_np / fx
+        Y = (vv - cy) * depth_np / fy
+        Z = depth_np
+        pts3d = np.stack([X, Y, Z], axis=-1)  # (H, W, 3)
+
+        # Camera pose: identity (camera frame = world frame for single view)
+        camera_pose = np.eye(4, dtype=np.float32)
+
+        # Valid mask: positive finite depth
+        mask = np.isfinite(depth_np) & (depth_np > 0)
+
+        return [{
+            "pts3d":       pts3d.astype(np.float32),
+            "depth":       depth_np.astype(np.float32),
+            "camera_pose": camera_pose,
+            "intrinsics":  K,
+            "mask":        mask,
+            "image":       image_np,
+        }]
+
+    # ------------------------------------------------------------------
+    # Multi-view path: MapAnything (original logic)
+    # ------------------------------------------------------------------
+
+    def _estimate_multi_view(
+        self,
+        images: Union[str, List[str], List[np.ndarray]],
+        run_name: Optional[str],
+    ) -> List[Dict]:
         from mapanything.utils.geometry import depthmap_to_world_frame
         from mapanything.utils.image import load_images
 
-        # ---- build the 'views' list expected by model.infer() ----------
         if isinstance(images, str):
-            if run_name is None:
-                run_name = Path(images).name or "run"
             views = load_images(images)
         elif isinstance(images, list) and len(images) > 0 and isinstance(images[0], str):
-            if run_name is None:
-                run_name = Path(images[0]).parent.name or "run"
             views = load_images(images)
-        elif isinstance(images, list) and len(images) > 0 and isinstance(images[0], np.ndarray):
-            if run_name is None:
-                run_name = "run"
-            views = self._views_from_arrays(images)
         else:
-            raise ValueError(
-                "images must be a folder path, a list of image file paths, "
-                "or a list of uint8 numpy arrays (H×W×3)."
-            )
+            views = self._views_from_arrays(images)
 
         if not views:
             raise ValueError("No valid images found.")
 
-        # ---- run inference (pure model forward, no augmentation) -------
         outputs = self._model.infer(
             views,
             memory_efficient_inference=self.memory_efficient,
@@ -184,24 +326,20 @@ class CoordEstimator:
             apply_confidence_mask=False,
         )
 
-        # ---- extract results -------------------------------------------
         results: List[Dict] = []
         for pred in outputs:
             depthmap_t    = pred["depth_z"][0].squeeze(-1)         # (H, W)
             intrinsics_t  = pred["intrinsics"][0]                   # (3, 3)
             camera_pose_t = pred["camera_poses"][0]                 # (4, 4)
 
-            # world-frame point cloud
             pts3d_t, valid_mask_t = depthmap_to_world_frame(
                 depthmap_t, intrinsics_t, camera_pose_t
             )
 
-            # confidence / edge mask from the model
             model_mask = pred["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
             valid_mask  = valid_mask_t.cpu().numpy()
             combined_mask = model_mask & valid_mask
 
-            # original image in [0, 255] uint8
             image_np = pred["img_no_norm"][0].cpu().numpy()
             if image_np.dtype != np.uint8:
                 image_np = (image_np * 255).clip(0, 255).astype(np.uint8)
@@ -214,12 +352,6 @@ class CoordEstimator:
                 "mask":        combined_mask,
                 "image":       image_np,
             })
-
-        # ---- save to disk ----------------------------------------------
-        if save_dir is not None:
-            out_dir = save_results(results, save_dir=save_dir, run_name=run_name)
-            if visualize:
-                visualize_results(results, out_dir=out_dir)
 
         return results
 
