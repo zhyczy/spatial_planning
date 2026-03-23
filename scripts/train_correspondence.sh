@@ -6,16 +6,18 @@
 # prediction.  Multi-GPU via torchrun (DDP).
 #
 # Usage:
-#   bash scripts/train_correspondence.sh [num_gpus] [num_samples]
+#   bash scripts/train_correspondence.sh [num_gpus] [num_samples] [--plus]
 #
 #   num_gpus    — number of GPUs to use (default: all available)
 #   num_samples — truncate dataset to this many entries (default: all)
+#   --plus      — enable correspondence_plus mode (adds LM answer-prediction loss)
 #
 # Examples:
-#   bash scripts/train_correspondence.sh            # all GPUs, full dataset
-#   bash scripts/train_correspondence.sh 2          # 2 GPUs, full dataset
-#   bash scripts/train_correspondence.sh 2 100      # 2 GPUs, 100 samples
-#   bash scripts/train_correspondence.sh 1 6        # single GPU, 6 samples
+#   bash scripts/train_correspondence.sh               # all GPUs, full dataset
+#   bash scripts/train_correspondence.sh 2             # 2 GPUs, full dataset
+#   bash scripts/train_correspondence.sh 2 100         # 2 GPUs, 100 samples
+#   bash scripts/train_correspondence.sh 1 6           # single GPU, 6 samples
+#   bash scripts/train_correspondence.sh 2 100 --plus  # plus mode, 100 samples
 # =============================================================================
 
 set -euo pipefail
@@ -51,10 +53,17 @@ MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
 JSON_PATH="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/train_10k.json"
 POS3D_DIR="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/3D_pos"
 
-RUN_NAME="correspondence"
+# --plus flag: positional arg 3 (default: disabled)
+PLUS_FLAG=""
+if [ "${3:-}" = "--plus" ] || [ "${3:-}" = "plus" ]; then
+    PLUS_FLAG="--plus"
+fi
+
+RUN_NAME="correspondence${PLUS_FLAG:+_plus}"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
-EPOCHS=3
+# EPOCHS=3
+EPOCHS=5
 LR=2e-4
 LORA_RANK=16
 MAX_IMAGES=4
@@ -68,7 +77,7 @@ SAVE_STEPS=500
 
 WANDB_PROJECT="SPI"
 WANDB_ENTITY="actmrv"
-WANDB_RUN_NAME="lora_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}"
+WANDB_RUN_NAME="lora_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}${PLUS_FLAG:+_plus}"
 
 # =============================================================================
 # Setup
@@ -79,6 +88,7 @@ mkdir -p "$OUTPUT_DIR"
 echo "[INFO] NPROC_PER_NODE      = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
+echo "[INFO] PLUS mode            = ${PLUS_FLAG:-disabled}"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -117,6 +127,7 @@ $TORCHRUN \
     --wandb_project  "$WANDB_PROJECT" \
     --wandb_entity   "$WANDB_ENTITY"  \
     --wandb_run_name "$WANDB_RUN_NAME" \
-    $MAX_SAMPLES_FLAG
+    $MAX_SAMPLES_FLAG \
+    $PLUS_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

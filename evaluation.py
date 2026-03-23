@@ -221,11 +221,16 @@ def load_dataset(
                 "data_dir": str(data_dir),
             })
 
-    elif dataset in ("sparbench_multi_view", "sparbench_single_view"):
+    elif dataset in ("sparbench_multi_view", "sparbench_single_view", "sparbench_mv"):
         # SPARBench — images are base64-encoded JPEG strings embedded in the JSON.
         # Keys: id, img_type, format_type, task, source, question, answer, images
         import base64, tempfile
-        suffix = "multi_view" if dataset == "sparbench_multi_view" else "single_view"
+        if dataset == "sparbench_mv":
+            suffix = "mv"
+        elif dataset == "sparbench_multi_view":
+            suffix = "multi_view"
+        else:
+            suffix = "single_view"
         json_file = data_dir / f"sparbench_{suffix}.json"
         if not json_file.exists():
             raise FileNotFoundError(f"Dataset file not found: {json_file}")
@@ -258,7 +263,7 @@ def load_dataset(
         raise ValueError(
             f"Unknown dataset '{dataset}'. "
             "Choose: mmsibench | mindcube | sat | sat_real | vsibench | "
-            "sparbench_multi_view | sparbench_single_view"
+            "sparbench_multi_view | sparbench_single_view | sparbench_mv"
         )
 
     return samples
@@ -1120,7 +1125,7 @@ def main() -> None:
         choices=[
             "mmsibench", "mindcube",
             "sat", "sat_real",
-            "sparbench_multi_view", "sparbench_single_view",
+            "sparbench_multi_view", "sparbench_single_view", "sparbench_mv",
             "vsibench",
         ],
     )

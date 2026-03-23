@@ -11,6 +11,7 @@ Datasets
   sat_real              test.json                   — img_paths: relative paths
   sparbench_multi_view  sparbench_multi_view.json   — images: base64
   sparbench_single_view sparbench_single_view.json  — images: base64
+  sparbench_mv          sparbench_mv.json           — images: base64 (multi-view, video excluded)
 
 Routing
 -------
@@ -167,6 +168,12 @@ DATASETS = {
     "sparbench_single_view": {
         "iter": lambda limit: _iter_sparbench(
             _EVAL_ROOT / "SPARBench" / "sparbench_single_view.json", limit
+        ),
+        "out_dir": _EVAL_ROOT / "SPARBench" / "3d_results",
+    },
+    "sparbench_mv": {
+        "iter": lambda limit: _iter_sparbench(
+            _EVAL_ROOT / "SPARBench" / "sparbench_mv.json", limit
         ),
         "out_dir": _EVAL_ROOT / "SPARBench" / "3d_results",
     },

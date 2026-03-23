@@ -187,17 +187,19 @@ def geodesic_loss(
 
 def cycle_consistency_loss(R_preds: torch.Tensor, N: int) -> torch.Tensor:
     """
-    Rotation cycle-consistency loss over all C(N, 3) triangles.
+    Rotation cycle-consistency loss combining pair round-trips and triangles.
 
-    For each unordered triple {a, b, c}, penalises the deviation of
-    R_{a→b} @ R_{b→c} @ R_{c→a} from the identity:
-        loss = mean_triple  ||R_{a→b} R_{b→c} R_{c→a} - I||_F
+    For every ordered pair (i, j) with i < j (round-trip, valid for N ≥ 2):
+        ||R_{i→j} @ R_{j→i} - I||_F
+
+    For every unordered triple {a, b, c} (triangle, valid for N ≥ 3):
+        ||R_{a→b} @ R_{b→c} @ R_{c→a} - I||_F
 
     R_preds: (K, 3, 3)  where K = N*(N-1), ordered by
              [(i,j) for i in range(N) for j in range(N) if i != j]
-    Returns scalar (0 when N < 3).
+    Returns mean over all terms (scalar).  Returns 0 when N < 2.
     """
-    if N < 3:
+    if N < 2:
         return R_preds.new_tensor(0.0)
 
     pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
@@ -205,9 +207,18 @@ def cycle_consistency_loss(R_preds: torch.Tensor, N: int) -> torch.Tensor:
     I3    = torch.eye(3, device=R_preds.device, dtype=R_preds.dtype)
 
     errs = []
+
+    # Pair round-trips: R_{i→j} @ R_{j→i} = I  for all i < j
+    for i in range(N):
+        for j in range(i + 1, N):
+            cycle = R_preds[p2k[(i, j)]] @ R_preds[p2k[(j, i)]]
+            errs.append(torch.norm(cycle - I3, p="fro"))
+
+    # Triangle cycles: R_{a→b} @ R_{b→c} @ R_{c→a} = I  for all triples
     for a, b, c in combinations(range(N), 3):
         cycle = R_preds[p2k[(a, b)]] @ R_preds[p2k[(b, c)]] @ R_preds[p2k[(c, a)]]
         errs.append(torch.norm(cycle - I3, p="fro"))
+
     return torch.stack(errs).mean()
 
 
@@ -308,14 +319,14 @@ class SpaCorrespondenceModel(nn.Module):
             as_tuple=True
         )[0]
         if len(pose_positions) == 0:
-            return None, None
+            return None, None, None
 
         # Predict pose at each <pose> token
         latents  = hidden[0, pose_positions]       # (K, input_dim)
         preds_9d = self.pose_head(latents)          # (K, 9)
 
         if gt_transforms is None:
-            return preds_9d, None
+            return preds_9d, None, None
 
         K  = preds_9d.shape[0]
         gt = gt_transforms[:K].to(preds_9d.device, dtype=preds_9d.dtype)  # (K, 4, 4)
@@ -325,15 +336,133 @@ class SpaCorrespondenceModel(nn.Module):
         R_pred = rot6d_to_rotmat(preds_9d[:, :6])    # (K, 3, 3)
         t_pred = preds_9d[:, 6:]                     # (K, 3)
 
-        loss = geodesic_loss(R_pred, R_gt) + F.l1_loss(t_pred, t_gt)
+        rot_loss   = geodesic_loss(R_pred, R_gt)
+        trans_loss = F.l1_loss(t_pred, t_gt)
+        loss = rot_loss + trans_loss
+
+        _ldict: dict = {"rot_loss": rot_loss.item(), "trans_loss": trans_loss.item()}
 
         # Cycle consistency: R_{a→b} R_{b→c} R_{c→a} = I  for all triples
         if cycle_weight > 0.0:
             N = round((1 + math.sqrt(1 + 4 * K)) / 2)
             if N * (N - 1) == K:                     # valid A(N,2) count
-                loss = loss + cycle_weight * cycle_consistency_loss(R_pred, N)
+                c_loss = cycle_weight * cycle_consistency_loss(R_pred, N)
+                loss   = loss + c_loss
+                _ldict["cycle_loss"] = c_loss.item()
 
-        return preds_9d, loss
+        _ldict["pose_loss"] = loss.item()
+        return preds_9d, loss, _ldict
+
+
+class CorrespondencePlusModel(SpaCorrespondenceModel):
+    """
+    SpaCorrespondenceModel + auxiliary LM answer-prediction loss.
+
+    When ``labels`` (1, seq_len) are provided the model additionally
+    computes causal cross-entropy on the answer tokens and adds it
+    (scaled by ``answer_weight``) to the pose regression loss.
+    """
+
+    def __init__(
+        self,
+        spa_model:      nn.Module,
+        pose_head:      PoseRegressionHead,
+        pose_token_id:  int,
+        skip_layers:    tuple[int, ...] = (-1,),
+        answer_weight:  float = 1.0,
+    ):
+        super().__init__(spa_model, pose_head, pose_token_id, skip_layers)
+        self.answer_weight = answer_weight
+
+    def forward(
+        self,
+        input_ids:      torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values:   torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+        gt_transforms:  torch.Tensor | None = None,
+        image_xyz:      list | None = None,
+        coord_scale:    float = 100.0,
+        cycle_weight:   float = 0.0,
+        labels:         torch.Tensor | None = None,
+        **kwargs,
+    ):
+        outputs = self.spa_model(
+            input_ids            = input_ids,
+            attention_mask       = attention_mask,
+            pixel_values         = pixel_values,
+            image_grid_thw       = image_grid_thw,
+            output_hidden_states = True,
+            return_dict          = True,
+            image_xyz            = image_xyz,
+            coord_scale          = coord_scale,
+            **kwargs,
+        )
+
+        # ── pose prediction ───────────────────────────────────────────────────
+        if len(self.skip_layers) == 1:
+            hidden = outputs.hidden_states[self.skip_layers[0]]
+        else:
+            hidden = torch.cat(
+                [outputs.hidden_states[i] for i in self.skip_layers], dim=-1
+            )
+
+        pose_positions = (input_ids[0] == self.pose_token_id).nonzero(
+            as_tuple=True
+        )[0]
+        if len(pose_positions) == 0:
+            return None, None, None
+
+        latents  = hidden[0, pose_positions]
+        preds_9d = self.pose_head(latents)
+
+        pose_loss = None
+        _ldict: dict = {}
+        if gt_transforms is not None:
+            K  = preds_9d.shape[0]
+            gt = gt_transforms[:K].to(preds_9d.device, dtype=preds_9d.dtype)
+            R_gt   = gt[:, :3, :3]
+            t_gt   = gt[:, :3,  3]
+            R_pred = rot6d_to_rotmat(preds_9d[:, :6])
+            t_pred = preds_9d[:, 6:]
+            rot_loss   = geodesic_loss(R_pred, R_gt)
+            trans_loss = F.l1_loss(t_pred, t_gt)
+            pose_loss  = rot_loss + trans_loss
+            _ldict = {"rot_loss": rot_loss.item(), "trans_loss": trans_loss.item()}
+            if cycle_weight > 0.0:
+                N = round((1 + math.sqrt(1 + 4 * K)) / 2)
+                if N * (N - 1) == K:
+                    c_loss    = cycle_weight * cycle_consistency_loss(R_pred, N)
+                    pose_loss = pose_loss + c_loss
+                    _ldict["cycle_loss"] = c_loss.item()
+            _ldict["pose_loss"] = pose_loss.item()
+
+        # ── LM answer-prediction loss ─────────────────────────────────────────
+        lm_loss = None
+        if labels is not None:
+            logits = outputs.logits                          # (1, seq_len, vocab_size)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous().to(logits.device)
+            lm_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        # ── combine ───────────────────────────────────────────────────────────
+        # _ldict already holds rot_loss / trans_loss / cycle_loss / pose_loss
+        if pose_loss is not None and lm_loss is not None:
+            loss = pose_loss + self.answer_weight * lm_loss
+            _ldict["lm_loss"] = lm_loss.item()
+        elif pose_loss is not None:
+            loss = pose_loss
+        elif lm_loss is not None:
+            loss = self.answer_weight * lm_loss
+            _ldict["lm_loss"] = lm_loss.item()
+        else:
+            loss = None
+
+        return preds_9d, loss, (_ldict if _ldict else None)
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────
@@ -368,6 +497,7 @@ class SPARDataset(Dataset):
         pos3d_dir:           str | None = None,
         spatial_merge_size:  int = 2,
         max_samples:         int | None = None,
+        plus:                bool = False,
     ):
         import json
         with open(json_path) as fh:
@@ -397,6 +527,7 @@ class SPARDataset(Dataset):
         self.max_images          = max_images
         self.pos3d_dir           = pos3d_dir
         self.spatial_merge_size  = spatial_merge_size
+        self.plus                = plus
         log.info(f"SPARDataset: {len(self.samples)} valid entries "
                  f"(out of {len(entries)} total)")
 
@@ -458,18 +589,61 @@ class SPARDataset(Dataset):
         ]
         content.append({"type": "text", "text": " ".join(pose_sentences)})
 
-        messages = [{"role": "user", "content": content}]
-        prompt_text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
+        # ── build prompt (plus mode appends QA for LM loss) ──────────────────
+        # Extract question/answer from conversations list (ShareGPT format)
+        # or from flat "question"/"answer" fields.
+        _convs = entry.get("conversations", [])
+        _question = (
+            entry.get("question")
+            or next((c["value"] for c in _convs if c.get("from") == "human"), None)
+        )
+        _answer = (
+            entry.get("answer")
+            or next((c["value"] for c in _convs if c.get("from") == "gpt"), None)
         )
 
-        # ── tokenise + encode images ──────────────────────────────────────────
-        proc_out = self.processor(
-            text   = [prompt_text],
-            images = images,
-            return_tensors = "pt",
-            padding        = False,
-        )
+        labels = None
+        if self.plus and _question and _answer:
+            question = _question
+            answer   = _answer
+            # Replace last text element to include the question
+            qa_content = list(content)
+            qa_content[-1] = {
+                "type": "text",
+                "text": " ".join(pose_sentences) + " " + question,
+            }
+            # Full conversation with assistant answer
+            text_full = self.processor.apply_chat_template(
+                [{"role": "user", "content": qa_content},
+                 {"role": "assistant", "content": answer}],
+                tokenize=False, add_generation_prompt=False,
+            )
+            proc_out = self.processor(
+                text=[text_full], images=images,
+                return_tensors="pt", padding=False,
+            )
+            # Supervise only the answer tokens at the tail of the sequence.
+            # Mask everything before (including the <think> block) so the
+            # model's reasoning behaviour is not suppressed.
+            # <|im_end|> is a special token so suffix tokenisation is stable.
+            suffix_ids = self.processor.tokenizer(
+                answer + "<|im_end|>\n", add_special_tokens=False
+            )["input_ids"]
+            suffix_len = len(suffix_ids)
+            labels = proc_out["input_ids"].clone()
+            labels[0, :-suffix_len] = -100          # mask all except answer tokens
+        else:
+            messages = [{"role": "user", "content": content}]
+            prompt_text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )
+            # ── tokenise + encode images ──────────────────────────────────────
+            proc_out = self.processor(
+                text   = [prompt_text],
+                images = images,
+                return_tensors = "pt",
+                padding        = False,
+            )
 
         # ── 3D position maps ──────────────────────────────────────────────────
         # Load per-pixel XYZ from 3D_pos file and downsample to the LLM patch
@@ -508,6 +682,7 @@ class SPARDataset(Dataset):
                                              # pixel_values, image_grid_thw …
             "gt_transforms": gt_transforms,  # (N*(N-1), 4, 4)
             "image_xyz":     image_xyz,      # list of (llm_H, llm_W, 3) or None
+            "labels":        labels,         # (1, seq_len) for plus mode, else None
         }
 
 
@@ -529,6 +704,8 @@ def build_model(
     lora_rank:     int = 16,
     freeze_vision: bool = True,
     skip_layers:   tuple[int, ...] = (-1,),
+    plus:          bool = False,
+    answer_weight: float = 1.0,
 ) -> SpaCorrespondenceModel:
     """
     Load SpaForConditionalGeneration, patch 4D M-RoPE, apply LoRA,
@@ -588,6 +765,10 @@ def build_model(
     log.info(f"PoseRegressionHead input_dim={input_dim} "
              f"(skip_layers={list(skip_layers)}, hidden={hidden_dim})")
 
+    if plus:
+        return CorrespondencePlusModel(spa, pose_head, pose_token_id,
+                                       skip_layers=skip_layers,
+                                       answer_weight=answer_weight)
     return SpaCorrespondenceModel(spa, pose_head, pose_token_id,
                                   skip_layers=skip_layers)
 
@@ -628,6 +809,8 @@ def train(args: argparse.Namespace) -> None:
         lora_rank      = args.lora_rank,
         freeze_vision  = not args.train_vision,
         skip_layers    = tuple(args.skip_layers),
+        plus           = args.plus,
+        answer_weight  = args.answer_weight,
     )
     model = model.to(device)
 
@@ -666,6 +849,7 @@ def train(args: argparse.Namespace) -> None:
         pos3d_dir           = args.pos3d_dir,
         spatial_merge_size  = spatial_merge_size,
         max_samples         = args.max_samples,
+        plus                = args.plus,
     )
     sampler = (
         DistributedSampler(dataset, num_replicas=world_size,
@@ -708,6 +892,7 @@ def train(args: argparse.Namespace) -> None:
 
     global_step = 0
     running_loss = 0.0
+    running_loss_dict: dict[str, float] = {}
     optimizer.zero_grad()
 
     for epoch in range(args.epochs):
@@ -733,9 +918,13 @@ def train(args: argparse.Namespace) -> None:
             if image_xyz is not None:
                 image_xyz = [xyz.to(device) for xyz in image_xyz]
 
+            labels = batch.get("labels")
+            if labels is not None:
+                labels = labels.to(device)
+
             # ── forward + loss ────────────────────────────────────────────────
             try:
-                _, loss = model(
+                _, loss, loss_dict = model(
                     input_ids      = input_ids,
                     attention_mask = attention_mask,
                     pixel_values   = pixel_values,
@@ -743,6 +932,7 @@ def train(args: argparse.Namespace) -> None:
                     gt_transforms  = gt_transforms,
                     image_xyz      = image_xyz,
                     cycle_weight   = args.cycle_weight,
+                    labels         = labels,
                 )
             except Exception as exc:
                 log.warning(f"[rank{local_rank}] Step {step} skipped: {exc}")
@@ -754,6 +944,9 @@ def train(args: argparse.Namespace) -> None:
 
             (loss / args.grad_accum).backward()
             running_loss += loss.item()
+            if loss_dict:
+                for k, v in loss_dict.items():
+                    running_loss_dict[k] = running_loss_dict.get(k, 0.0) + v
 
             # ── gradient accumulation ─────────────────────────────────────────
             if (step + 1) % args.grad_accum == 0:
@@ -765,12 +958,21 @@ def train(args: argparse.Namespace) -> None:
 
                 if local_rank == 0:
                     avg_loss = running_loss / args.grad_accum
+                    avg_loss_dict = {
+                        k: v / args.grad_accum
+                        for k, v in running_loss_dict.items()
+                    }
                     running_loss = 0.0
+                    running_loss_dict.clear()
                     current_lr = scheduler.get_last_lr()[0]
+                    detail = "  ".join(
+                        f"{k}={v:.4f}" for k, v in avg_loss_dict.items()
+                    )
                     log.info(
                         f"epoch={epoch+1:02d}  step={global_step:05d}  "
-                        f"loss={avg_loss:.4f}  "
-                        f"lr={current_lr:.2e}"
+                        f"loss={avg_loss:.4f}"
+                        + (f"  ({detail})" if detail else "")
+                        + f"  lr={current_lr:.2e}"
                     )
                     if use_wandb:
                         wandb.log(
@@ -778,6 +980,7 @@ def train(args: argparse.Namespace) -> None:
                                 "train/loss": avg_loss,
                                 "train/lr":   current_lr,
                                 "epoch":      epoch + 1,
+                                **{f"train/{k}": v for k, v in avg_loss_dict.items()},
                             },
                             step=global_step,
                         )
@@ -788,6 +991,7 @@ def train(args: argparse.Namespace) -> None:
                                          global_step)
                 else:
                     running_loss = 0.0
+                    running_loss_dict.clear()
 
     # Final checkpoint (rank 0 only)
     if local_rank == 0:
@@ -875,6 +1079,18 @@ def parse_args() -> argparse.Namespace:
         type=float, default=0.1,
         help="Weight for rotation cycle-consistency loss (0 to disable). "
              "Active only when N >= 3 views.",
+    )
+    p.add_argument(
+        "--plus",
+        action="store_true",
+        help="Enable correspondence_plus mode: the model also predicts the text "
+             "answer (from entry['answer']) and its cross-entropy loss is added "
+             "to the pose loss.",
+    )
+    p.add_argument(
+        "--answer_weight",
+        type=float, default=1.0,
+        help="Weight applied to the LM answer-prediction loss in plus mode.",
     )
     # ── WandB ─────────────────────────────────────────────────────────────────
     p.add_argument(
