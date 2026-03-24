@@ -68,9 +68,21 @@ DATASET_DIR["sparbench_single_view"]="datasets/evaluation/SPARBench"
 DATASET_DIR["sparbench_mv"]="datasets/evaluation/SPARBench"
 DATASET_DIR["sat_real"]="datasets/evaluation/SAT"
 
-# Dataset → JSONL file mapping (relative to SPATIAL_DIR)
+# Dataset → JSONL/JSON file mapping (relative to SPATIAL_DIR)
 declare -A DATASET_JSONL
 DATASET_JSONL["mindcube"]="datasets/evaluation/MindCube/MindCube_tinybench.jsonl"
+DATASET_JSONL["mmsibench"]="datasets/evaluation/MMSIBench/data/test_data_final.json"
+DATASET_JSONL["sparbench_multi_view"]="datasets/evaluation/SPARBench/sparbench_multi_view.json"
+DATASET_JSONL["sparbench_single_view"]="datasets/evaluation/SPARBench/sparbench_single_view.json"
+DATASET_JSONL["sat_real"]="datasets/evaluation/SAT/test.json"
+
+# Dataset → subcommand mapping for spatial_mllm_eval.py
+declare -A DATASET_SUBCMD
+DATASET_SUBCMD["mindcube"]="mindcube"
+DATASET_SUBCMD["mmsibench"]="mmsibench"
+DATASET_SUBCMD["sparbench_multi_view"]="sparbench"
+DATASET_SUBCMD["sparbench_single_view"]="sparbench"
+DATASET_SUBCMD["sat_real"]="sat"
 
 # =============================================================================
 # Parse arguments
@@ -203,25 +215,32 @@ for DS in $DATASETS; do
     echo "[INFO] Started : $(date '+%Y-%m-%d %H:%M:%S')"
     echo "----------------------------------------------------------"
 
-    # Only mindcube is implemented in spatial_mllm_eval.py so far
-    if [[ "$DS" != "mindcube" ]]; then
-        echo "[WARN] '$DS' is not yet supported by spatial_mllm_eval.py — skipping." >&2
-        FAILED_DATASETS+=("$DS(not_supported)")
+    DATA_JSON="$SPATIAL_DIR/${DATASET_JSONL[$DS]}"
+    if [[ ! -f "$DATA_JSON" ]]; then
+        echo "[WARN] Data file not found for '$DS': $DATA_JSON — skipping." >&2
+        FAILED_DATASETS+=("$DS(missing_data)")
         continue
     fi
 
-    DATA_JSONL="$SPATIAL_DIR/${DATASET_JSONL[$DS]}"
-    if [[ ! -f "$DATA_JSONL" ]]; then
-        echo "[WARN] JSONL file not found for '$DS': $DATA_JSONL — skipping." >&2
-        FAILED_DATASETS+=("$DS(missing_jsonl)")
-        continue
-    fi
+    SUBCMD="${DATASET_SUBCMD[$DS]}"
+
+    # Build dataset-specific flags
+    DS_FLAGS=()
+    case "$SUBCMD" in
+        mindcube)
+            DS_FLAGS+=(--data_jsonl "$DATA_JSON" --data_dir "$DATA_DIR") ;;
+        mmsibench)
+            DS_FLAGS+=(--data_json "$DATA_JSON") ;;
+        sparbench)
+            DS_FLAGS+=(--data_json "$DATA_JSON") ;;
+        sat)
+            DS_FLAGS+=(--data_json "$DATA_JSON" --data_dir "$DATA_DIR") ;;
+    esac
 
     set +e
-    python baseline/spatial_mllm_eval.py mindcube \
-        "${COMMON_FLAGS[@]}"      \
-        --data_jsonl "$DATA_JSONL" \
-        --data_dir   "$DATA_DIR"   \
+    python baseline/spatial_mllm_eval.py "$SUBCMD" \
+        "${COMMON_FLAGS[@]}"  \
+        "${DS_FLAGS[@]}"      \
         --model_name "$DS_RUN_NAME"
 
     EXIT_CODE=$?

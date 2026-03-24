@@ -57,7 +57,8 @@ def prepare_spatial_mllm_inputs(batch, video_inputs, image_inputs):
     if image_inputs:
         for image_input in image_inputs:
             if isinstance(image_input, Image.Image):
-                image_input = torch.tensor(np.array(image_input)).permute(2, 0, 1).float() / 255.0
+                # Single image → treat as 1-frame video [1, C, H, W]
+                image_input = torch.tensor(np.array(image_input)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
             else:
                 raise ValueError("Unsupported image input format.")
             image_tchw.append(image_input)
@@ -310,6 +311,223 @@ def postprocess_batch(
     return results
 
 
+# ─── shared batch helper ──────────────────────────────────────────────────────
+
+def _prepare_batch_from_messages(
+    batch_messages: List[List[Dict]],
+    processor: Any,
+    model_type: str,
+) -> Tuple[Dict, List[str]]:
+    """Tokenise pre-built chat messages into model inputs."""
+    prompts_text = [
+        processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        for msgs in batch_messages
+    ]
+
+    video_inputs: List = []
+    image_inputs: List = []
+    for msgs in batch_messages:
+        imgs, vids = process_vision_info(msgs)
+        if imgs:
+            image_inputs.extend(imgs)
+        elif vids:
+            video_inputs.extend(vids)
+
+    batch = processor(
+        text=prompts_text,
+        images=image_inputs if image_inputs else None,
+        videos=video_inputs if video_inputs else None,
+        return_tensors="pt",
+        padding=True,
+        padding_side="left",
+    )
+
+    if "spatial-mllm" in model_type:
+        batch = prepare_spatial_mllm_inputs(batch, video_inputs, image_inputs)
+
+    return batch, prompts_text
+
+
+# ─── MMSIBench utilities ──────────────────────────────────────────────────────
+
+def load_mmsibench_dataset(json_path: str, limit: Optional[int] = None) -> List[Dict]:
+    """Load MMSIBench from test_data_final.json; resolve image paths."""
+    json_file = Path(json_path)
+    mmsibench_root = json_file.parent.parent  # .../MMSIBench/data/test_data_final.json
+    with open(json_file) as f:
+        raw = json.load(f)
+    if limit:
+        raw = raw[:limit]
+    dataset = []
+    for item in raw:
+        image_paths = [
+            str((mmsibench_root / p).resolve())
+            for p in item.get("local_images", [])
+        ]
+        dataset.append({
+            "index": item.get("id", ""),
+            "image": image_paths,
+            "question": item.get("question", ""),
+            "answer": item.get("answer", ""),
+            "category": item.get("type", "unknown"),
+        })
+    return dataset
+
+
+def build_mmsibench_message(item: Dict) -> Dict:
+    """Video-format message for an MMSIBench sample (multi-image → video frames)."""
+    question = f"{item['question']}\n{SFT_TYPE_TEMPLATE}"
+    return {
+        "role": "user",
+        "content": [
+            {"type": "video", "video": item["image"]},
+            {"type": "text", "text": question},
+        ],
+    }
+
+
+def extract_mmsibench_answer(text: str) -> str:
+    """Extract A/B/C/D from MMSIBench output using backtick then word-boundary regex."""
+    m = re.search(r'``([^`]*)``', text)
+    if m:
+        text = m.group(1)
+    else:
+        m = re.search(r'`([^`]*)`', text)
+        if m:
+            text = m.group(1)
+    m = re.search(r'\b[A-D]\b(?!\s[a-zA-Z])', text)
+    return m.group().upper() if m else ""
+
+
+def calculate_mmsibench_metrics(results: List[Dict]) -> Dict:
+    """Overall + per-category accuracy for MMSIBench."""
+    from collections import defaultdict
+    total = len(results)
+    correct = sum(r["reward"] for r in results)
+    cat_correct: Dict = defaultdict(float)
+    cat_total: Dict = defaultdict(int)
+    for r in results:
+        cat = r["sample"].get("category", "unknown")
+        cat_total[cat] += 1
+        cat_correct[cat] += r["reward"]
+    return {
+        "overall_accuracy": correct / total if total else 0.0,
+        "total_samples": total,
+        "correct_samples": int(correct),
+        "category_accuracy": {c: cat_correct[c] / cat_total[c] for c in cat_total},
+        "category_counts": dict(cat_total),
+    }
+
+
+# ─── SAT utilities ────────────────────────────────────────────────────────────
+
+def load_sat_dataset(json_path: str, limit: Optional[int] = None) -> List[Dict]:
+    """Load SAT test.json."""
+    with open(json_path) as f:
+        data = json.load(f)
+    return data[:limit] if limit else data
+
+
+def build_sat_message(item: Dict, data_dir: Path) -> Dict:
+    """Video-format message for a SAT sample with lettered answer choices."""
+    answer_choices = item.get("answer_choices", [])
+    options_text = "Options:\n" + "\n".join(
+        f"{chr(65 + i)}. {choice}" for i, choice in enumerate(answer_choices)
+    )
+    question = f"{item.get('question', '')}\n{options_text}\n{SFT_TYPE_TEMPLATE}"
+
+    img_paths = item.get("img_paths", [])
+    if not img_paths:
+        raise ValueError(f"SAT sample {item.get('database_idx')} has no image paths.")
+    resolved = [
+        str((data_dir / p).resolve()) if not Path(p).is_absolute() else p
+        for p in img_paths
+    ]
+    return {
+        "role": "user",
+        "content": [
+            {"type": "video", "video": resolved},
+            {"type": "text", "text": question},
+        ],
+    }
+
+
+def _sat_gt_letter(item: Dict) -> str:
+    """Return the answer letter (A/B/…) for correct_answer in a SAT item."""
+    correct = item.get("correct_answer", "").strip().lower()
+    for i, choice in enumerate(item.get("answer_choices", [])):
+        if choice.strip().lower() == correct:
+            return chr(65 + i)
+    return correct  # fallback
+
+
+def calculate_sat_metrics(results: List[Dict]) -> Dict:
+    """Per-question-type + overall accuracy for SAT."""
+    if not results:
+        return {"per_question_type": {}, "overall": {"accuracy": 0.0, "count": 0}}
+    import pandas as pd
+    df = pd.DataFrame([
+        {"reward": r["reward"], "question_type": r["sample"].get("question_type", "unknown")}
+        for r in results
+    ])
+    per_qtype = {
+        qt: {"score": float(g["reward"].mean()), "count": int(len(g))}
+        for qt, g in df.groupby("question_type")
+    }
+    return {
+        "per_question_type": per_qtype,
+        "overall": {"accuracy": float(df["reward"].mean()), "count": len(df)},
+    }
+
+
+# ─── SPARBench utilities ──────────────────────────────────────────────────────
+
+def load_sparbench_dataset(json_path: str, limit: Optional[int] = None) -> List[Dict]:
+    """Load SPARBench JSON (images are base64-encoded JPEG strings)."""
+    with open(json_path) as f:
+        data = json.load(f)
+    return data[:limit] if limit else data
+
+
+def build_sparbench_message(item: Dict) -> Dict:
+    """Video-format message for a SPARBench sample; decode base64 images on the fly."""
+    import base64
+    import io as _io
+    question = f"{item.get('question', '')}\n{SFT_TYPE_TEMPLATE}"
+    pil_images = []
+    for b64_str in item.get("images", []):
+        img_bytes = base64.b64decode(b64_str)
+        pil_images.append(Image.open(_io.BytesIO(img_bytes)).convert("RGB"))
+    if not pil_images:
+        raise ValueError(f"SPARBench sample {item.get('id')} has no images.")
+    return {
+        "role": "user",
+        "content": [
+            {"type": "video", "video": pil_images},
+            {"type": "text", "text": question},
+        ],
+    }
+
+
+def calculate_sparbench_metrics(results: List[Dict]) -> Dict:
+    """Per-task + overall accuracy for SPARBench."""
+    if not results:
+        return {"per_task": {}, "overall": {"accuracy": 0.0, "count": 0}}
+    import pandas as pd
+    df = pd.DataFrame([
+        {"reward": r["reward"], "task": r["sample"].get("task", "unknown")}
+        for r in results
+    ])
+    per_task = {
+        t: {"score": float(g["reward"].mean()), "count": int(len(g))}
+        for t, g in df.groupby("task")
+    }
+    return {
+        "per_task": per_task,
+        "overall": {"accuracy": float(df["reward"].mean()), "count": len(df)},
+    }
+
+
 # ─── CLI configs and entry points ────────────────────────────────────────────
 
 @dataclass
@@ -456,19 +674,247 @@ def run_mindcube(args: MindCubeArgs) -> None:
     logger.info(f"Results saved to: {output_dir}")
 
 
+# ─── MMSIBench run ────────────────────────────────────────────────────────────
+
+@dataclass
+class MMSIBenchArgs:
+    """Evaluate Spatial-MLLM on MMSIBench."""
+    data_json: str = "/egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning/datasets/evaluation/MMSIBench/data/test_data_final.json"
+    output_dir: str = "eval_results"
+    model_type: str = "spatial-mllm"
+    model_path: str = DEFAULT_MODEL_PATH
+    model_name: Optional[str] = None
+    batch_size: int = 1
+    limit: Optional[int] = None
+
+
+def run_mmsibench(args: MMSIBenchArgs) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger(__name__)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = args.model_name or args.model_type
+    output_dir = Path(args.output_dir) / "MMSIBench" / model_name / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(output_dir / "run.log")
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logging.getLogger().addHandler(fh)
+
+    logger.info(f"Model path:  {args.model_path}")
+    logger.info(f"Data JSON:   {args.data_json}")
+    logger.info(f"Output dir:  {output_dir}")
+    logger.info(f"Limit:       {args.limit}")
+
+    data = load_mmsibench_dataset(args.data_json, limit=args.limit)
+    logger.info(f"Loaded {len(data)} samples.")
+
+    torch.cuda.empty_cache()
+    model, processor = load_model_and_processor(args.model_type, args.model_path)
+
+    final_output: List[Dict] = []
+    eval_result_path = output_dir / "eval_result.json"
+
+    for i in tqdm(range(0, len(data), args.batch_size), desc="Evaluating MMSIBench"):
+        batch_data = data[i : i + args.batch_size]
+        batch_messages = [[build_mmsibench_message(item)] for item in batch_data]
+        batch_inputs, prompts_text = _prepare_batch_from_messages(batch_messages, processor, args.model_type)
+        batch_output_text = inference_batch(batch_inputs, model, processor)
+
+        for sample, model_output, prompt in zip(batch_data, batch_output_text, prompts_text):
+            pred_letter = extract_mmsibench_answer(model_output)
+            gt_letter = sample.get("answer", "").strip().upper()
+            reward = 1.0 if pred_letter == gt_letter and pred_letter != "" else 0.0
+            final_output.append({
+                "sample": sample,
+                "prompt": prompt,
+                "model_output": model_output,
+                "pred_letter": pred_letter,
+                "gt_letter": gt_letter,
+                "reward": reward,
+                "correct": reward == 1.0,
+            })
+
+        if (i // args.batch_size + 1) % 10 == 0 or (i + args.batch_size) >= len(data):
+            with open(eval_result_path, "w") as f:
+                json.dump(final_output, f, indent=2)
+
+    metrics = calculate_mmsibench_metrics(final_output)
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    logger.info(f"Final metrics: {metrics}")
+    logger.info(f"Results saved to: {output_dir}")
+
+
+# ─── SAT run ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class SATArgs:
+    """Evaluate Spatial-MLLM on SAT (sat_real)."""
+    data_json: str = "/egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning/datasets/evaluation/SAT/test.json"
+    data_dir: str = "/egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning/datasets/evaluation/SAT"
+    output_dir: str = "eval_results"
+    model_type: str = "spatial-mllm"
+    model_path: str = DEFAULT_MODEL_PATH
+    model_name: Optional[str] = None
+    batch_size: int = 1
+    limit: Optional[int] = None
+
+
+def run_sat(args: SATArgs) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger(__name__)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = args.model_name or args.model_type
+    output_dir = Path(args.output_dir) / "SAT" / model_name / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(output_dir / "run.log")
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logging.getLogger().addHandler(fh)
+
+    logger.info(f"Model path:  {args.model_path}")
+    logger.info(f"Data JSON:   {args.data_json}")
+    logger.info(f"Data dir:    {args.data_dir}")
+    logger.info(f"Output dir:  {output_dir}")
+    logger.info(f"Limit:       {args.limit}")
+
+    data = load_sat_dataset(args.data_json, limit=args.limit)
+    logger.info(f"Loaded {len(data)} samples.")
+
+    torch.cuda.empty_cache()
+    model, processor = load_model_and_processor(args.model_type, args.model_path)
+    data_dir = Path(args.data_dir).resolve()
+
+    final_output: List[Dict] = []
+    eval_result_path = output_dir / "eval_result.json"
+
+    for i in tqdm(range(0, len(data), args.batch_size), desc="Evaluating SAT"):
+        batch_data = data[i : i + args.batch_size]
+        batch_messages = [[build_sat_message(item, data_dir)] for item in batch_data]
+        batch_inputs, prompts_text = _prepare_batch_from_messages(batch_messages, processor, args.model_type)
+        batch_output_text = inference_batch(batch_inputs, model, processor)
+
+        for sample, model_output, prompt in zip(batch_data, batch_output_text, prompts_text):
+            pred_letter = extract_answer_letter(model_output)
+            gt_letter = _sat_gt_letter(sample)
+            reward = 1.0 if pred_letter is not None and pred_letter == gt_letter else 0.0
+            final_output.append({
+                "sample": sample,
+                "prompt": prompt,
+                "model_output": model_output,
+                "pred_letter": pred_letter,
+                "gt_letter": gt_letter,
+                "reward": reward,
+                "correct": reward == 1.0,
+            })
+
+        if (i // args.batch_size + 1) % 10 == 0 or (i + args.batch_size) >= len(data):
+            with open(eval_result_path, "w") as f:
+                json.dump(final_output, f, indent=2)
+
+    metrics = calculate_sat_metrics(final_output)
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    logger.info(f"Final metrics: {metrics}")
+    logger.info(f"Results saved to: {output_dir}")
+
+
+# ─── SPARBench run ────────────────────────────────────────────────────────────
+
+@dataclass
+class SPARBenchArgs:
+    """Evaluate Spatial-MLLM on SPARBench (multi_view or single_view)."""
+    data_json: str = "/egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning/datasets/evaluation/SPARBench/sparbench_multi_view.json"
+    output_dir: str = "eval_results"
+    model_type: str = "spatial-mllm"
+    model_path: str = DEFAULT_MODEL_PATH
+    model_name: Optional[str] = None
+    batch_size: int = 1
+    limit: Optional[int] = None
+
+
+def run_sparbench(args: SPARBenchArgs) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger(__name__)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = args.model_name or args.model_type
+    dataset_label = Path(args.data_json).stem  # e.g. "sparbench_multi_view"
+    output_dir = Path(args.output_dir) / "SPARBench" / dataset_label / model_name / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(output_dir / "run.log")
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logging.getLogger().addHandler(fh)
+
+    logger.info(f"Model path:  {args.model_path}")
+    logger.info(f"Data JSON:   {args.data_json}")
+    logger.info(f"Output dir:  {output_dir}")
+    logger.info(f"Limit:       {args.limit}")
+
+    data = load_sparbench_dataset(args.data_json, limit=args.limit)
+    logger.info(f"Loaded {len(data)} samples.")
+
+    torch.cuda.empty_cache()
+    model, processor = load_model_and_processor(args.model_type, args.model_path)
+
+    final_output: List[Dict] = []
+    eval_result_path = output_dir / "eval_result.json"
+
+    for i in tqdm(range(0, len(data), args.batch_size), desc=f"Evaluating {dataset_label}"):
+        batch_data = data[i : i + args.batch_size]
+        batch_messages = [[build_sparbench_message(item)] for item in batch_data]
+        batch_inputs, prompts_text = _prepare_batch_from_messages(batch_messages, processor, args.model_type)
+        batch_output_text = inference_batch(batch_inputs, model, processor)
+
+        for sample, model_output, prompt in zip(batch_data, batch_output_text, prompts_text):
+            pred_letter = extract_answer_letter(model_output)
+            gt_letter = sample.get("answer", "").strip().upper()
+            reward = 1.0 if pred_letter is not None and pred_letter == gt_letter else 0.0
+            # Don't store base64 images in results
+            sample_out = {k: v for k, v in sample.items() if k != "images"}
+            final_output.append({
+                "sample": sample_out,
+                "prompt": prompt,
+                "model_output": model_output,
+                "pred_letter": pred_letter,
+                "gt_letter": gt_letter,
+                "reward": reward,
+                "correct": reward == 1.0,
+            })
+
+        if (i // args.batch_size + 1) % 10 == 0 or (i + args.batch_size) >= len(data):
+            with open(eval_result_path, "w") as f:
+                json.dump(final_output, f, indent=2)
+
+    metrics = calculate_sparbench_metrics(final_output)
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    logger.info(f"Final metrics: {metrics}")
+    logger.info(f"Results saved to: {output_dir}")
+
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     args = tyro.cli(
         Union[
-            Annotated[DemoArgs, tyro.conf.subcommand("demo", default=DemoArgs())],
-            Annotated[MindCubeArgs, tyro.conf.subcommand("mindcube", default=MindCubeArgs())],
+            Annotated[DemoArgs,       tyro.conf.subcommand("demo",       default=DemoArgs())],
+            Annotated[MindCubeArgs,   tyro.conf.subcommand("mindcube",   default=MindCubeArgs())],
+            Annotated[MMSIBenchArgs,  tyro.conf.subcommand("mmsibench",  default=MMSIBenchArgs())],
+            Annotated[SATArgs,        tyro.conf.subcommand("sat",        default=SATArgs())],
+            Annotated[SPARBenchArgs,  tyro.conf.subcommand("sparbench",  default=SPARBenchArgs())],
         ]
     )
     if isinstance(args, DemoArgs):
         run_demo(args)
     elif isinstance(args, MindCubeArgs):
         run_mindcube(args)
+    elif isinstance(args, MMSIBenchArgs):
+        run_mmsibench(args)
+    elif isinstance(args, SATArgs):
+        run_sat(args)
+    elif isinstance(args, SPARBenchArgs):
+        run_sparbench(args)
 
 
 if __name__ == "__main__":
