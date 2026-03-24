@@ -6,6 +6,7 @@ __pycache__/
 # exteranal reposs
 external/
 backup/
+baseline/repo/
 
 # data
 vsibench/
@@ -198,3 +199,4 @@ checkpoints/
 results/
 train_records/
 eval_results/
+eval_results_baseline/

@@ -255,6 +255,7 @@ def load_dataset(
                 "question": item.get("question", ""),
                 "answer": item.get("answer", ""),
                 "category": item.get("task", "unknown"),
+                "format_type": item.get("format_type", "select"),
                 "thought": "",
                 "data_dir": str(data_dir),
             })
@@ -296,6 +297,18 @@ def extract_answer_letter(text: str) -> str:
     if matches:
         return matches[-1]
     return ""
+
+
+def extract_answer_number(text: str) -> str:
+    """Extract a numeric answer from <answer>...</answer> tags (for fill-format)."""
+    if not text or not isinstance(text, str):
+        return ""
+    m = re.search(r"<answer>\s*([-+]?\d+(?:\.\d+)?)\s*</answer>", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # fallback: last standalone number in text
+    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
+    return nums[-1] if nums else ""
 
 
 # ===========================================================================
@@ -782,13 +795,19 @@ def _make_result(
     # Thinking: model generates the full response (including <think>...</think>
     # and <answer>X</answer>) — no prefix needed.
     full_output = output if thinking else "<answer>" + output
+    fmt = item.get("format_type", "select")
+    if fmt == "fill":
+        prediction = extract_answer_number(full_output)
+    else:
+        prediction = extract_answer_letter(full_output)
     return {
         "method": method,
         "index": item.get("index", ""),
         "category": item.get("category", "unknown"),
+        "format_type": fmt,
         "question": item.get("question", ""),
         "answer": item.get("answer", ""),
-        "prediction": extract_answer_letter(full_output),
+        "prediction": prediction,
         "output": full_output,
         "thought_gt": item.get("thought", ""),
         "image_paths": item["image"],
@@ -801,6 +820,7 @@ def _error_result(item: Dict, exc: Exception, method: str) -> Dict:
         "method": method,
         "index": item.get("index", ""),
         "category": item.get("category", "unknown"),
+        "format_type": item.get("format_type", "select"),
         "question": item.get("question", ""),
         "answer": item.get("answer", ""),
         "prediction": "",
@@ -815,19 +835,39 @@ def _error_result(item: Dict, exc: Exception, method: str) -> Dict:
 # Metrics
 # ===========================================================================
 
+def _mra_score(pred_str: str, gt_str: str) -> float:
+    """Mean Relative Accuracy for a single numeric prediction.
+    MRA = max(0, 1 - |pred - gt| / |gt|).  Returns 0 if unparseable.
+    """
+    try:
+        pred = float(pred_str)
+        gt   = float(gt_str)
+        if gt == 0:
+            return 1.0 if pred == 0 else 0.0
+        return max(0.0, 1.0 - abs(pred - gt) / abs(gt))
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
     total = len(results)
     correct = 0
-    cat_correct: dict = defaultdict(int)
+    cat_correct: dict = defaultdict(float)
     cat_total: dict = defaultdict(int)
     for r in results:
-        pred = r.get("prediction", "").lower().strip()
-        gt   = r.get("answer", "").lower().strip()
+        pred = r.get("prediction", "")
+        gt   = r.get("answer", "")
         cat  = r.get("category", "unknown")
+        fmt  = r.get("format_type", "select")
         cat_total[cat] += 1
-        if pred == gt:
-            correct += 1
-            cat_correct[cat] += 1
+        if fmt == "fill":
+            score = _mra_score(pred, gt)
+            correct += score
+            cat_correct[cat] += score
+        else:
+            if pred.lower().strip() == gt.lower().strip():
+                correct += 1
+                cat_correct[cat] += 1
     cat_accuracy = {cat: cat_correct[cat] / cat_total[cat] for cat in cat_total}
     return {
         "overall_accuracy": correct / total if total else 0.0,
