@@ -9,7 +9,7 @@
 #   bash scripts/train_baseline.sh [num_gpus] [model_preset] [model_name_or_path]
 #
 #   num_gpus           — number of GPUs to use (default: all available)
-#   model_preset       — qwen2.5vl-3b | qwen3.5-4b (default: qwen3.5-4b)
+#   model_preset       — qwen2.5vl-3b | qwen3.5-4b (default: qwen2.5vl-3b)
 #   model_name_or_path — optional override model path/name
 #
 # Examples:
@@ -42,7 +42,7 @@ else
 fi
 
 # model preset: positional arg 2
-MODEL_PRESET="${2:-qwen3.5-4b}"
+MODEL_PRESET="${2:-qwen2.5vl-3b}"
 
 if [[ "$MODEL_PRESET" != "qwen2.5vl-3b" && "$MODEL_PRESET" != "qwen3.5-4b" ]]; then
     echo "[ERROR] model_preset must be one of: qwen2.5vl-3b, qwen3.5-4b"
@@ -56,9 +56,16 @@ MODEL_OVERRIDE="${3:-}"
 # Paths
 # =============================================================================
 
-MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
-if [ -z "$MODEL_OVERRIDE" ] && [ -d "$MODEL_PATH" ]; then
-    MODEL_OVERRIDE="$MODEL_PATH"
+if [ -z "$MODEL_OVERRIDE" ]; then
+    if [ "$MODEL_PRESET" = "qwen2.5vl-3b" ]; then
+        if [ -d "$SPATIAL_DIR/checkpoints/Qwen2.5-VL-3B-Instruct" ]; then
+            MODEL_OVERRIDE="$SPATIAL_DIR/checkpoints/Qwen2.5-VL-3B-Instruct"
+        fi
+    else
+        if [ -d "$SPATIAL_DIR/checkpoints/Qwen3.5-4B" ]; then
+            MODEL_OVERRIDE="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
+        fi
+    fi
 fi
 
 RUN_NAME="3drs_${MODEL_PRESET}"

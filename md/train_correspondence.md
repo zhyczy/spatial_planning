@@ -175,3 +175,18 @@ train_records/correspondence/
 └── final/
     └── ...
 ```
+
+
+Both files pass syntax checks. Here's a summary of the changes:
+
+Two ablation modes via --ablation {no_cam, vanilla}:
+
+Pose Head	Position Embedding	Loss	Backbone
+default	Yes	4D M-RoPE + image_xyz	pose (geodesic+L1+cycle)	SpaForConditionalGeneration
+--plus	Yes	4D M-RoPE + image_xyz	pose + LM answer	SpaForConditionalGeneration
+--ablation no_cam	No	4D M-RoPE + image_xyz	LM answer only	SpaForConditionalGeneration
+--ablation vanilla	No	Original 3D M-RoPE	LM answer only	Qwen3_5ForConditionalGeneration
+Key changes:
+
+train_correspondence.py: Added AnswerOnlyModel class (LM loss only, no pose head), --ablation CLI flag, no_pose dataset flag to skip <pose> tokens and GT transforms, vanilla uses stock Qwen3_5ForConditionalGeneration
+train_correspondence.sh: Added --ablation MODE flag parsing, e.g. bash scripts/train_correspondence.sh 2 100 --ablation no_cam

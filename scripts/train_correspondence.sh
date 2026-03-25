@@ -6,11 +6,12 @@
 # prediction.  Multi-GPU via torchrun (DDP).
 #
 # Usage:
-#   bash scripts/train_correspondence.sh [num_gpus] [num_samples] [--plus]
+#   bash scripts/train_correspondence.sh [num_gpus] [num_samples] [--plus] [--ablation MODE]
 #
 #   num_gpus    — number of GPUs to use (default: all available)
 #   num_samples — truncate dataset to this many entries (default: all)
 #   --plus      — enable correspondence_plus mode (adds LM answer-prediction loss)
+#   --ablation MODE — ablation study: no_cam | vanilla
 #
 # Examples:
 #   bash scripts/train_correspondence.sh               # all GPUs, full dataset
@@ -18,6 +19,8 @@
 #   bash scripts/train_correspondence.sh 2 100         # 2 GPUs, 100 samples
 #   bash scripts/train_correspondence.sh 1 6           # single GPU, 6 samples
 #   bash scripts/train_correspondence.sh 2 100 --plus  # plus mode, 100 samples
+#   bash scripts/train_correspondence.sh 2 100 --ablation no_cam   # ablation: no cam pred
+#   bash scripts/train_correspondence.sh 2 100 --ablation vanilla  # ablation: vanilla
 # =============================================================================
 
 set -euo pipefail
@@ -31,9 +34,31 @@ cd "$SPATIAL_DIR"
 # Arguments
 # =============================================================================
 
-# num_gpus: positional arg 1 (default: auto-detect)
-if [ -n "${1:-}" ]; then
-    NPROC="$1"
+# Parse positional args and flags from any position
+NPROC=""
+MAX_SAMPLES=""
+PLUS_FLAG=""
+ABLATION_FLAG=""
+_positional=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --plus|plus)
+            PLUS_FLAG="--plus"; shift ;;
+        --ablation)
+            ABLATION_FLAG="--ablation $2"; shift 2 ;;
+        *)
+            if [ $_positional -eq 0 ]; then
+                NPROC="$1"
+            elif [ $_positional -eq 1 ]; then
+                MAX_SAMPLES="$1"
+            fi
+            _positional=$((_positional + 1))
+            shift ;;
+    esac
+done
+
+# num_gpus: default auto-detect
+if [ -n "$NPROC" ]; then
     CUDA_IDS=$(seq -s ',' 0 $((NPROC - 1)))
     export CUDA_VISIBLE_DEVICES="$CUDA_IDS"
 else
@@ -41,9 +66,6 @@ else
     NPROC="$N_AVAIL"
     export CUDA_VISIBLE_DEVICES=$(seq -s ',' 0 $((NPROC - 1)))
 fi
-
-# num_samples: positional arg 2 (default: empty = all)
-MAX_SAMPLES="${2:-}"
 
 # =============================================================================
 # Hyperparameters
@@ -53,17 +75,16 @@ MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
 JSON_PATH="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/train_10k.json"
 POS3D_DIR="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/3D_pos"
 
-# --plus flag: positional arg 3 (default: disabled)
-PLUS_FLAG=""
-if [ "${3:-}" = "--plus" ] || [ "${3:-}" = "plus" ]; then
-    PLUS_FLAG="--plus"
+# Derive run name from mode
+_ablation_name=""
+if [ -n "$ABLATION_FLAG" ]; then
+    _ablation_name="_$(echo "$ABLATION_FLAG" | awk '{print $2}')"
 fi
-
-RUN_NAME="correspondence${PLUS_FLAG:+_plus}"
+RUN_NAME="correspondence${PLUS_FLAG:+_plus}${_ablation_name}"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
-# EPOCHS=3
-EPOCHS=5
+EPOCHS=3
+# EPOCHS=5
 LR=2e-4
 LORA_RANK=16
 MAX_IMAGES=4
@@ -77,18 +98,20 @@ SAVE_STEPS=500
 
 WANDB_PROJECT="SPI"
 WANDB_ENTITY="actmrv"
-WANDB_RUN_NAME="lora_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}${PLUS_FLAG:+_plus}"
+WANDB_RUN_NAME="lora_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}${PLUS_FLAG:+_plus}${_ablation_name}"
 
 # =============================================================================
 # Setup
 # =============================================================================
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 mkdir -p "$OUTPUT_DIR"
 
 echo "[INFO] NPROC_PER_NODE      = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] PLUS mode            = ${PLUS_FLAG:-disabled}"
+echo "[INFO] ABLATION             = ${ABLATION_FLAG:-disabled}"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -128,6 +151,7 @@ $TORCHRUN \
     --wandb_entity   "$WANDB_ENTITY"  \
     --wandb_run_name "$WANDB_RUN_NAME" \
     $MAX_SAMPLES_FLAG \
-    $PLUS_FLAG
+    $PLUS_FLAG \
+    $ABLATION_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

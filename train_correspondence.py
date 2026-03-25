@@ -60,6 +60,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
 from models.spa_emb import SpaForConditionalGeneration
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
 # Re-use dataset detection logic from the data processing pipeline
 sys.path.insert(0, os.path.join(_ROOT, "src", "data_process"))
@@ -465,6 +466,61 @@ class CorrespondencePlusModel(SpaCorrespondenceModel):
         return preds_9d, loss, (_ldict if _ldict else None)
 
 
+class AnswerOnlyModel(nn.Module):
+    """
+    Ablation model: LoRA fine-tuning with only LM answer-prediction loss.
+    No pose regression head, no <pose> tokens.
+
+    Used for two ablation studies:
+      - no_cam:  keeps 4D M-RoPE (image_xyz passed), removes pose prediction
+      - vanilla: uses original 3D M-RoPE (no image_xyz), removes pose prediction
+    """
+
+    def __init__(self, spa_model: nn.Module, use_xyz: bool = True):
+        super().__init__()
+        self.spa_model = spa_model
+        self.use_xyz = use_xyz
+
+    def forward(
+        self,
+        input_ids:      torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values:   torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+        image_xyz:      list | None = None,
+        coord_scale:    float = 100.0,
+        labels:         torch.Tensor | None = None,
+        **kwargs,
+    ):
+        fwd_kwargs = dict(
+            input_ids            = input_ids,
+            attention_mask       = attention_mask,
+            pixel_values         = pixel_values,
+            image_grid_thw       = image_grid_thw,
+            output_hidden_states = False,
+            return_dict          = True,
+        )
+        if self.use_xyz:
+            fwd_kwargs["image_xyz"]   = image_xyz
+            fwd_kwargs["coord_scale"] = coord_scale
+
+        outputs = self.spa_model(**fwd_kwargs)
+
+        if labels is None:
+            return None, None, None
+
+        logits = outputs.logits
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous().to(logits.device)
+        lm_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+        _ldict = {"lm_loss": lm_loss.item()}
+        return None, lm_loss, _ldict
+
+
 # ── dataset ───────────────────────────────────────────────────────────────────
 
 class SPARDataset(Dataset):
@@ -498,6 +554,7 @@ class SPARDataset(Dataset):
         spatial_merge_size:  int = 2,
         max_samples:         int | None = None,
         plus:                bool = False,
+        no_pose:             bool = False,
     ):
         import json
         with open(json_path) as fh:
@@ -528,6 +585,7 @@ class SPARDataset(Dataset):
         self.pos3d_dir           = pos3d_dir
         self.spatial_merge_size  = spatial_merge_size
         self.plus                = plus
+        self.no_pose             = no_pose
         log.info(f"SPARDataset: {len(self.samples)} valid entries "
                  f"(out of {len(entries)} total)")
 
@@ -565,31 +623,37 @@ class SPARDataset(Dataset):
 
         images = images[:N]
 
-        rel_transforms = torch.tensor(
-            data["relative_transforms"][:N, :N], dtype=torch.float32
-        )  # (N, N, 4, 4)
+        # ── GT transforms (skipped in no_pose ablation mode) ─────────────────
+        if self.no_pose:
+            gt_transforms = None
+        else:
+            rel_transforms = torch.tensor(
+                data["relative_transforms"][:N, :N], dtype=torch.float32
+            )  # (N, N, 4, 4)
 
-        # All ordered pairs (i, j) with i≠j — A(N,2) = N*(N-1) pairs
-        pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
+            # All ordered pairs (i, j) with i≠j — A(N,2) = N*(N-1) pairs
+            pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
 
-        # GT: T_{i→j} for every ordered pair
-        gt_transforms = torch.stack(
-            [rel_transforms[i, j] for (i, j) in pairs], dim=0
-        )  # (N*(N-1), 4, 4)
+            # GT: T_{i→j} for every ordered pair
+            gt_transforms = torch.stack(
+                [rel_transforms[i, j] for (i, j) in pairs], dim=0
+            )  # (N*(N-1), 4, 4)
 
         # ── build multi-image prompt ──────────────────────────────────────────
         content: list = []
         for img in images:
             content.append({"type": "image", "image": img})
 
-        pose_sentences = [
-            f"The camera pose of image {j + 1} relative to image {i + 1} is "
-            f"{POSE_TOKEN}."
-            for (i, j) in pairs
-        ]
-        content.append({"type": "text", "text": " ".join(pose_sentences)})
+        pose_sentences = []
+        if not self.no_pose:
+            pose_sentences = [
+                f"The camera pose of image {j + 1} relative to image {i + 1} is "
+                f"{POSE_TOKEN}."
+                for (i, j) in pairs
+            ]
+            content.append({"type": "text", "text": " ".join(pose_sentences)})
 
-        # ── build prompt (plus mode appends QA for LM loss) ──────────────────
+        # ── build prompt (plus / no_pose modes append QA for LM loss) ────────
         # Extract question/answer from conversations list (ShareGPT format)
         # or from flat "question"/"answer" fields.
         _convs = entry.get("conversations", [])
@@ -603,15 +667,19 @@ class SPARDataset(Dataset):
         )
 
         labels = None
-        if self.plus and _question and _answer:
+        if (self.plus or self.no_pose) and _question and _answer:
             question = _question
             answer   = _answer
-            # Replace the last text element to include the question
             qa_content = list(content)
-            qa_content[-1] = {
-                "type": "text",
-                "text": " ".join(pose_sentences) + " " + question,
-            }
+            if self.no_pose:
+                # No pose sentences — just append the question
+                qa_content.append({"type": "text", "text": question})
+            else:
+                # Replace the last text element to include the question
+                qa_content[-1] = {
+                    "type": "text",
+                    "text": " ".join(pose_sentences) + " " + question,
+                }
             # Full conversation with assistant answer
             text_full = self.processor.apply_chat_template(
                 [{"role": "user", "content": qa_content},
@@ -706,36 +774,47 @@ def build_model(
     skip_layers:   tuple[int, ...] = (-1,),
     plus:          bool = False,
     answer_weight: float = 1.0,
-) -> SpaCorrespondenceModel:
+    ablation:      str | None = None,
+) -> nn.Module:
     """
-    Load SpaForConditionalGeneration, patch 4D M-RoPE, apply LoRA,
-    resize embeddings for <pose>, and attach PoseRegressionHead.
+    Load backbone, patch M-RoPE, apply LoRA, and attach task head.
+
+    ablation=None   → SpaCorrespondenceModel (or Plus variant)
+    ablation="no_cam"  → AnswerOnlyModel with 4D M-RoPE (keeps image_xyz)
+    ablation="vanilla" → AnswerOnlyModel with original 3D M-RoPE (no image_xyz)
     """
-    # ── config: switch mrope_section to 4 equal parts ─────────────────────────
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
-    section_size  = sum(orig_section) // 4          # e.g. 32 // 4 = 8
-    config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
-    log.info(
-        f"mrope_section: {orig_section} → {[section_size]*4}  "
-        f"(4D M-RoPE for spatial tokens)"
-    )
 
-    # ── load model ─────────────────────────────────────────────────────────────
-    # device_map is intentionally omitted: the caller places the full model on
-    # a single GPU (required for DDP; device_map="auto" is incompatible).
-    # Use sdpa (safe on Blackwell sm_120); flash_attention_2 segfaults there.
-    spa = SpaForConditionalGeneration.from_pretrained(
-        model_path,
-        config             = config,
-        torch_dtype        = torch.bfloat16,
-        attn_implementation= "sdpa",
-    )
+    if ablation == "vanilla":
+        # ── vanilla: keep original 3D M-RoPE, use stock Qwen model ───────────
+        log.info(f"mrope_section: {orig_section} (original 3D M-RoPE, vanilla ablation)")
+        spa = Qwen3_5ForConditionalGeneration.from_pretrained(
+            model_path,
+            config             = config,
+            torch_dtype        = torch.bfloat16,
+            attn_implementation= "sdpa",
+        )
+    else:
+        # ── 4D M-RoPE for normal / plus / no_cam ─────────────────────────────
+        section_size = sum(orig_section) // 4          # e.g. 32 // 4 = 8
+        config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
+        log.info(
+            f"mrope_section: {orig_section} → {[section_size]*4}  "
+            f"(4D M-RoPE for spatial tokens)"
+        )
+        spa = SpaForConditionalGeneration.from_pretrained(
+            model_path,
+            config             = config,
+            torch_dtype        = torch.bfloat16,
+            attn_implementation= "sdpa",
+        )
 
-    # ── resize embedding table for new <pose> token ───────────────────────────
-    old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
-    spa.resize_token_embeddings(old_vocab + 1)
-    log.info(f"Embedding table: {old_vocab} → {old_vocab + 1} (added <pose>)")
+    # ── resize embedding table for <pose> (only when pose tokens are used) ───
+    if ablation is None:
+        old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
+        spa.resize_token_embeddings(old_vocab + 1)
+        log.info(f"Embedding table: {old_vocab} → {old_vocab + 1} (added <pose>)")
 
     # ── optionally freeze vision encoder ─────────────────────────────────────
     if freeze_vision:
@@ -757,6 +836,12 @@ def build_model(
     )
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
+
+    # ── ablation: answer-only model (no pose head) ───────────────────────────
+    if ablation is not None:
+        use_xyz = (ablation != "vanilla")
+        log.info(f"Ablation '{ablation}': AnswerOnlyModel (use_xyz={use_xyz})")
+        return AnswerOnlyModel(spa, use_xyz=use_xyz)
 
     # ── pose regression head ──────────────────────────────────────────────────
     hidden_dim = config.text_config.hidden_size
@@ -811,11 +896,15 @@ def train(args: argparse.Namespace) -> None:
         skip_layers    = tuple(args.skip_layers),
         plus           = args.plus,
         answer_weight  = args.answer_weight,
+        ablation       = args.ablation,
     )
     model = model.to(device)
 
     # Normalise --pos3d_dir (empty string → None to disable 3D pos loading)
     if args.pos3d_dir == "":
+        args.pos3d_dir = None
+    # vanilla ablation: disable 3D position maps (uses original 3D M-RoPE)
+    if args.ablation == "vanilla":
         args.pos3d_dir = None
     rank0_print(f"pos3d_dir = {args.pos3d_dir}")
 
@@ -839,6 +928,7 @@ def train(args: argparse.Namespace) -> None:
         _model = model
 
     # ── dataset / loader ──────────────────────────────────────────────────────
+    _no_pose = args.ablation is not None
     dataset = SPARDataset(
         json_path           = args.json_path,
         spar_root           = SPAR_ROOT,
@@ -849,7 +939,8 @@ def train(args: argparse.Namespace) -> None:
         pos3d_dir           = args.pos3d_dir,
         spatial_merge_size  = spatial_merge_size,
         max_samples         = args.max_samples,
-        plus                = args.plus,
+        plus                = args.plus or _no_pose,
+        no_pose             = _no_pose,
     )
     sampler = (
         DistributedSampler(dataset, num_replicas=world_size,
@@ -906,7 +997,9 @@ def train(args: argparse.Namespace) -> None:
             attention_mask = batch["attention_mask"].to(device)
             pixel_values   = batch.get("pixel_values")
             image_grid_thw = batch.get("image_grid_thw")
-            gt_transforms  = batch["gt_transforms"].to(device)
+            gt_transforms  = batch.get("gt_transforms")
+            if gt_transforms is not None:
+                gt_transforms = gt_transforms.to(device)
 
             if pixel_values is not None:
                 pixel_values = pixel_values.to(device, dtype=torch.bfloat16)
@@ -1017,10 +1110,11 @@ def _save_checkpoint(
 
     model.spa_model.save_pretrained(ckpt)
     tokenizer.save_pretrained(ckpt)
-    torch.save(
-        model.pose_head.state_dict(),
-        os.path.join(ckpt, "pose_head.pt"),
-    )
+    if hasattr(model, "pose_head"):
+        torch.save(
+            model.pose_head.state_dict(),
+            os.path.join(ckpt, "pose_head.pt"),
+        )
     log.info(f"Checkpoint saved → {ckpt}")
 
 
@@ -1091,6 +1185,16 @@ def parse_args() -> argparse.Namespace:
         "--answer_weight",
         type=float, default=1.0,
         help="Weight applied to the LM answer-prediction loss in plus mode.",
+    )
+    p.add_argument(
+        "--ablation",
+        choices=["no_cam", "vanilla"],
+        default=None,
+        help="Ablation study mode. "
+             "no_cam: keeps 4D M-RoPE position embedding, removes pose prediction, "
+             "only LM answer loss. "
+             "vanilla: uses original Qwen 3D M-RoPE, removes pose prediction, "
+             "only LM answer loss.",
     )
     # ── WandB ─────────────────────────────────────────────────────────────────
     p.add_argument(

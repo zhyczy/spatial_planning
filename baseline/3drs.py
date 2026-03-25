@@ -12,6 +12,7 @@ unchanged.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import shutil
@@ -66,6 +67,14 @@ def parse_args() -> tuple[argparse.Namespace, List[str]]:
 
     parser.add_argument("--model", choices=sorted(MODEL_PRESETS.keys()), required=True)
     parser.add_argument("--model-name-or-path", default=None)
+    parser.add_argument(
+        "--allow-incompatible-qwen35",
+        action="store_true",
+        help=(
+            "Allow running qwen3.5-4b preset even when checkpoint architecture "
+            "is incompatible with 3DRS qwen2-style backbone."
+        ),
+    )
 
     parser.add_argument("--repo-3drs", type=Path, default=threedrs_root)
     parser.add_argument("--vggt-root", type=Path, default=default_vggt_root)
@@ -231,6 +240,70 @@ def build_command(args: argparse.Namespace, model_name_or_path: str, torchrun_bi
     return cmd
 
 
+def _load_local_model_config(model_name_or_path: str) -> dict | None:
+    model_dir = Path(model_name_or_path)
+    config_path = model_dir / "config.json"
+    if not model_dir.exists() or not config_path.exists():
+        return None
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _checkpoint_uses_nested_language_model_keys(model_name_or_path: str) -> bool:
+    model_dir = Path(model_name_or_path)
+    index_path = model_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        return False
+
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    weight_map = payload.get("weight_map", {})
+    if not isinstance(weight_map, dict) or not weight_map:
+        return False
+
+    sample_keys = list(weight_map.keys())[:128]
+    return any(key.startswith("model.language_model.") for key in sample_keys)
+
+
+def validate_model_compatibility(args: argparse.Namespace, model_name_or_path: str) -> None:
+    # train_3d.py routes all qwen checkpoints to llava_qwen (Qwen2-style).
+    # Newer Qwen-VL/Qwen3.5 checkpoints can be structurally incompatible.
+    cfg = _load_local_model_config(model_name_or_path)
+    uses_nested_lm = _checkpoint_uses_nested_language_model_keys(model_name_or_path)
+
+    if args.model != "qwen3.5-4b":
+        return
+
+    model_type = cfg.get("model_type") if isinstance(cfg, dict) else None
+    architectures = cfg.get("architectures", []) if isinstance(cfg, dict) else []
+    text_cfg = cfg.get("text_config", {}) if isinstance(cfg, dict) else {}
+    layer_types = text_cfg.get("layer_types", []) if isinstance(text_cfg, dict) else []
+
+    has_linear_attention_layers = isinstance(layer_types, list) and any(
+        t == "linear_attention" for t in layer_types
+    )
+    is_conditional_generation = any(
+        isinstance(a, str) and a.endswith("ForConditionalGeneration") for a in architectures
+    )
+
+    incompatible = uses_nested_lm or has_linear_attention_layers or is_conditional_generation
+    if incompatible and not args.allow_incompatible_qwen35:
+        raise RuntimeError(
+            "Incompatible qwen3.5 checkpoint for current 3DRS backend. "
+            "Detected a Qwen-VL/Qwen3.5 conditional-generation layout "
+            "(e.g., model.language_model.* and/or linear_attention layers), "
+            "while 3DRS llava_qwen expects Qwen2-style causal-lm weights. "
+            "This would silently initialize most language weights from scratch. "
+            "Please pass a compatible text-style Qwen checkpoint, or rerun with "
+            "--allow-incompatible-qwen35 only if you intentionally want random-init training."
+        )
+
+
 def main() -> int:
     args, passthrough = parse_args()
     workspace_root = Path(__file__).resolve().parent.parent
@@ -245,6 +318,7 @@ def main() -> int:
 
     preset = MODEL_PRESETS[args.model]
     model_name_or_path = resolve_model_name_or_path(args, preset, workspace_root)
+    validate_model_compatibility(args, model_name_or_path)
 
     torchrun_bin = shutil.which("torchrun")
     if torchrun_bin is None:
