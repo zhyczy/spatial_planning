@@ -2,23 +2,21 @@
 # =============================================================================
 # train_baseline.sh
 #
-# 3DRS-style LoRA fine-tuning of Qwen3.5-VL on SPAR spatial QA.
-# Multi-GPU via torchrun (DDP).
+# 3DRS training launcher.
+# Multi-GPU is managed by baseline/3drs.py (internally uses torchrun).
 #
 # Usage:
-#   bash scripts/train_baseline.sh [num_gpus] [num_samples] [spatial_model]
+#   bash scripts/train_baseline.sh [num_gpus] [model_preset] [model_name_or_path]
 #
-#   num_gpus      — number of GPUs to use (default: all available)
-#   num_samples   — truncate dataset to this many entries (default: all)
-#   spatial_model — "vggt" | "mapanything" | "none" (default: vggt)
+#   num_gpus           — number of GPUs to use (default: all available)
+#   model_preset       — qwen2.5vl-3b | qwen3.5-4b (default: qwen3.5-4b)
+#   model_name_or_path — optional override model path/name
 #
 # Examples:
-#   bash scripts/train_baseline.sh                    # all GPUs, full dataset, vggt
-#   bash scripts/train_baseline.sh 2                  # 2 GPUs, full dataset, vggt
-#   bash scripts/train_baseline.sh 2 100              # 2 GPUs, 100 samples, vggt
-#   bash scripts/train_baseline.sh 1 6                # single GPU, 6 samples, vggt
-#   bash scripts/train_baseline.sh 2 100 mapanything  # 2 GPUs, 100 samples, mapanything
-#   bash scripts/train_baseline.sh 2 "" none          # 2 GPUs, full dataset, no spatial
+#   bash scripts/train_baseline.sh
+#   bash scripts/train_baseline.sh 8
+#   bash scripts/train_baseline.sh 8 qwen2.5vl-3b
+#   bash scripts/train_baseline.sh 8 qwen3.5-4b /path/to/local/model
 # =============================================================================
 
 set -euo pipefail
@@ -43,32 +41,28 @@ else
     export CUDA_VISIBLE_DEVICES=$(seq -s ',' 0 $((NPROC - 1)))
 fi
 
-# num_samples: positional arg 2 (default: empty = all)
-MAX_SAMPLES="${2:-}"
+# model preset: positional arg 2
+MODEL_PRESET="${2:-qwen3.5-4b}"
 
-# spatial_model: positional arg 3 (default: vggt)
-SPATIAL_MODEL="${3:-vggt}"
+if [[ "$MODEL_PRESET" != "qwen2.5vl-3b" && "$MODEL_PRESET" != "qwen3.5-4b" ]]; then
+    echo "[ERROR] model_preset must be one of: qwen2.5vl-3b, qwen3.5-4b"
+    exit 1
+fi
+
+# optional model path/name override: positional arg 3
+MODEL_OVERRIDE="${3:-}"
 
 # =============================================================================
 # Paths
 # =============================================================================
 
 MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
-JSON_PATH="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/train_10k.json"
-
-VGGT_PATH="$SPATIAL_DIR/checkpoints/VGGT-1B"
-MAPANYTHING_PATH="$SPATIAL_DIR/checkpoints/map-anything-weights"
-
-if [ "$SPATIAL_MODEL" = "vggt" ]; then
-    SPATIAL_MODEL_PATH="$VGGT_PATH"
-elif [ "$SPATIAL_MODEL" = "mapanything" ]; then
-    SPATIAL_MODEL_PATH="$MAPANYTHING_PATH"
-else
-    SPATIAL_MODEL_PATH=""
+if [ -z "$MODEL_OVERRIDE" ] && [ -d "$MODEL_PATH" ]; then
+    MODEL_OVERRIDE="$MODEL_PATH"
 fi
 
-RUN_NAME="3drs_${SPATIAL_MODEL}"
-OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
+RUN_NAME="3drs_${MODEL_PRESET}"
+OUTPUT_DIR="$SPATIAL_DIR/train_records_baseline/$RUN_NAME"
 
 # =============================================================================
 # Hyperparameters
@@ -76,15 +70,6 @@ OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 EPOCHS=3
 LR=2e-4
-LORA_RANK=64
-MAX_IMAGES=4
-GRAD_ACCUM=8
-NUM_WORKERS=4
-SAVE_STEPS=500
-
-WANDB_PROJECT="SPI"
-WANDB_ENTITY="actmrv"
-WANDB_RUN_NAME="3drs_${SPATIAL_MODEL}_lora_r${LORA_RANK}_ep${EPOCHS}"
 
 # =============================================================================
 # Setup
@@ -94,50 +79,38 @@ mkdir -p "$OUTPUT_DIR"
 
 echo "[INFO] NPROC_PER_NODE      = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
-echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
-echo "[INFO] SPATIAL_MODEL        = $SPATIAL_MODEL"
+echo "[INFO] MODEL_PRESET         = $MODEL_PRESET"
+echo "[INFO] MODEL_OVERRIDE       = ${MODEL_OVERRIDE:-<preset default>}"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
 # =============================================================================
-# Build optional flags
+# Build command
 # =============================================================================
 
-MAX_SAMPLES_FLAG=""
-if [ -n "$MAX_SAMPLES" ]; then
-    MAX_SAMPLES_FLAG="--max_samples $MAX_SAMPLES"
+PYTHON=/egr/research-actionlab/caizhon2/miniconda3/envs/spc/bin/python
+
+CMD=(
+    "$PYTHON" baseline/3drs.py
+    --model "$MODEL_PRESET"
+    --num-gpus "$NPROC"
+    --cuda-visible-devices "$CUDA_VISIBLE_DEVICES"
+    --run-name "$RUN_NAME"
+    --output-dir "$OUTPUT_DIR"
+    --num-train-epochs "$EPOCHS"
+    --learning-rate "$LR"
+    --frames-upbound 32
+    --frame-sampling-strategy uniform
+)
+
+if [ -n "$MODEL_OVERRIDE" ]; then
+    CMD+=(--model-name-or-path "$MODEL_OVERRIDE")
 fi
 
-SPATIAL_PATH_FLAG=""
-if [ -n "$SPATIAL_MODEL_PATH" ]; then
-    SPATIAL_PATH_FLAG="--spatial_model_path $SPATIAL_MODEL_PATH"
-fi
-
 # =============================================================================
-# Run via torchrun (DDP)
+# Run via baseline/3drs.py
 # =============================================================================
 
-TORCHRUN=/egr/research-actionlab/caizhon2/miniconda3/envs/spc/bin/torchrun
-
-$TORCHRUN \
-    --nproc_per_node "$NPROC" \
-    --master_port    29501 \
-    baseline/3drs.py \
-    --model_path     "$MODEL_PATH"      \
-    --json_path      "$JSON_PATH"       \
-    --output_dir     "$OUTPUT_DIR"      \
-    --epochs         "$EPOCHS"          \
-    --lr             "$LR"              \
-    --lora_rank      "$LORA_RANK"       \
-    --max_images     "$MAX_IMAGES"      \
-    --grad_accum     "$GRAD_ACCUM"      \
-    --num_workers    "$NUM_WORKERS"     \
-    --save_steps     "$SAVE_STEPS"      \
-    --spatial_model  "$SPATIAL_MODEL"   \
-    --wandb_project  "$WANDB_PROJECT"   \
-    --wandb_entity   "$WANDB_ENTITY"    \
-    --wandb_run_name "$WANDB_RUN_NAME"  \
-    $SPATIAL_PATH_FLAG \
-    $MAX_SAMPLES_FLAG
+"${CMD[@]}"
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

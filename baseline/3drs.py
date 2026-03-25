@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+Launcher for 3DRS training with two model presets:
+- qwen2.5vl-3b
+- qwen3.5-4b
+
+This script delegates training to 3DRS/llava/train/train_3d.py so the
+original training loss (including grounding + 3D distillation terms) remains
+unchanged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List
+
+
+@dataclass(frozen=True)
+class ModelPreset:
+    model_name_or_path: str
+    prompt_version: str = "qwen_1_5"
+    local_candidates: tuple[str, ...] = ()
+
+
+MODEL_PRESETS: Dict[str, ModelPreset] = {
+    "qwen2.5vl-3b": ModelPreset(
+        model_name_or_path="Qwen/Qwen2.5-VL-3B-Instruct",
+        local_candidates=(
+            "checkpoints/Qwen2.5-VL-3B-Instruct",
+            "checkpoints/Qwen2_5_VL_3B_Instruct",
+            "checkpoints/Qwen2.5-VL-3B",
+        ),
+    ),
+    "qwen3.5-4b": ModelPreset(
+        model_name_or_path="Qwen/Qwen3.5-4B-Instruct",
+        local_candidates=(
+            "checkpoints/Qwen3.5-4B-Instruct",
+            "checkpoints/Qwen3.5-4B",
+            "checkpoints/Qwen3_5_4B_Instruct",
+        ),
+    ),
+}
+
+
+def parse_args() -> tuple[argparse.Namespace, List[str]]:
+    repo_root = Path(__file__).resolve().parent
+    spatial_root = repo_root.parent
+    threedrs_root = repo_root / "repo" / "3DRS"
+    default_vggt_root = spatial_root / "external" / "vggt"
+    default_data_path = spatial_root / "datasets" / "train" / "SPAR_7M" / "spar" / "train_10k.json"
+    default_image_folder = spatial_root / "datasets" / "train" / "SPAR_7M" / "spar" / "scannetpp" / "images"
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train 3DRS with the original loss implementation and selectable "
+            "Qwen model presets."
+        )
+    )
+
+    parser.add_argument("--model", choices=sorted(MODEL_PRESETS.keys()), required=True)
+    parser.add_argument("--model-name-or-path", default=None)
+
+    parser.add_argument("--repo-3drs", type=Path, default=threedrs_root)
+    parser.add_argument("--vggt-root", type=Path, default=default_vggt_root)
+
+    parser.add_argument("--data-path", "--data-yaml", dest="data_path", default=str(default_data_path))
+    parser.add_argument("--image-folder", default=str(default_image_folder))
+    parser.add_argument("--video-folder", default="data")
+    parser.add_argument("--embodiedscan-folder", default="data/embodiedscan/")
+
+    parser.add_argument("--vision-tower", default="google/siglip-so400m-patch14-384")
+    parser.add_argument("--deepspeed-config", default="scripts/zero3.json")
+    parser.add_argument("--master-port", type=int, default=43000)
+
+    parser.add_argument("--num-gpus", type=int, default=8)
+    parser.add_argument("--global-batch-size", type=int, default=16)
+    parser.add_argument("--per-device-train-batch-size", type=int, default=1)
+    parser.add_argument("--per-device-eval-batch-size", type=int, default=4)
+
+    parser.add_argument("--num-train-epochs", type=float, default=1.0)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--frames-upbound", type=int, default=32)
+    parser.add_argument("--frame-sampling-strategy", default="uniform")
+
+    parser.add_argument("--run-name", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--cuda-visible-devices", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+
+    args, passthrough = parser.parse_known_args()
+    return args, passthrough
+
+
+def resolve_model_name_or_path(args: argparse.Namespace, preset: ModelPreset, workspace_root: Path) -> str:
+    if args.model_name_or_path:
+        return args.model_name_or_path
+
+    for rel_path in preset.local_candidates:
+        candidate = (workspace_root / rel_path).resolve()
+        if candidate.exists():
+            return str(candidate)
+
+    return preset.model_name_or_path
+
+
+def build_command(args: argparse.Namespace, model_name_or_path: str, torchrun_bin: str) -> List[str]:
+    preset = MODEL_PRESETS[args.model]
+    run_name = args.run_name or f"3drs-{args.model}"
+    output_dir = args.output_dir or f"./ckpt/{run_name}"
+
+    grad_acc_steps = max(1, args.global_batch_size // max(1, args.num_gpus))
+
+    cmd = [
+        torchrun_bin,
+        "--nnodes",
+        "1",
+        "--nproc_per_node",
+        str(args.num_gpus),
+        "--master_port",
+        str(args.master_port),
+        "llava/train/train_3d.py",
+        "--deepspeed",
+        args.deepspeed_config,
+        "--model_name_or_path",
+        model_name_or_path,
+        "--version",
+        preset.prompt_version,
+        "--data_path",
+        args.data_path,
+        "--image_folder",
+        args.image_folder,
+        "--video_folder",
+        args.video_folder,
+        "--embodiedscan_folder",
+        args.embodiedscan_folder,
+        # LoRA mode (instead of full-parameter mm_tunable_parts finetuning).
+        "--lora_enable",
+        "True",
+        "--lora_r",
+        "64",
+        "--lora_alpha",
+        "16",
+        "--lora_dropout",
+        "0.05",
+        "--lora_bias",
+        "none",
+        "--vision_tower",
+        args.vision_tower,
+        "--mm_projector_type",
+        "mlp2x_gelu",
+        "--mm_vision_select_layer",
+        "-2",
+        "--mm_use_im_start_end",
+        "False",
+        "--mm_use_im_patch_token",
+        "False",
+        "--image_aspect_ratio",
+        "anyres_max_9",
+        "--image_grid_pinpoints",
+        "(1x1),...,(6x6)",
+        "--mm_patch_merge_type",
+        "spatial_unpad",
+        "--bf16",
+        "True",
+        "--run_name",
+        run_name,
+        "--output_dir",
+        output_dir,
+        "--num_train_epochs",
+        str(args.num_train_epochs),
+        "--per_device_train_batch_size",
+        str(args.per_device_train_batch_size),
+        "--per_device_eval_batch_size",
+        str(args.per_device_eval_batch_size),
+        "--gradient_accumulation_steps",
+        str(grad_acc_steps),
+        "--eval_strategy",
+        "no",
+        "--save_strategy",
+        "steps",
+        "--save_steps",
+        "2000",
+        "--save_total_limit",
+        "1",
+        "--learning_rate",
+        str(args.learning_rate),
+        "--weight_decay",
+        "0.0",
+        "--warmup_ratio",
+        "0.03",
+        "--lr_scheduler_type",
+        "cosine",
+        "--logging_steps",
+        "1",
+        "--tf32",
+        "True",
+        "--model_max_length",
+        "32768",
+        "--gradient_checkpointing",
+        "True",
+        "--dataloader_num_workers",
+        "1",
+        "--lazy_preprocess",
+        "True",
+        "--torch_compile",
+        "True",
+        "--torch_compile_backend",
+        "inductor",
+        "--dataloader_drop_last",
+        "True",
+        "--mm_newline_position",
+        "grid",
+        "--add_spatial_instruction",
+        "True",
+        "--force_sample",
+        "True",
+        "--mm_spatial_pool_stride",
+        "2",
+        "--frame_sampling_strategy",
+        args.frame_sampling_strategy,
+        "--frames_upbound",
+        str(args.frames_upbound),
+    ]
+    return cmd
+
+
+def main() -> int:
+    args, passthrough = parse_args()
+    workspace_root = Path(__file__).resolve().parent.parent
+
+    repo_3drs = args.repo_3drs.resolve()
+    if not repo_3drs.exists():
+        raise FileNotFoundError(f"3DRS repo not found: {repo_3drs}")
+
+    vggt_root = args.vggt_root.resolve()
+    if not vggt_root.exists():
+        raise FileNotFoundError(f"VGGT root not found: {vggt_root}")
+
+    preset = MODEL_PRESETS[args.model]
+    model_name_or_path = resolve_model_name_or_path(args, preset, workspace_root)
+
+    torchrun_bin = shutil.which("torchrun")
+    if torchrun_bin is None:
+        candidate = Path(sys.executable).resolve().parent / "torchrun"
+        if candidate.exists():
+            torchrun_bin = str(candidate)
+        else:
+            raise FileNotFoundError(
+                "torchrun not found. Please activate your training environment "
+                "or install pytorch distributed launcher in that environment."
+            )
+
+    env = os.environ.copy()
+    if args.cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+
+    # Ensure dependencies are importable. We intentionally do not force the
+    # repository's vendored transformers source to avoid tokenizers version
+    # conflicts in the active environment.
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    pythonpath_items = [str(vggt_root), str(repo_3drs)]
+    if existing_pythonpath:
+        pythonpath_items.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_items)
+
+    cmd = build_command(args, model_name_or_path, torchrun_bin) + passthrough
+    printable_cmd = " ".join(shlex.quote(part) for part in cmd)
+
+    print(f"[3drs] cwd: {repo_3drs}")
+    print(f"[3drs] model preset: {args.model}")
+    print(f"[3drs] model_name_or_path: {model_name_or_path}")
+    print(f"[3drs] data_path: {args.data_path}")
+    print(f"[3drs] image_folder: {args.image_folder}")
+    print(f"[3drs] vggt root: {vggt_root}")
+    print(f"[3drs] command: {printable_cmd}")
+
+    # 3DRS train_3d.py uses local_files_only=True in the qwen branch. If this is a
+    # remote HF id, make the caveat explicit to avoid confusing runtime failures.
+    if "/" in model_name_or_path and not Path(model_name_or_path).exists():
+        print(
+            "[3drs][warning] model_name_or_path looks like a HF repo id. "
+            "train_3d.py loads qwen models with local_files_only=True, so please "
+            "ensure weights are already cached locally or pass a local checkpoint path."
+        )
+
+    if args.dry_run:
+        return 0
+
+    result = subprocess.run(cmd, cwd=str(repo_3drs), env=env, check=False)
+    return result.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
