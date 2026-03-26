@@ -369,16 +369,30 @@ class SpaTextModel(Qwen3_5TextModel):
             layer_mask = (
                 linear_attn_mask if decoder_layer.layer_type == "linear_attention" else causal_mask
             )
-            hidden_states = decoder_layer(
-                hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=layer_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
-            )
+            if self.gradient_checkpointing and self.training:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=layer_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    use_reentrant=False,
+                    **kwargs,
+                )
+            else:
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=layer_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -417,6 +431,19 @@ class SpaModel(Qwen3_5Model):
         self.language_model = SpaTextModel._from_config(config.text_config)
         self.rope_deltas = None
         self.post_init()
+
+    def get_image_features(self, pixel_values, image_grid_thw, **kwargs):
+        """Run frozen vision encoder without building a computation graph."""
+        with torch.no_grad():
+            out = super().get_image_features(pixel_values, image_grid_thw, **kwargs)
+        # Detach so autograd does not trace back through the ViT
+        if isinstance(out.pooler_output, (list, tuple)):
+            out.pooler_output = [t.detach() for t in out.pooler_output]
+        else:
+            out.pooler_output = out.pooler_output.detach()
+        if out.last_hidden_state is not None:
+            out.last_hidden_state = out.last_hidden_state.detach()
+        return out
 
     def get_vision_position_ids(
         self,

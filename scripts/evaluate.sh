@@ -24,6 +24,7 @@
 #   --output    base output directory (default: train_records/eval_results)
 #   --run_name  optional sub-folder name (default: auto timestamp per dataset)
 #   --no_coord  pass --no_coord to evaluation.py (zero XYZ, ablation mode)
+#   --abl_vanilla  vanilla ablation: use stock Qwen3.5 with original 3D M-RoPE
 #   --max_new_tokens  generation budget (default: 512)
 #
 # Examples:
@@ -71,6 +72,7 @@ LIMIT=""
 OUTPUT_BASE="$SPATIAL_DIR/eval_results"
 RUN_NAME=""
 NO_COORD=""
+ABL_VANILLA=""
 THINKING=""
 MAX_NEW_TOKENS=512
 
@@ -101,8 +103,9 @@ while [[ $# -gt 0 ]]; do
         --limit)         LIMIT="$2";           shift 2 ;;
         --output)        OUTPUT_BASE="$2";     shift 2 ;;
         --run_name)      RUN_NAME="$2";        shift 2 ;;
-        --no_coord)      NO_COORD="--no_coord";   shift  ;;
-        --thinking)      THINKING="--thinking";   shift  ;;
+        --no_coord)      NO_COORD="--no_coord";       shift  ;;
+        --abl_vanilla)   ABL_VANILLA="--abl_vanilla"; shift  ;;
+        --thinking)      THINKING="--thinking";       shift  ;;
         --max_new_tokens) MAX_NEW_TOKENS="$2";    shift 2 ;;
         *)
             echo "[ERROR] Unknown argument: $1" >&2
@@ -181,6 +184,10 @@ fi
 
 if [[ -n "$NO_COORD" ]]; then
     COMMON_FLAGS+=($NO_COORD)
+fi
+
+if [[ -n "$ABL_VANILLA" ]]; then
+    COMMON_FLAGS+=($ABL_VANILLA)
 fi
 
 if [[ -n "$THINKING" ]]; then

@@ -362,39 +362,52 @@ def load_spa_model(
     base_model_path: str,
     ckpt_path: str,
     device: str = "cuda:0",
+    vanilla: bool = False,
 ) -> Tuple[Any, Any]:
-    """Load SpaForConditionalGeneration with LoRA adapter for correspondence evaluation.
+    """Load SPA model with LoRA adapter for correspondence evaluation.
 
     Steps:
       1. Load config and set mrope_section to 4 equal parts (4D M-RoPE).
-      2. Load base SpaForConditionalGeneration from base_model_path.
+         For vanilla ablation: keep original 3D mrope_section and use stock
+         Qwen3_5ForConditionalGeneration instead of SpaForConditionalGeneration.
+      2. Load base model from base_model_path.
       3. Load processor/tokenizer from ckpt_path (has <pose> in vocab).
       4. Resize embedding table to match the saved tokenizer.
       5. Load PEFT LoRA adapter from ckpt_path, then merge into base weights.
     """
     logger = logging.getLogger(__name__)
-    logger.info(f"[correspondence] Loading SPA model: base={base_model_path}  ckpt={ckpt_path}")
+    logger.info(f"[correspondence] Loading SPA model: base={base_model_path}  ckpt={ckpt_path}  vanilla={vanilla}")
 
     from transformers import AutoConfig, AutoProcessor, AutoTokenizer
     from peft import PeftModel
-    from models.spa_emb import SpaForConditionalGeneration
 
-    # 1. Config: switch to 4D mrope_section
     config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
-    section_size = sum(orig_section) // 4
-    config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
-    logger.info(f"[correspondence] mrope_section: {orig_section} → {[section_size]*4}")
 
-    # 2. Load base model
-    spa = SpaForConditionalGeneration.from_pretrained(
-        base_model_path,
-        config=config,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-    )
+    if vanilla:
+        # vanilla ablation: keep original 3D M-RoPE, use stock Qwen3.5 model
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+        logger.info(f"[correspondence] mrope_section: {orig_section} (original 3D M-RoPE, vanilla)")
+        spa = Qwen3_5ForConditionalGeneration.from_pretrained(
+            base_model_path,
+            config=config,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+    else:
+        # 4D M-RoPE for normal / plus / no_cam
+        from models.spa_emb import SpaForConditionalGeneration
+        section_size = sum(orig_section) // 4
+        config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
+        logger.info(f"[correspondence] mrope_section: {orig_section} → {[section_size]*4}")
+        spa = SpaForConditionalGeneration.from_pretrained(
+            base_model_path,
+            config=config,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
 
-    # 3. Processor from base model; swap in the checkpoint tokenizer (<pose> token added during training)
+    # 3. Processor from base model; swap in the checkpoint tokenizer
     processor = AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path, local_files_only=True)
     processor.tokenizer = tokenizer
@@ -720,12 +733,16 @@ def run_inference_spa(
     processor: Any,
     max_new_tokens: int = 512,
     coord_scale: float = 100.0,
+    vanilla: bool = False,
 ) -> str:
-    """Run generation with SpaForConditionalGeneration.
+    """Run generation with SPA model (or stock Qwen3.5 for vanilla ablation).
 
     image_xyz (if provided) is passed as a kwarg to model.generate() which
     forwards it to forward() → get_rope_index() for 4D M-RoPE.
     The PoseRegressionHead is NOT used; we only call generate() for QA.
+
+    When vanilla=True, the model is a stock Qwen3_5ForConditionalGeneration
+    with original 3D M-RoPE — no custom get_rope_index or image_xyz needed.
     """
     device = next(model.parameters()).device
     inputs_dev = {
@@ -733,42 +750,51 @@ def run_inference_spa(
         for k, v in inputs.items()
     }
 
-    # Move image_xyz to device
-    xyz_on_device = None
-    if image_xyz is not None:
-        xyz_on_device = [xyz.to(device) for xyz in image_xyz]
+    if vanilla:
+        # Stock Qwen3.5: let the model compute its own 3D position_ids
+        gen_kwargs: Dict[str, Any] = dict(
+            **inputs_dev,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=processor.tokenizer.eos_token_id,
+        )
+    else:
+        # Move image_xyz to device
+        xyz_on_device = None
+        if image_xyz is not None:
+            xyz_on_device = [xyz.to(device) for xyz in image_xyz]
 
-    # Pre-compute 5D position_ids (seq, t, x, y, z) so that generate()'s
-    # _prepare_position_ids_for_generation is bypassed.  Without this,
-    # SpaForConditionalGeneration.forward uses *args/**kwargs and
-    # inspect.signature can't see "position_ids", so accepts_position_ids=False
-    # and the model falls back to compute_3d_position_ids() → 3D → shape
-    # mismatch in Spa4DRotaryEmbedding ("4 vs 3" error).
-    with torch.no_grad():
-        position_ids, _ = model.model.get_rope_index(
-            input_ids=inputs_dev["input_ids"],
-            mm_token_type_ids=inputs_dev["mm_token_type_ids"],
-            image_grid_thw=inputs_dev.get("image_grid_thw"),
-            video_grid_thw=inputs_dev.get("video_grid_thw"),
-            attention_mask=inputs_dev.get("attention_mask"),
-            image_xyz=xyz_on_device,
+        # Pre-compute 5D position_ids (seq, t, x, y, z) so that generate()'s
+        # _prepare_position_ids_for_generation is bypassed.  Without this,
+        # SpaForConditionalGeneration.forward uses *args/**kwargs and
+        # inspect.signature can't see "position_ids", so accepts_position_ids=False
+        # and the model falls back to compute_3d_position_ids() → 3D → shape
+        # mismatch in Spa4DRotaryEmbedding ("4 vs 3" error).
+        with torch.no_grad():
+            position_ids, _ = model.model.get_rope_index(
+                input_ids=inputs_dev["input_ids"],
+                mm_token_type_ids=inputs_dev["mm_token_type_ids"],
+                image_grid_thw=inputs_dev.get("image_grid_thw"),
+                video_grid_thw=inputs_dev.get("video_grid_thw"),
+                attention_mask=inputs_dev.get("attention_mask"),
+                image_xyz=xyz_on_device,
+                coord_scale=coord_scale,
+            )
+
+        gen_kwargs: Dict[str, Any] = dict(
+            **inputs_dev,
+            position_ids=position_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=processor.tokenizer.eos_token_id,
             coord_scale=coord_scale,
         )
-
-    gen_kwargs: Dict[str, Any] = dict(
-        **inputs_dev,
-        position_ids=position_ids,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=processor.tokenizer.eos_token_id,
-        coord_scale=coord_scale,
-    )
-    # mm_token_type_ids was already consumed to pre-compute position_ids above.
-    # HuggingFace's _validate_model_kwargs would reject it because it's not in
-    # SpaForConditionalGeneration.prepare_inputs_for_generation's signature.
-    gen_kwargs.pop("mm_token_type_ids", None)
-    if xyz_on_device is not None:
-        gen_kwargs["image_xyz"] = xyz_on_device
+        # mm_token_type_ids was already consumed to pre-compute position_ids above.
+        # HuggingFace's _validate_model_kwargs would reject it because it's not in
+        # SpaForConditionalGeneration.prepare_inputs_for_generation's signature.
+        gen_kwargs.pop("mm_token_type_ids", None)
+        if xyz_on_device is not None:
+            gen_kwargs["image_xyz"] = xyz_on_device
 
     with torch.no_grad():
         generated_ids = model.generate(**gen_kwargs)
@@ -911,6 +937,7 @@ def evaluate(
     output_dir: Path,
     device: str = "cuda:0",
     thinking: bool = False,
+    vanilla: bool = False,
 ) -> Dict[str, List[Dict]]:
     """Run evaluation for the requested method(s) on *data*.
 
@@ -931,7 +958,7 @@ def evaluate(
     if run_correspondence:
         if correspondence_ckpt is None:
             raise ValueError("--correspondence_ckpt is required for method='correspondence'/'both'")
-        spa_model, spa_proc = load_spa_model(spa_base_model_path, correspondence_ckpt, device)
+        spa_model, spa_proc = load_spa_model(spa_base_model_path, correspondence_ckpt, device, vanilla=vanilla)
 
         # Resolve spatial_merge_size from base model config
         cfg_path = Path(spa_base_model_path) / "config.json"
@@ -977,7 +1004,7 @@ def evaluate(
                 )
                 output = run_inference_spa(
                     inputs, image_xyz, spa_model, spa_proc,
-                    max_new_tokens, coord_scale,
+                    max_new_tokens, coord_scale, vanilla=vanilla,
                 )
                 results_map["correspondence"].append(
                     _make_result(item, output, prompt, "correspondence",
@@ -1015,6 +1042,7 @@ def _worker(
     output_dir: str,
     log_file: Optional[str],
     thinking: bool = False,
+    vanilla: bool = False,
 ) -> None:
     if log_file:
         logging.basicConfig(
@@ -1040,6 +1068,7 @@ def _worker(
         output_dir=Path(output_dir),
         device=device,
         thinking=thinking,
+        vanilla=vanilla,
     )
     logger.info(f"[Worker {gpu_id}] Done.")
 
@@ -1154,6 +1183,12 @@ def main() -> None:
              "Useful for ablation or debugging without MapAnything.",
     )
     parser.add_argument(
+        "--abl_vanilla", action="store_true", default=False,
+        help="Vanilla ablation: load stock Qwen3_5ForConditionalGeneration with "
+             "original 3D M-RoPE instead of SpaForConditionalGeneration with 4D M-RoPE. "
+             "Must match the model trained with --ablation vanilla.",
+    )
+    parser.add_argument(
         "--coord_scale", type=float, default=100.0,
         help="Scale applied to XYZ values before discretisation in M-RoPE "
              "(must match the value used during training, default: 100.0).",
@@ -1234,6 +1269,7 @@ def main() -> None:
     logger.info(f"  model_path          : {args.model_path}")
     logger.info(f"  correspondence_ckpt : {args.correspondence_ckpt}")
     logger.info(f"  use_coord           : {not args.no_coord}")
+    logger.info(f"  abl_vanilla         : {args.abl_vanilla}")
     logger.info(f"  coord_scale         : {args.coord_scale}")
     logger.info(f"  dataset             : {args.dataset}  ({len(dataset)} samples)")
     logger.info(f"  max_new_tokens      : {args.max_new_tokens}")
@@ -1272,6 +1308,7 @@ def main() -> None:
                 str(output_dir),
                 str(log_file),
                 args.thinking,
+                args.abl_vanilla,
             ),
         )
         p.start()

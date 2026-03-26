@@ -9,15 +9,15 @@ simultaneous supervision signals:
   2. LM answer        — causal cross-entropy on answer tokens
                         (question appended to prompt; answer supervised)
   3. Coordinate       — L1 loss predicting per-patch mean 3D (x,y,z)
-                        (each LLM vision token → CoordinateRegressionHead)
+                        (down-sampled <coord> tokens → MLP → bilinear upsample)
 
 Architecture:
   CoordinatePlusModel
     ├── SpaForConditionalGeneration  [backbone + LoRA adapters]
     │    ├── SpaVisionModel (ViT, frozen)
     │    └── SpaModel (LLM + 4D M-RoPE)
-    ├── PoseRegressionHead    [MLP: hidden_dim*n_skip → 9D per <pose> token]
-    └── CoordinateReadoutHead [cross-attn: <coord> token conditions visual tokens → 3D xyz]
+    ├── PoseRegressionHead      [MLP: hidden_dim*n_skip → 9D per <pose> token]
+    └── CoordinateRegressionHead [MLP: hidden_dim → 3D + bilinear upsample]
 
 Coordinate GT:
   For each image and each LLM patch token (after spatial merge), the GT is the
@@ -210,31 +210,17 @@ class PoseRegressionHead(nn.Module):
         return self.mlp(x)
 
 
-class CoordinateReadoutHead(nn.Module):
+class CoordinateRegressionHead(nn.Module):
     """
-    Task-routing coordinate decoder.
+    Direct per-patch coordinate decoder: MLP applied to each <coord> token.
 
-    The <coord> token (inserted once per image in the user prompt) acts as a
-    task-routing token: its hidden state has attended to both the visual tokens
-    and the instruction, providing a rich conditioning signal.
-
-    Architecture:
-      - Visual tokens for image k  → queries  (n_tok, D)
-      - <coord> token for image k  → key/value (1, D)
-      - Cross-attention output + residual → LayerNorm → MLP → (n_tok, 3)
-
-    This lets each patch's predicted coordinate be conditioned on the global
-    scene context encoded in the <coord> token.
+    One <coord> token per LLM patch.  Each token's hidden state is decoded to
+    (x, y, z) by a small MLP; the output is reshaped to the patch grid.
+    No downsampling or upsampling.
     """
 
-    def __init__(self, hidden_dim: int = 2560, n_heads: int = 8):
+    def __init__(self, hidden_dim: int = 2560):
         super().__init__()
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim   = hidden_dim,
-            num_heads   = n_heads,
-            batch_first = True,
-        )
-        self.norm = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, 256),
             nn.GELU(),
@@ -243,14 +229,19 @@ class CoordinateReadoutHead(nn.Module):
 
     def forward(
         self,
-        visual_hidden: torch.Tensor,   # (n_tok, hidden_dim)
-        coord_hidden:  torch.Tensor,   # (hidden_dim,)
-    ) -> torch.Tensor:                 # (n_tok, 3)
-        q  = visual_hidden.unsqueeze(0)              # (1, n_tok, D)
-        kv = coord_hidden.unsqueeze(0).unsqueeze(0)  # (1, 1,     D)
-        attn_out, _ = self.cross_attn(q, kv, kv)    # (1, n_tok, D)
-        fused = self.norm(q + attn_out).squeeze(0)   # (n_tok, D)
-        return self.mlp(fused)                        # (n_tok, 3)
+        hidden: torch.Tensor,
+        h: int,
+        w: int,
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden: (h*w, hidden_dim) — <coord> token hidden states
+            h:      patch grid height
+            w:      patch grid width
+        Returns:
+            (h, w, 3) — predicted xyz
+        """
+        return self.mlp(hidden).view(h, w, 3)
 
 
 class CoordinatePlusModel(nn.Module):
@@ -259,16 +250,14 @@ class CoordinatePlusModel(nn.Module):
 
       1. PoseRegressionHead    → rot + trans + cycle loss   (at <pose> tokens)
       2. LM cross-entropy      → answer prediction loss     (at answer tokens)
-      3. CoordinateReadoutHead → xyz coordinate loss
-           - one <coord> task-routing token per image (in user prompt)
-           - visual tokens for that image act as cross-attn queries
-           - <coord> hidden state acts as key/value (scene-level conditioning)
-           - MLP decodes to per-patch (x, y, z)
+      3. CoordinateRegressionHead → xyz coordinate loss
+           - one <coord> token per LLM patch per image
+           - each token's hidden state decoded directly to (x, y, z) via MLP
 
     Args:
         spa_model:          backbone (SpaForConditionalGeneration + LoRA)
         pose_head:          PoseRegressionHead
-        coord_head:         CoordinateReadoutHead
+        coord_head:         CoordinateRegressionHead
         pose_token_id:      token id of <pose>
         coord_token_id:     token id of <coord>
         image_token_id:     token id of <|image_pad|>
@@ -282,7 +271,7 @@ class CoordinatePlusModel(nn.Module):
         self,
         spa_model:          nn.Module,
         pose_head:          PoseRegressionHead,
-        coord_head:         CoordinateReadoutHead,
+        coord_head:         CoordinateRegressionHead,
         pose_token_id:      int,
         coord_token_id:     int,
         image_token_id:     int,
@@ -303,6 +292,18 @@ class CoordinatePlusModel(nn.Module):
         self.answer_weight      = answer_weight
         self.coord_weight       = coord_weight
 
+        # Hook on lm_head to capture last hidden state without
+        # output_hidden_states=True (which defeats gradient checkpointing).
+        self._lm_head_input: torch.Tensor | None = None
+        for name, mod in self.spa_model.named_modules():
+            if name.endswith("lm_head"):
+                mod.register_forward_pre_hook(self._capture_lm_input)
+                break
+
+    def _capture_lm_input(self, module, args):
+        """Pre-hook: capture the input to lm_head (= post-norm last hidden state)."""
+        self._lm_head_input = args[0]
+
     def forward(
         self,
         input_ids:      torch.Tensor,           # (1, seq_len)
@@ -317,29 +318,37 @@ class CoordinatePlusModel(nn.Module):
         **kwargs,
     ):
         # ── backbone (single forward pass) ────────────────────────────────────
+        # When skip_layers==[-1], avoid output_hidden_states=True so that
+        # gradient checkpointing can actually discard intermediate activations.
+        # The lm_head pre-hook captures the last hidden state for us.
+        only_last = (len(self.skip_layers) == 1 and self.skip_layers[0] == -1)
         outputs = self.spa_model(
             input_ids            = input_ids,
             attention_mask       = attention_mask,
             pixel_values         = pixel_values,
             image_grid_thw       = image_grid_thw,
-            output_hidden_states = True,
+            output_hidden_states = not only_last,
             return_dict          = True,
             image_xyz            = image_xyz,
             coord_scale          = coord_scale,
             **kwargs,
         )
-        # hidden_states: tuple[num_layers+1] of (1, seq_len, hidden_dim)
 
-        # ── skip-connection hidden for pose head ──────────────────────────────
-        if len(self.skip_layers) == 1:
-            hidden_pose = outputs.hidden_states[self.skip_layers[0]]
+        # ── hidden states for pose & coord heads ─────────────────────────────
+        if only_last:
+            # Captured by lm_head pre-hook (post-norm last hidden state)
+            hidden_pose  = self._lm_head_input
+            hidden_coord = self._lm_head_input
         else:
-            hidden_pose = torch.cat(
-                [outputs.hidden_states[i] for i in self.skip_layers], dim=-1
-            )  # (1, seq_len, hidden_dim * n_skip)
-
-        # Last-layer hidden for coordinate head
-        hidden_coord = outputs.hidden_states[-1]   # (1, seq_len, hidden_dim)
+            if len(self.skip_layers) == 1:
+                hidden_pose = outputs.hidden_states[self.skip_layers[0]]
+            else:
+                hidden_pose = torch.cat(
+                    [outputs.hidden_states[i] for i in self.skip_layers], dim=-1
+                )
+            hidden_coord = outputs.hidden_states[-1]
+        logits = outputs.logits
+        del outputs
 
         # ── pose prediction ───────────────────────────────────────────────────
         pose_positions = (input_ids[0] == self.pose_token_id).nonzero(
@@ -375,8 +384,7 @@ class CoordinatePlusModel(nn.Module):
         # ── LM answer-prediction loss ─────────────────────────────────────────
         lm_loss = None
         if labels is not None:
-            logits       = outputs.logits                  # (1, seq_len, vocab)
-            shift_logits = logits[..., :-1, :].contiguous()
+            shift_logits = logits[..., :-1, :].contiguous()    # logits extracted above
             shift_labels = labels[..., 1:].contiguous().to(logits.device)
             lm_loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
@@ -384,44 +392,29 @@ class CoordinatePlusModel(nn.Module):
                 ignore_index=-100,
             )
 
-        # ── per-patch 3D coordinate prediction (task-routing tokens) ─────────
-        # Each image k has one <coord> token in the user prompt.
-        # Its hidden state (coord_h_k) conditions the visual tokens for that
-        # image via cross-attention in CoordinateReadoutHead.
+        # ── per-patch 3D coordinate prediction ────────────────────────────────
+        # One <coord> token per LLM patch; MLP decodes each directly to (x,y,z).
         coord_loss = None
         if image_xyz is not None and image_grid_thw is not None:
-            # <coord> token positions — one per image, in prompt order
             coord_pos = (input_ids[0] == self.coord_token_id).nonzero(
-                as_tuple=True
-            )[0]   # (num_images,)
-
-            # <|image_pad|> token positions — split per image by grid size
-            img_pos = (input_ids[0] == self.image_token_id).nonzero(
                 as_tuple=True
             )[0]
 
-            sms    = self.spatial_merge_size
-            start  = 0
+            sms   = self.spatial_merge_size
+            start = 0
             per_img_losses: list[torch.Tensor] = []
 
-            for k in range(min(len(image_xyz), len(coord_pos))):
+            for k in range(min(len(image_xyz), len(image_grid_thw))):
                 thw_k = image_grid_thw[k]
                 llm_h = int(thw_k[1]) // sms
                 llm_w = int(thw_k[2]) // sms
                 n_tok = llm_h * llm_w
 
-                if start + n_tok > len(img_pos):
+                if start + n_tok > len(coord_pos):
                     break
 
-                # Visual token hidden states for image k (queries)
-                vis_pos_k  = img_pos[start : start + n_tok]  # (n_tok,)
-                visual_k   = hidden_coord[0, vis_pos_k]       # (n_tok, D)
-
-                # <coord> token hidden state for image k (key/value)
-                coord_h_k  = hidden_coord[0, coord_pos[k]]    # (D,)
-
-                pred_k = self.coord_head(visual_k, coord_h_k)  # (n_tok, 3)
-                pred_k = pred_k.view(llm_h, llm_w, 3)
+                coord_h_k = hidden_coord[0, coord_pos[start : start + n_tok]]
+                pred_k = self.coord_head(coord_h_k, llm_h, llm_w)  # (llm_h, llm_w, 3)
 
                 gt_k = image_xyz[k].to(pred_k.device, dtype=pred_k.dtype)
                 per_img_losses.append(F.l1_loss(pred_k, gt_k))
@@ -549,12 +542,6 @@ class SPARDataset(Dataset):
             for (i, j) in pairs
         ]
 
-        # One <coord> task-routing token per image
-        coord_sentences = [
-            f"Image {k + 1} 3D spatial coordinates: {COORD_TOKEN}."
-            for k in range(N)
-        ]
-
         # ── QA prompt ─────────────────────────────────────────────────────────
         _convs    = entry.get("conversations", [])
         _question = (
@@ -571,6 +558,36 @@ class SPARDataset(Dataset):
                 f"Sample {idx} (id={entry.get('id')}) has no QA pair."
             )
 
+        # ── Probe image_grid_thw first (to know patch counts per image) ────────
+        # Build a temporary prompt with pose but no coord, process to get thw
+        content_probe = list(content)
+        content_probe.append({
+            "type": "text",
+            "text": " ".join(pose_sentences) + " " + _question,
+        })
+        text_probe = self.processor.apply_chat_template(
+            [{"role": "user", "content": content_probe}],
+            tokenize=False, add_generation_prompt=False,
+        )
+        proc_probe = self.processor(
+            text=[text_probe], images=images,
+            return_tensors="pt", padding=False,
+        )
+        thw_all = proc_probe["image_grid_thw"]  # (N, 3)
+        sms = self.spatial_merge_size
+
+        # ── Build coord sentences (one token per LLM patch) ────────────────────
+        coord_sentences = []
+        for k in range(N):
+            llm_h = int(thw_all[k][1]) // sms
+            llm_w = int(thw_all[k][2]) // sms
+            n_tok = llm_h * llm_w
+            coord_tokens = " ".join([COORD_TOKEN] * n_tok)
+            coord_sentences.append(
+                f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
+            )
+
+        # ── Build final prompt with dense coord tokens ──────────────────────────
         content.append({
             "type": "text",
             "text": (
@@ -695,6 +712,18 @@ def build_model(
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
 
+    # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
+    spa.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    # Verify checkpointing propagated to the language model
+    lm = spa.model.model.language_model if hasattr(spa.model, 'model') else spa.model.language_model
+    gc_flag = getattr(lm, 'gradient_checkpointing', False)
+    log.info(f"Gradient checkpointing enabled. language_model.gradient_checkpointing={gc_flag}")
+    if not gc_flag:
+        lm.gradient_checkpointing = True
+        log.info("Manually set gradient_checkpointing=True on language_model")
+
     hidden_dim = config.text_config.hidden_size
 
     # Pose head: uses skip-layer concat
@@ -703,10 +732,9 @@ def build_model(
     log.info(f"PoseRegressionHead input_dim={pose_input_dim} "
              f"(skip_layers={list(skip_layers)}, hidden={hidden_dim})")
 
-    # Coordinate readout head: cross-attention over visual tokens conditioned
-    # on the <coord> task-routing token
-    coord_head = CoordinateReadoutHead(hidden_dim=hidden_dim).to(torch.bfloat16)
-    log.info(f"CoordinateReadoutHead hidden_dim={hidden_dim}")
+    # Coordinate regression head: dense MLP decoder
+    coord_head = CoordinateRegressionHead(hidden_dim=hidden_dim).to(torch.bfloat16)
+    log.info(f"CoordinateRegressionHead hidden_dim={hidden_dim}")
 
     return CoordinatePlusModel(
         spa_model          = spa,
@@ -779,6 +807,9 @@ def train(args: argparse.Namespace) -> None:
         coord_weight       = args.coord_weight,
     )
     model = model.to(device)
+    if local_rank == 0:
+        mem_gb = torch.cuda.memory_allocated(device) / 1e9
+        log.info(f"[MEM] After model.to(device): {mem_gb:.2f} GiB allocated")
 
     if args.pos3d_dir == "":
         args.pos3d_dir = None
@@ -843,6 +874,8 @@ def train(args: argparse.Namespace) -> None:
     elif args.wandb_project and not _WANDB_AVAILABLE and local_rank == 0:
         log.warning("wandb not installed — logging disabled. `pip install wandb`")
 
+    model.train()
+
     global_step = 0
     running_loss = 0.0
     running_loss_dict: dict[str, float] = {}
@@ -872,6 +905,19 @@ def train(args: argparse.Namespace) -> None:
             labels = batch.get("labels")
             if labels is not None:
                 labels = labels.to(device)
+
+            if step == 0 and local_rank == 0:
+                n_img_tok = (input_ids[0] == image_token_id).sum().item()
+                n_coord_tok = (input_ids[0] == coord_token_id).sum().item()
+                pv_shape = tuple(pixel_values.shape) if pixel_values is not None else None
+                mem_before = torch.cuda.memory_allocated(device) / 1e9
+                log.info(
+                    f"[MEM] Step 0: seq_len={input_ids.shape[1]}, "
+                    f"img_tokens={n_img_tok}, coord_tokens={n_coord_tok}, "
+                    f"pixel_values={pv_shape}, "
+                    f"image_grid_thw={image_grid_thw}, "
+                    f"mem_before_fwd={mem_before:.2f} GiB"
+                )
 
             try:
                 _, loss, loss_dict = model(
