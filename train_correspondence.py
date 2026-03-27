@@ -883,9 +883,14 @@ def train(args: argparse.Namespace) -> None:
         args.model_path, trust_remote_code=True
     )
     tokenizer = processor.tokenizer
-    tokenizer.add_special_tokens({"additional_special_tokens": [POSE_TOKEN]})
-    pose_token_id = tokenizer.convert_tokens_to_ids(POSE_TOKEN)
-    rank0_print(f"<pose> token id = {pose_token_id}")
+    if args.ablation is None:
+        # Only add <pose> token when pose prediction is used (non-ablation modes)
+        tokenizer.add_special_tokens({"additional_special_tokens": [POSE_TOKEN]})
+        pose_token_id = tokenizer.convert_tokens_to_ids(POSE_TOKEN)
+        rank0_print(f"<pose> token id = {pose_token_id}")
+    else:
+        pose_token_id = -1  # unused in ablation modes
+        rank0_print(f"Ablation '{args.ablation}': <pose> token not added")
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = build_model(

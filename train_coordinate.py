@@ -8,8 +8,8 @@ simultaneous supervision signals:
                         (one <pose> token per ordered image pair)
   2. LM answer        — causal cross-entropy on answer tokens
                         (question appended to prompt; answer supervised)
-  3. Coordinate       — L1 loss predicting per-patch mean 3D (x,y,z)
-                        (down-sampled <coord> tokens → MLP → bilinear upsample)
+  3. Coordinate       — L1 loss predicting sub-pixel 3D (x,y,z)
+                        (one <coord> token per LLM patch → Linear + PixelShuffle)
 
 Architecture:
   CoordinatePlusModel
@@ -17,7 +17,7 @@ Architecture:
     │    ├── SpaVisionModel (ViT, frozen)
     │    └── SpaModel (LLM + 4D M-RoPE)
     ├── PoseRegressionHead      [MLP: hidden_dim*n_skip → 9D per <pose> token]
-    └── CoordinateRegressionHead [MLP: hidden_dim → 3D + bilinear upsample]
+    └── CoordinateRegressionHead [Linear + PixelShuffle → sub-pixel 3D]
 
 Coordinate GT:
   For each image and each LLM patch token (after spatial merge), the GT is the
@@ -211,21 +211,19 @@ class PoseRegressionHead(nn.Module):
 
 
 class CoordinateRegressionHead(nn.Module):
-    """
-    Direct per-patch coordinate decoder: MLP applied to each <coord> token.
+    """Ultra-shallow upsampler: single Linear + PixelShuffle.
 
-    One <coord> token per LLM patch.  Each token's hidden state is decoded to
-    (x, y, z) by a small MLP; the output is reshaped to the patch grid.
-    No downsampling or upsampling.
+    Each <coord> token's hidden state is projected to 3 * upscale² channels,
+    then PixelShuffle rearranges into (upscale, upscale) sub-pixels per patch.
+    No activation, no conv, no deep MLP — capacity is deliberately minimal
+    so that spatial reasoning must happen in the backbone.
     """
 
-    def __init__(self, hidden_dim: int = 2560):
+    def __init__(self, hidden_dim: int = 2560, upscale_factor: int = 4):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.GELU(),
-            nn.Linear(256, 3),
-        )
+        self.upscale_factor = upscale_factor
+        self.linear_proj = nn.Linear(hidden_dim, 3 * (upscale_factor ** 2))
+        self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
 
     def forward(
         self,
@@ -236,12 +234,15 @@ class CoordinateRegressionHead(nn.Module):
         """
         Args:
             hidden: (h*w, hidden_dim) — <coord> token hidden states
-            h:      patch grid height
-            w:      patch grid width
+            h:      LLM patch grid height
+            w:      LLM patch grid width
         Returns:
-            (h, w, 3) — predicted xyz
+            (h*upscale, w*upscale, 3) — predicted xyz at sub-pixel resolution
         """
-        return self.mlp(hidden).view(h, w, 3)
+        x = self.linear_proj(hidden)                       # (h*w, 3*up²)
+        x = x.view(1, h, w, -1).permute(0, 3, 1, 2)       # (1, 3*up², h, w)
+        x = self.pixel_shuffle(x)                           # (1, 3, h*up, w*up)
+        return x[0].permute(1, 2, 0)                        # (h*up, w*up, 3)
 
 
 class CoordinatePlusModel(nn.Module):
@@ -311,7 +312,8 @@ class CoordinatePlusModel(nn.Module):
         pixel_values:   torch.Tensor | None,    # (total_patches, C, H, W)
         image_grid_thw: torch.Tensor | None,    # (num_images, 3)  [T, H, W]
         gt_transforms:  torch.Tensor | None = None,  # (K, 4, 4)
-        image_xyz:      list | None = None,     # list[i] = (llm_H_i, llm_W_i, 3)
+        image_xyz:      list | None = None,     # list[i] = (llm_H_i, llm_W_i, 3) for RoPE
+        image_xyz_hires: list | None = None,    # list[i] = (llm_H_i*up, llm_W_i*up, 3) for coord loss
         coord_scale:    float = 100.0,
         cycle_weight:   float = 0.0,
         labels:         torch.Tensor | None = None,
@@ -392,10 +394,12 @@ class CoordinatePlusModel(nn.Module):
                 ignore_index=-100,
             )
 
-        # ── per-patch 3D coordinate prediction ────────────────────────────────
-        # One <coord> token per LLM patch; MLP decodes each directly to (x,y,z).
+        # ── per-patch 3D coordinate prediction (PixelShuffle sub-pixel) ────────
+        # One <coord> token per LLM patch; Linear+PixelShuffle decodes each to
+        # (upscale, upscale) sub-pixels of (x,y,z).  GT is image_xyz_hires.
         coord_loss = None
-        if image_xyz is not None and image_grid_thw is not None:
+        coord_gt = image_xyz_hires if image_xyz_hires is not None else image_xyz
+        if coord_gt is not None and image_grid_thw is not None:
             coord_pos = (input_ids[0] == self.coord_token_id).nonzero(
                 as_tuple=True
             )[0]
@@ -404,7 +408,7 @@ class CoordinatePlusModel(nn.Module):
             start = 0
             per_img_losses: list[torch.Tensor] = []
 
-            for k in range(min(len(image_xyz), len(image_grid_thw))):
+            for k in range(min(len(coord_gt), len(image_grid_thw))):
                 thw_k = image_grid_thw[k]
                 llm_h = int(thw_k[1]) // sms
                 llm_w = int(thw_k[2]) // sms
@@ -414,9 +418,9 @@ class CoordinatePlusModel(nn.Module):
                     break
 
                 coord_h_k = hidden_coord[0, coord_pos[start : start + n_tok]]
-                pred_k = self.coord_head(coord_h_k, llm_h, llm_w)  # (llm_h, llm_w, 3)
+                pred_k = self.coord_head(coord_h_k, llm_h, llm_w)  # (llm_h*up, llm_w*up, 3)
 
-                gt_k = image_xyz[k].to(pred_k.device, dtype=pred_k.dtype)
+                gt_k = coord_gt[k].to(pred_k.device, dtype=pred_k.dtype)
                 per_img_losses.append(F.l1_loss(pred_k, gt_k))
 
                 start += n_tok
@@ -458,6 +462,7 @@ class SPARDataset(Dataset):
         max_images:          int = 4,
         pos3d_dir:           str | None = None,
         spatial_merge_size:  int = 2,
+        coord_upscale:       int = 4,
         max_samples:         int | None = None,
     ):
         import json
@@ -487,6 +492,7 @@ class SPARDataset(Dataset):
         self.max_images         = max_images
         self.pos3d_dir          = pos3d_dir
         self.spatial_merge_size = spatial_merge_size
+        self.coord_upscale      = coord_upscale
         log.info(f"SPARDataset: {len(self.samples)} valid entries "
                  f"(out of {len(entries)} total)")
 
@@ -617,13 +623,18 @@ class SPARDataset(Dataset):
         labels[0, :-len(suffix_ids)] = -100
 
         # ── 3D position maps ──────────────────────────────────────────────────
+        # image_xyz:       patch-level (llm_h, llm_w, 3) — used for 4D M-RoPE
+        # image_xyz_hires: sub-pixel   (llm_h*up, llm_w*up, 3) — used for coord loss
         image_xyz = None
+        image_xyz_hires = None
         if p3d_path is not None:
             try:
                 d3d     = np.load(p3d_path)
                 thw_all = proc_out["image_grid_thw"]   # (N, 3)
                 sms     = self.spatial_merge_size
+                up      = self.coord_upscale
                 xyz_list = []
+                xyz_hires_list = []
                 n_3d = int(d3d["n_frames"])
                 for k in range(min(N, n_3d)):
                     xyz_raw   = d3d[f"frame_{k}_xyz"]
@@ -632,20 +643,25 @@ class SPARDataset(Dataset):
                     llm_h     = int(thw_k[1]) // sms
                     llm_w     = int(thw_k[2]) // sms
                     xyz_list.append(resize_xyz(xyz_raw, llm_h, llm_w, valid=valid_raw))
+                    xyz_hires_list.append(resize_xyz(xyz_raw, llm_h * up, llm_w * up, valid=valid_raw))
                 for k in range(len(xyz_list), N):
                     thw_k = thw_all[k]
                     llm_h = int(thw_k[1]) // sms
                     llm_w = int(thw_k[2]) // sms
                     xyz_list.append(torch.zeros(llm_h, llm_w, 3))
+                    xyz_hires_list.append(torch.zeros(llm_h * up, llm_w * up, 3))
                 image_xyz = xyz_list
+                image_xyz_hires = xyz_hires_list
             except Exception as exc:
                 log.debug(f"3D_pos load failed for {p3d_path}: {exc}")
                 image_xyz = None
+                image_xyz_hires = None
 
         return {
             **proc_out,
             "gt_transforms": gt_transforms,
             "image_xyz":     image_xyz,
+            "image_xyz_hires": image_xyz_hires,
             "labels":        labels,
         }
 
@@ -663,6 +679,7 @@ def build_model(
     coord_token_id:     int,
     image_token_id:     int,
     spatial_merge_size: int,
+    coord_upscale:      int = 4,
     lora_rank:          int = 16,
     freeze_vision:      bool = True,
     skip_layers:        tuple[int, ...] = (-1,),
@@ -732,9 +749,11 @@ def build_model(
     log.info(f"PoseRegressionHead input_dim={pose_input_dim} "
              f"(skip_layers={list(skip_layers)}, hidden={hidden_dim})")
 
-    # Coordinate regression head: dense MLP decoder
-    coord_head = CoordinateRegressionHead(hidden_dim=hidden_dim).to(torch.bfloat16)
-    log.info(f"CoordinateRegressionHead hidden_dim={hidden_dim}")
+    # Coordinate regression head: Linear + PixelShuffle (ultra-shallow)
+    coord_head = CoordinateRegressionHead(
+        hidden_dim=hidden_dim, upscale_factor=coord_upscale,
+    ).to(torch.bfloat16)
+    log.info(f"CoordinateRegressionHead hidden_dim={hidden_dim} upscale={coord_upscale}")
 
     return CoordinatePlusModel(
         spa_model          = spa,
@@ -800,6 +819,7 @@ def train(args: argparse.Namespace) -> None:
         coord_token_id     = coord_token_id,
         image_token_id     = image_token_id,
         spatial_merge_size = spatial_merge_size,
+        coord_upscale      = args.coord_upscale,
         lora_rank          = args.lora_rank,
         freeze_vision      = not args.train_vision,
         skip_layers        = tuple(args.skip_layers),
@@ -833,6 +853,7 @@ def train(args: argparse.Namespace) -> None:
         max_images         = args.max_images,
         pos3d_dir          = args.pos3d_dir,
         spatial_merge_size = spatial_merge_size,
+        coord_upscale      = args.coord_upscale,
         max_samples        = args.max_samples,
     )
     sampler = (
@@ -902,6 +923,10 @@ def train(args: argparse.Namespace) -> None:
             if image_xyz is not None:
                 image_xyz = [xyz.to(device) for xyz in image_xyz]
 
+            image_xyz_hires = batch.get("image_xyz_hires")
+            if image_xyz_hires is not None:
+                image_xyz_hires = [xyz.to(device) for xyz in image_xyz_hires]
+
             labels = batch.get("labels")
             if labels is not None:
                 labels = labels.to(device)
@@ -921,14 +946,15 @@ def train(args: argparse.Namespace) -> None:
 
             try:
                 _, loss, loss_dict = model(
-                    input_ids      = input_ids,
-                    attention_mask = attention_mask,
-                    pixel_values   = pixel_values,
-                    image_grid_thw = image_grid_thw,
-                    gt_transforms  = gt_transforms,
-                    image_xyz      = image_xyz,
-                    cycle_weight   = args.cycle_weight,
-                    labels         = labels,
+                    input_ids       = input_ids,
+                    attention_mask  = attention_mask,
+                    pixel_values    = pixel_values,
+                    image_grid_thw  = image_grid_thw,
+                    gt_transforms   = gt_transforms,
+                    image_xyz       = image_xyz,
+                    image_xyz_hires = image_xyz_hires,
+                    cycle_weight    = args.cycle_weight,
+                    labels          = labels,
                 )
             except Exception as exc:
                 log.warning(f"[rank{local_rank}] Step {step} skipped: {exc}")
@@ -1080,6 +1106,12 @@ def parse_args() -> argparse.Namespace:
         "--coord_weight",
         type=float, default=1.0,
         help="Weight for the per-patch coordinate prediction loss.",
+    )
+    p.add_argument(
+        "--coord_upscale",
+        type=int, default=4,
+        help="PixelShuffle upscale factor for coord head. "
+             "Each <coord> token predicts upscale² sub-pixel (x,y,z) values.",
     )
     # ── WandB ─────────────────────────────────────────────────────────────────
     p.add_argument("--wandb_project",  default="", help="WandB project name.")
