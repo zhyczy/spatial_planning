@@ -167,30 +167,70 @@ def geodesic_loss(
     return torch.acos(cos).mean()
 
 
-def cycle_consistency_loss(R_preds: torch.Tensor, N: int) -> torch.Tensor:
+def cycle_consistency_loss(
+    R_preds: torch.Tensor,
+    t_preds: torch.Tensor,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Pair round-trips (N ≥ 2): R_{i→j} @ R_{j→i} = I
-    Triangle cycles  (N ≥ 3): R_{a→b} @ R_{b→c} @ R_{c→a} = I
-    Returns mean Frobenius error (scalar).
+    Rotation + translation cycle-consistency loss.
+
+    Rotation (Frobenius norm):
+      Pair round-trip (i < j):   ||R_{i→j} @ R_{j→i} - I||_F
+      Triangle {a, b, c}:        ||R_{a→b} @ R_{b→c} @ R_{c→a} - I||_F
+
+    Translation (L1 norm, more robust to outliers):
+      Pair round-trip (i < j):   ||R_{i→j} @ t_{j→i} + t_{i→j}||_1
+      Triangle {a, b, c}:        ||R_{a→b} @ R_{b→c} @ t_{c→a}
+                                    + R_{a→b} @ t_{b→c} + t_{a→b}||_1
+
+    Args:
+      R_preds: (K, 3, 3)  where K = N*(N-1), ordered by
+               [(i,j) for i in range(N) for j in range(N) if i != j]
+      t_preds: (K, 3)     same ordering as R_preds
+      N:       number of views
+
+    Returns:
+      (cycle_r, cycle_t) — two scalars, mean over all terms.
+      Returns (0, 0) when N < 2.
     """
+    zero = R_preds.new_tensor(0.0)
     if N < 2:
-        return R_preds.new_tensor(0.0)
+        return zero, zero
 
     pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
     p2k   = {p: k for k, p in enumerate(pairs)}
     I3    = torch.eye(3, device=R_preds.device, dtype=R_preds.dtype)
-    errs  = []
 
+    r_errs = []
+    t_errs = []
+
+    # Pair round-trips for all i < j
     for i in range(N):
         for j in range(i + 1, N):
-            cycle = R_preds[p2k[(i, j)]] @ R_preds[p2k[(j, i)]]
-            errs.append(torch.norm(cycle - I3, p="fro"))
+            kij, kji = p2k[(i, j)], p2k[(j, i)]
+            # Rotation: R_{i→j} @ R_{j→i} = I
+            R_cycle = R_preds[kij] @ R_preds[kji]
+            r_errs.append(torch.norm(R_cycle - I3, p="fro"))
+            # Translation: R_{i→j} @ t_{j→i} + t_{i→j} = 0
+            t_cycle = R_preds[kij] @ t_preds[kji] + t_preds[kij]
+            t_errs.append(t_cycle.abs().sum())          # L1 norm
 
+    # Triangle cycles for all triples {a, b, c}
     for a, b, c in combinations(range(N), 3):
-        cycle = R_preds[p2k[(a, b)]] @ R_preds[p2k[(b, c)]] @ R_preds[p2k[(c, a)]]
-        errs.append(torch.norm(cycle - I3, p="fro"))
+        kab, kbc, kca = p2k[(a, b)], p2k[(b, c)], p2k[(c, a)]
+        # Rotation: R_{a→b} @ R_{b→c} @ R_{c→a} = I
+        R_cycle = R_preds[kab] @ R_preds[kbc] @ R_preds[kca]
+        r_errs.append(torch.norm(R_cycle - I3, p="fro"))
+        # Translation: R_{a→b} @ R_{b→c} @ t_{c→a} + R_{a→b} @ t_{b→c} + t_{a→b} = 0
+        t_cycle = (R_preds[kab] @ R_preds[kbc] @ t_preds[kca]
+                   + R_preds[kab] @ t_preds[kbc]
+                   + t_preds[kab])
+        t_errs.append(t_cycle.abs().sum())              # L1 norm
 
-    return torch.stack(errs).mean()
+    cycle_r = torch.stack(r_errs).mean()
+    cycle_t = torch.stack(t_errs).mean()
+    return cycle_r, cycle_t
 
 
 # ── model components ──────────────────────────────────────────────────────────
@@ -372,27 +412,31 @@ class CoordinatePlusModel(nn.Module):
             R_pred = rot6d_to_rotmat(preds_9d[:, :6])
             t_pred = preds_9d[:, 6:]
             rot_loss   = geodesic_loss(R_pred, R_gt)
-            trans_loss = F.l1_loss(t_pred, t_gt)
+            trans_loss = F.smooth_l1_loss(t_pred, t_gt, beta=0.5)
             pose_loss  = rot_loss + trans_loss
             _ldict = {"rot_loss": rot_loss.item(), "trans_loss": trans_loss.item()}
             if cycle_weight > 0.0:
                 N = round((1 + math.sqrt(1 + 4 * K)) / 2)
                 if N * (N - 1) == K:
-                    c_loss    = cycle_weight * cycle_consistency_loss(R_pred, N)
+                    c_r, c_t  = cycle_consistency_loss(R_pred, t_pred, N)
+                    c_loss    = cycle_weight * (c_r + c_t)
                     pose_loss = pose_loss + c_loss
-                    _ldict["cycle_loss"] = c_loss.item()
+                    _ldict["cycle_loss"]   = c_loss.item()
+                    _ldict["cycle_r_loss"] = c_r.item()
+                    _ldict["cycle_t_loss"] = c_t.item()
             _ldict["pose_loss"] = pose_loss.item()
 
         # ── LM answer-prediction loss ─────────────────────────────────────────
         lm_loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()    # logits extracted above
-            shift_labels = labels[..., 1:].contiguous().to(logits.device)
-            lm_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            shift_logits = logits[:, :-1, :]                   # (1, seq_len-1, V)
+            shift_labels = labels[:, 1:].to(logits.device)     # (1, seq_len-1)
+
+            # 只取有效 label 位置的 logits，避免整个 (seq_len, V) 留在显存里
+            mask = shift_labels[0] != -100                     # (seq_len-1,)
+            shift_logits = shift_logits[0, mask]               # (N_valid, V)
+            shift_labels = shift_labels[0, mask]               # (N_valid,)
+            lm_loss = F.cross_entropy(shift_logits, shift_labels)
 
         # ── per-patch 3D coordinate prediction (PixelShuffle sub-pixel) ────────
         # One <coord> token per LLM patch; Linear+PixelShuffle decodes each to

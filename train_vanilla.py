@@ -1,39 +1,11 @@
-"""
-train_correspondence.py
-
-LoRA fine-tuning of SpaForConditionalGeneration (Qwen3.5-VL) to predict
-relative camera transformations between image pairs in a scene.
-
-Architecture:
-  SpaCorrespondenceModel
-    ├── SpaForConditionalGeneration  [backbone + LoRA adapters]
-    │    ├── SpaVisionModel (ViT, frozen)
-    │    └── SpaModel (LLM + 4D M-RoPE)
-    └── PoseRegressionHead           [MLP: hidden_dim → 9D]
-
-Training strategy:
-  - Each SPAR entry = one scene with N images
-  - Prompt inserts one <pose> token per ordered pair (i→j), i≠j  → A(N,2) tokens
-    e.g. N=2: 2 tokens (0→1, 1→0); N=3: 6 tokens (all permutations)
-  - Hidden state at each <pose> token → PoseRegressionHead → (6D rot, 3D trans)
-  - Loss = geodesic rotation loss + L1 translation loss
-
-Coordinate convention:
-  - Predicts T_{i→j} = relative_transforms[i, j] from the .npz GT files
-  - T = [R | t; 0 | 1],  parameterised as 6D-rotation + 3D-translation
-
-Usage:
-  python train_correspondence.py \\
-      --model_path checkpoints/Qwen3.5-4B \\
-      --output_dir checkpoints/spa_correspondence
-"""
-
 import argparse
+import json
 import logging
 import math
 import os
 import sys
 from itertools import combinations
+
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -50,6 +22,7 @@ except ImportError:
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -65,6 +38,17 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGe
 # Re-use dataset detection logic from the data processing pipeline
 sys.path.insert(0, os.path.join(_ROOT, "src", "data_process"))
 from reconstruct_3d import detect_dataset, _scene_id_from_path  # noqa: E402
+
+# Re-use evaluation utilities
+from evaluation import (
+    load_dataset as load_eval_dataset,
+    prepare_batch_spa,
+    run_inference_spa,
+    extract_answer_letter,
+    extract_answer_number,
+    compute_metrics,
+    log_metrics,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,415 +74,6 @@ SPAR_ROOT = os.path.join(
 )
 RECONSTRUCT_DIR = os.path.join(SPAR_ROOT, "reconstruct")
 POS3D_DIR       = os.path.join(SPAR_ROOT, "3D_pos")
-POSE_TOKEN = "<pose>"
-
-
-# ── 3D coordinate helper ──────────────────────────────────────────────────────
-
-def resize_xyz(
-    xyz:      np.ndarray,
-    target_h: int,
-    target_w: int,
-    valid:    np.ndarray | None = None,
-) -> torch.Tensor:
-    """
-    Compute the mean 3D position of all valid pixels within each LLM patch.
-
-    Args:
-        xyz:      (H, W, 3) float  — per-pixel XYZ map (any float dtype)
-        target_h: output patch rows (= image_grid_thw[1] // spatial_merge_size)
-        target_w: output patch cols (= image_grid_thw[2] // spatial_merge_size)
-        valid:    (H, W) bool mask — True where XYZ is reliable;
-                  if None all pixels are treated as valid
-
-    Returns:
-        (target_h, target_w, 3) float32 tensor; patches with no valid pixels
-        are set to zero.
-    """
-    H, W = xyz.shape[:2]
-    xyz_f = xyz.astype(np.float32)                     # (H, W, 3)
-
-    if valid is None:
-        valid = np.ones((H, W), dtype=bool)
-
-    # Stride per LLM patch (integer division; crop any remainder)
-    stride_h = H // target_h
-    stride_w = W // target_w
-    H_crop   = target_h * stride_h
-    W_crop   = target_w * stride_w
-    xyz_f    = xyz_f[:H_crop, :W_crop]                 # (H_crop, W_crop, 3)
-    valid    = valid[:H_crop, :W_crop].astype(np.float32)  # (H_crop, W_crop)
-
-    # Reshape into patch blocks
-    # (target_h, stride_h, target_w, stride_w, 3)
-    xyz_blocks   = xyz_f.reshape(target_h, stride_h, target_w, stride_w, 3)
-    valid_blocks = valid.reshape(target_h, stride_h, target_w, stride_w)
-
-    # Masked sum → mean over the stride_h × stride_w pixel block per patch
-    xyz_sum   = (xyz_blocks * valid_blocks[..., None]).sum(axis=(1, 3))  # (th, tw, 3)
-    valid_cnt = valid_blocks.sum(axis=(1, 3))                            # (th, tw)
-
-    denom    = np.maximum(valid_cnt, 1)[..., None]     # avoid ÷0
-    xyz_mean = xyz_sum / denom                         # (target_h, target_w, 3)
-    xyz_mean[valid_cnt == 0] = 0.0                     # patches with no valid px
-
-    return torch.from_numpy(xyz_mean)                  # (target_h, target_w, 3)
-
-
-# ── rotation utilities ────────────────────────────────────────────────────────
-
-def rot6d_to_rotmat(r6d: torch.Tensor) -> torch.Tensor:
-    """
-    6D continuous rotation → 3×3 rotation matrix via Gram-Schmidt.
-    (..., 6)  →  (..., 3, 3)
-
-    The first two columns of R are encoded in r6d[..., :3] and r6d[..., 3:6].
-    Reference: Zhou et al., "On the Continuity of Rotation Representations in
-    Neural Networks", CVPR 2019.
-    """
-    # Cast to float32: bfloat16 lacks precision for Gram-Schmidt (eps=1e-6 ≈ 0
-    # in bf16, causing 0/0 NaN when a1 ∥ a2 at random initialisation).
-    orig_dtype = r6d.dtype
-    r6d = r6d.float()
-    a1, a2 = r6d[..., :3], r6d[..., 3:6]
-    b1 = F.normalize(a1, dim=-1, eps=1e-6)
-    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1, eps=1e-6)
-    b3 = torch.cross(b1, b2, dim=-1)
-    # Stack as columns: R = [b1 | b2 | b3], restore original dtype
-    return torch.stack([b1, b2, b3], dim=-1).to(orig_dtype)   # (..., 3, 3)
-
-
-def geodesic_loss(
-    R_pred: torch.Tensor,
-    R_gt: torch.Tensor,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """
-    Mean rotation-angle loss between predicted and GT rotation matrices.
-    R_pred, R_gt: (N, 3, 3)
-    """
-    # Compute in float32: acos gradient blows up near ±1 in bfloat16
-    R_pred = R_pred.float()
-    R_gt   = R_gt.float()
-    R_diff = torch.bmm(R_pred, R_gt.transpose(-1, -2))         # (N, 3, 3)
-    trace  = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)         # (N,)
-    cos    = ((trace - 1.0) / 2.0).clamp(-1.0 + eps, 1.0 - eps)
-    return torch.acos(cos).mean()
-
-
-def cycle_consistency_loss(
-    R_preds: torch.Tensor,
-    t_preds: torch.Tensor,
-    N: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Rotation + translation cycle-consistency loss.
-
-    Rotation (Frobenius norm):
-      Pair round-trip (i < j):   ||R_{i→j} @ R_{j→i} - I||_F
-      Triangle {a, b, c}:        ||R_{a→b} @ R_{b→c} @ R_{c→a} - I||_F
-
-    Translation (L1 norm, more robust to outliers):
-      Pair round-trip (i < j):   ||R_{i→j} @ t_{j→i} + t_{i→j}||_1
-      Triangle {a, b, c}:        ||R_{a→b} @ R_{b→c} @ t_{c→a}
-                                    + R_{a→b} @ t_{b→c} + t_{a→b}||_1
-
-    Args:
-      R_preds: (K, 3, 3)  where K = N*(N-1), ordered by
-               [(i,j) for i in range(N) for j in range(N) if i != j]
-      t_preds: (K, 3)     same ordering as R_preds
-      N:       number of views
-
-    Returns:
-      (cycle_r, cycle_t) — two scalars, mean over all terms.
-      Returns (0, 0) when N < 2.
-    """
-    zero = R_preds.new_tensor(0.0)
-    if N < 2:
-        return zero, zero
-
-    pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-    p2k   = {p: k for k, p in enumerate(pairs)}
-    I3    = torch.eye(3, device=R_preds.device, dtype=R_preds.dtype)
-
-    r_errs = []
-    t_errs = []
-
-    # Pair round-trips for all i < j
-    for i in range(N):
-        for j in range(i + 1, N):
-            kij, kji = p2k[(i, j)], p2k[(j, i)]
-            # Rotation: R_{i→j} @ R_{j→i} = I
-            R_cycle = R_preds[kij] @ R_preds[kji]
-            r_errs.append(torch.norm(R_cycle - I3, p="fro"))
-            # Translation: R_{i→j} @ t_{j→i} + t_{i→j} = 0
-            t_cycle = R_preds[kij] @ t_preds[kji] + t_preds[kij]
-            t_errs.append(t_cycle.abs().sum())          # L1 norm
-
-    # Triangle cycles for all triples {a, b, c}
-    for a, b, c in combinations(range(N), 3):
-        kab, kbc, kca = p2k[(a, b)], p2k[(b, c)], p2k[(c, a)]
-        # Rotation: R_{a→b} @ R_{b→c} @ R_{c→a} = I
-        R_cycle = R_preds[kab] @ R_preds[kbc] @ R_preds[kca]
-        r_errs.append(torch.norm(R_cycle - I3, p="fro"))
-        # Translation: R_{a→b} @ R_{b→c} @ t_{c→a} + R_{a→b} @ t_{b→c} + t_{a→b} = 0
-        t_cycle = (R_preds[kab] @ R_preds[kbc] @ t_preds[kca]
-                   + R_preds[kab] @ t_preds[kbc]
-                   + t_preds[kab])
-        t_errs.append(t_cycle.abs().sum())              # L1 norm
-
-    cycle_r = torch.stack(r_errs).mean()
-    cycle_t = torch.stack(t_errs).mean()
-    return cycle_r, cycle_t
-
-
-# ── model components ──────────────────────────────────────────────────────────
-
-class PoseRegressionHead(nn.Module):
-    """
-    MLP regression head: input_dim → 9D pose vector.
-    Output layout: first 6 dims = 6D rotation, last 3 dims = translation.
-
-    input_dim = hidden_size * len(skip_layers), e.g.:
-      skip_layers=[-1]     → input_dim = 2560  (last layer only)
-      skip_layers=[-4,-1]  → input_dim = 5120  (concat of two layers)
-    """
-
-    def __init__(self, input_dim: int = 2560):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.GELU(),
-            nn.Linear(1024, 9),
-        )
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        """latent: (input_dim,) or (N, input_dim) → (9,) or (N, 9)"""
-        return self.mlp(latent)
-
-
-class SpaCorrespondenceModel(nn.Module):
-    """
-    SpaForConditionalGeneration (+ LoRA) wrapped with a PoseRegressionHead.
-
-    Forward:
-      1. Runs the backbone with output_hidden_states=True.
-      2. Finds all <pose> token positions in input_ids.
-      3. Concatenates hidden states from skip_layers at each <pose> position
-         (skip connection from intermediate layers preserves geometric detail).
-      4. Passes each latent through PoseRegressionHead → 9D prediction.
-      5. Optionally computes geodesic + translation + cycle-consistency loss.
-
-    skip_layers: list of layer indices into outputs.hidden_states, e.g.
-      [-1]      → last layer only  (input_dim = hidden_size)
-      [-4, -1]  → concat 4th-from-last + last  (input_dim = 2 * hidden_size)
-
-    Returns:
-      preds_9d : (K, 9) tensor  —  K = number of <pose> tokens found
-      loss     : scalar or None
-    """
-
-    def __init__(
-        self,
-        spa_model:      nn.Module,
-        pose_head:      PoseRegressionHead,
-        pose_token_id:  int,
-        skip_layers:    tuple[int, ...] = (-1,),
-    ):
-        super().__init__()
-        self.spa_model     = spa_model
-        self.pose_head     = pose_head
-        self.pose_token_id = pose_token_id
-        self.skip_layers   = list(skip_layers)
-
-    def forward(
-        self,
-        input_ids:      torch.Tensor,                    # (1, seq_len)
-        attention_mask: torch.Tensor,                    # (1, seq_len)
-        pixel_values:   torch.Tensor | None,             # (total_patches, C, H, W)
-        image_grid_thw: torch.Tensor | None,             # (num_images, 3)
-        gt_transforms:  torch.Tensor | None = None,      # (K, 4, 4)
-        image_xyz:      list | None = None,              # list of (llm_H, llm_W, 3)
-        coord_scale:    float = 100.0,
-        cycle_weight:   float = 0.0,
-        **kwargs,
-    ):
-        outputs = self.spa_model(
-            input_ids            = input_ids,
-            attention_mask       = attention_mask,
-            pixel_values         = pixel_values,
-            image_grid_thw       = image_grid_thw,
-            output_hidden_states = True,
-            return_dict          = True,
-            image_xyz            = image_xyz,
-            coord_scale          = coord_scale,
-            **kwargs,
-        )
-
-        # Skip connection: concatenate hidden states from selected layers
-        # outputs.hidden_states: tuple[num_layers+1] of (1, seq_len, hidden_dim)
-        if len(self.skip_layers) == 1:
-            hidden = outputs.hidden_states[self.skip_layers[0]]    # (1, seq, H)
-        else:
-            hidden = torch.cat(
-                [outputs.hidden_states[i] for i in self.skip_layers], dim=-1
-            )                                                        # (1, seq, H*n)
-
-        # Locate <pose> tokens (batch item 0)
-        pose_positions = (input_ids[0] == self.pose_token_id).nonzero(
-            as_tuple=True
-        )[0]
-        if len(pose_positions) == 0:
-            return None, None, None
-
-        # Predict pose at each <pose> token
-        latents  = hidden[0, pose_positions]       # (K, input_dim)
-        preds_9d = self.pose_head(latents)          # (K, 9)
-
-        if gt_transforms is None:
-            return preds_9d, None, None
-
-        K  = preds_9d.shape[0]
-        gt = gt_transforms[:K].to(preds_9d.device, dtype=preds_9d.dtype)  # (K, 4, 4)
-
-        R_gt   = gt[:, :3, :3]                       # (K, 3, 3)
-        t_gt   = gt[:, :3,  3]                       # (K, 3)
-        R_pred = rot6d_to_rotmat(preds_9d[:, :6])    # (K, 3, 3)
-        t_pred = preds_9d[:, 6:]                     # (K, 3)
-
-        rot_loss   = geodesic_loss(R_pred, R_gt)
-        trans_loss = F.smooth_l1_loss(t_pred, t_gt, beta=0.5)
-        loss = rot_loss + trans_loss
-
-        _ldict: dict = {"rot_loss": rot_loss.item(), "trans_loss": trans_loss.item()}
-
-        # Cycle consistency (rotation + translation)
-        if cycle_weight > 0.0:
-            N = round((1 + math.sqrt(1 + 4 * K)) / 2)
-            if N * (N - 1) == K:                     # valid A(N,2) count
-                c_r, c_t = cycle_consistency_loss(R_pred, t_pred, N)
-                c_loss = cycle_weight * (c_r + c_t)
-                loss   = loss + c_loss
-                _ldict["cycle_loss"]   = c_loss.item()
-                _ldict["cycle_r_loss"] = c_r.item()
-                _ldict["cycle_t_loss"] = c_t.item()
-
-        _ldict["pose_loss"] = loss.item()
-        return preds_9d, loss, _ldict
-
-
-class CorrespondencePlusModel(SpaCorrespondenceModel):
-    """
-    SpaCorrespondenceModel + auxiliary LM answer-prediction loss.
-
-    When ``labels`` (1, seq_len) are provided the model additionally
-    computes causal cross-entropy on the answer tokens and adds it
-    (scaled by ``answer_weight``) to the pose regression loss.
-    """
-
-    def __init__(
-        self,
-        spa_model:      nn.Module,
-        pose_head:      PoseRegressionHead,
-        pose_token_id:  int,
-        skip_layers:    tuple[int, ...] = (-1,),
-        answer_weight:  float = 1.0,
-    ):
-        super().__init__(spa_model, pose_head, pose_token_id, skip_layers)
-        self.answer_weight = answer_weight
-
-    def forward(
-        self,
-        input_ids:      torch.Tensor,
-        attention_mask: torch.Tensor,
-        pixel_values:   torch.Tensor | None,
-        image_grid_thw: torch.Tensor | None,
-        gt_transforms:  torch.Tensor | None = None,
-        image_xyz:      list | None = None,
-        coord_scale:    float = 100.0,
-        cycle_weight:   float = 0.0,
-        labels:         torch.Tensor | None = None,
-        **kwargs,
-    ):
-        outputs = self.spa_model(
-            input_ids            = input_ids,
-            attention_mask       = attention_mask,
-            pixel_values         = pixel_values,
-            image_grid_thw       = image_grid_thw,
-            output_hidden_states = True,
-            return_dict          = True,
-            image_xyz            = image_xyz,
-            coord_scale          = coord_scale,
-            **kwargs,
-        )
-
-        # ── pose prediction ───────────────────────────────────────────────────
-        if len(self.skip_layers) == 1:
-            hidden = outputs.hidden_states[self.skip_layers[0]]
-        else:
-            hidden = torch.cat(
-                [outputs.hidden_states[i] for i in self.skip_layers], dim=-1
-            )
-
-        pose_positions = (input_ids[0] == self.pose_token_id).nonzero(
-            as_tuple=True
-        )[0]
-        if len(pose_positions) == 0:
-            return None, None, None
-
-        latents  = hidden[0, pose_positions]
-        preds_9d = self.pose_head(latents)
-
-        pose_loss = None
-        _ldict: dict = {}
-        if gt_transforms is not None:
-            K  = preds_9d.shape[0]
-            gt = gt_transforms[:K].to(preds_9d.device, dtype=preds_9d.dtype)
-            R_gt   = gt[:, :3, :3]
-            t_gt   = gt[:, :3,  3]
-            R_pred = rot6d_to_rotmat(preds_9d[:, :6])
-            t_pred = preds_9d[:, 6:]
-            rot_loss   = geodesic_loss(R_pred, R_gt)
-            trans_loss = F.smooth_l1_loss(t_pred, t_gt, beta=0.5)
-            pose_loss  = rot_loss + trans_loss
-            _ldict = {"rot_loss": rot_loss.item(), "trans_loss": trans_loss.item()}
-            if cycle_weight > 0.0:
-                N = round((1 + math.sqrt(1 + 4 * K)) / 2)
-                if N * (N - 1) == K:
-                    c_r, c_t  = cycle_consistency_loss(R_pred, t_pred, N)
-                    c_loss    = cycle_weight * (c_r + c_t)
-                    pose_loss = pose_loss + c_loss
-                    _ldict["cycle_loss"]   = c_loss.item()
-                    _ldict["cycle_r_loss"] = c_r.item()
-                    _ldict["cycle_t_loss"] = c_t.item()
-            _ldict["pose_loss"] = pose_loss.item()
-
-        # ── LM answer-prediction loss ─────────────────────────────────────────
-        lm_loss = None
-        if labels is not None:
-            logits = outputs.logits                          # (1, seq_len, vocab_size)
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous().to(logits.device)
-            lm_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-
-        # ── combine ───────────────────────────────────────────────────────────
-        # _ldict already holds rot_loss / trans_loss / cycle_loss / pose_loss
-        if pose_loss is not None and lm_loss is not None:
-            loss = pose_loss + self.answer_weight * lm_loss
-            _ldict["lm_loss"] = lm_loss.item()
-        elif pose_loss is not None:
-            loss = pose_loss
-        elif lm_loss is not None:
-            loss = self.answer_weight * lm_loss
-            _ldict["lm_loss"] = lm_loss.item()
-        else:
-            loss = None
-
-        return preds_9d, loss, (_ldict if _ldict else None)
 
 
 class AnswerOnlyModel(nn.Module):
@@ -681,14 +256,6 @@ class SPARDataset(Dataset):
             content.append({"type": "image", "image": img})
 
         pose_sentences = []
-        if not self.no_pose:
-            pose_sentences = [
-                f"The camera pose of image {j + 1} relative to image {i + 1} is "
-                f"{POSE_TOKEN}."
-                for (i, j) in pairs
-            ]
-            content.append({"type": "text", "text": " ".join(pose_sentences)})
-
         # ── build prompt (plus / no_pose modes append QA for LM loss) ────────
         # Extract question/answer from conversations list (ShareGPT format)
         # or from flat "question"/"answer" fields.
@@ -814,49 +381,25 @@ def build_model(
 ) -> nn.Module:
     """
     Load backbone, patch M-RoPE, apply LoRA, and attach task head.
-
-    ablation=None   → SpaCorrespondenceModel (or Plus variant)
-    ablation="no_cam"  → AnswerOnlyModel with 4D M-RoPE (keeps image_xyz)
     ablation="vanilla" → AnswerOnlyModel with original 3D M-RoPE (no image_xyz)
     """
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
 
-    if ablation == "vanilla":
-        # ── vanilla: keep original 3D M-RoPE, use stock Qwen model ───────────
-        log.info(f"mrope_section: {orig_section} (original 3D M-RoPE, vanilla ablation)")
-        spa = Qwen3_5ForConditionalGeneration.from_pretrained(
-            model_path,
-            config             = config,
-            torch_dtype        = torch.bfloat16,
-            attn_implementation= "sdpa",
-        )
-    else:
-        # ── 4D M-RoPE for normal / plus / no_cam ─────────────────────────────
-        section_size = sum(orig_section) // 4          # e.g. 32 // 4 = 8
-        config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
-        log.info(
-            f"mrope_section: {orig_section} → {[section_size]*4}  "
-            f"(4D M-RoPE for spatial tokens)"
-        )
-        spa = SpaForConditionalGeneration.from_pretrained(
-            model_path,
-            config             = config,
-            torch_dtype        = torch.bfloat16,
-            attn_implementation= "sdpa",
-        )
+    # ── vanilla: keep original 3D M-RoPE, use stock Qwen model ───────────
+    log.info(f"mrope_section: {orig_section} (original 3D M-RoPE, vanilla ablation)")
+    spa = Qwen3_5ForConditionalGeneration.from_pretrained(
+        model_path,
+        config             = config,
+        torch_dtype        = torch.bfloat16,
+        attn_implementation= "sdpa",
+    )
+    
 
-    # ── resize embedding table for <pose> (only when pose tokens are used) ───
-    if ablation is None:
-        old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
-        spa.resize_token_embeddings(old_vocab + 1)
-        log.info(f"Embedding table: {old_vocab} → {old_vocab + 1} (added <pose>)")
-
-    # ── optionally freeze vision encoder ─────────────────────────────────────
-    if freeze_vision:
-        for p in spa.model.visual.parameters():
-            p.requires_grad_(False)
-        log.info("Vision encoder frozen.")
+    # ── Freeze vision encoder ─────────────────────────────────────
+    for p in spa.model.visual.parameters():
+        p.requires_grad_(False)
+    log.info("Vision encoder frozen.")
 
     # ── apply LoRA to the language model ──────────────────────────────────────
     lora_cfg = LoraConfig(
@@ -886,24 +429,119 @@ def build_model(
         log.info("Manually set gradient_checkpointing=True on language_model")
 
     # ── ablation: answer-only model (no pose head) ───────────────────────────
-    if ablation is not None:
-        use_xyz = (ablation != "vanilla")
-        log.info(f"Ablation '{ablation}': AnswerOnlyModel (use_xyz={use_xyz})")
-        return AnswerOnlyModel(spa, use_xyz=use_xyz)
+    use_xyz = (ablation != "vanilla")
+    log.info(f"Ablation '{ablation}': AnswerOnlyModel (use_xyz={use_xyz})")
+    return AnswerOnlyModel(spa, use_xyz=use_xyz)
 
-    # ── pose regression head ──────────────────────────────────────────────────
-    hidden_dim = config.text_config.hidden_size
-    input_dim  = hidden_dim * len(skip_layers)   # concat of skip_layers features
-    pose_head  = PoseRegressionHead(input_dim=input_dim).to(torch.bfloat16)
-    log.info(f"PoseRegressionHead input_dim={input_dim} "
-             f"(skip_layers={list(skip_layers)}, hidden={hidden_dim})")
 
-    if plus:
-        return CorrespondencePlusModel(spa, pose_head, pose_token_id,
-                                       skip_layers=skip_layers,
-                                       answer_weight=answer_weight)
-    return SpaCorrespondenceModel(spa, pose_head, pose_token_id,
-                                  skip_layers=skip_layers)
+
+# ── periodic evaluation ───────────────────────────────────────────────────────
+
+@torch.no_grad()
+def evaluate_benchmarks(
+    model: nn.Module,
+    processor,
+    device: torch.device,
+    eval_datasets: dict[str, str],
+    spatial_merge_size: int = 2,
+    max_new_tokens: int = 512,
+    local_rank: int = 0,
+    world_size: int = 1,
+    eval_limit: int | None = None,
+) -> dict[str, dict]:
+    """
+    Run evaluation on the given benchmark datasets, distributed across all ranks.
+    Each rank processes every world_size-th sample; rank 0 gathers and logs results.
+    Returns the full metrics dict on rank 0, empty dict on other ranks.
+    """
+    from pathlib import Path
+
+    # Disable blocking kernel launches during eval (CUDA_LAUNCH_BLOCKING is
+    # checked per-launch, so toggling os.environ takes effect immediately)
+    _prev_blocking = os.environ.get("CUDA_LAUNCH_BLOCKING", "0")
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+
+    _model = model.module if hasattr(model, "module") else model
+    _model.eval()
+    # Access the underlying spa_model for generation
+    spa = _model.spa_model
+    # gradient_checkpointing_enable() sets use_cache=False; re-enable for eval
+    # so generation uses KV cache (otherwise each decode step is O(n²))
+    spa.config.use_cache = True
+
+    all_metrics: dict[str, dict] = {}
+
+    for ds_name, ds_dir in eval_datasets.items():
+        ds_path = Path(ds_dir)
+        try:
+            samples = load_eval_dataset(ds_path, dataset=ds_name, limit=eval_limit)
+        except Exception as exc:
+            log.warning(f"[eval] Failed to load {ds_name} from {ds_dir}: {exc}")
+            continue
+
+        # Shard samples across ranks: rank r processes indices r, r+world_size, ...
+        shard = samples[local_rank::world_size]
+        if local_rank == 0:
+            log.info(f"[eval] Running {ds_name}: {len(samples)} samples "
+                     f"({len(shard)} per rank × {world_size} ranks)")
+
+        results = []
+        for i, item in enumerate(tqdm(shard, desc=f"[eval] {ds_name} rank{local_rank}",
+                                      leave=False, disable=(local_rank != 0))):
+            try:
+                inputs, prompt_text, image_xyz = prepare_batch_spa(
+                    item, processor,
+                    spatial_merge_size=spatial_merge_size,
+                    use_coord=False,   # vanilla: no 3D coords
+                    coord_scale=100.0,
+                    thinking=False,
+                )
+                output = run_inference_spa(
+                    inputs, image_xyz, spa, processor,
+                    max_new_tokens=max_new_tokens,
+                    coord_scale=100.0,
+                    vanilla=True,  # vanilla ablation
+                )
+                full_output = "<answer>" + output
+                fmt = item.get("format_type", "select")
+                if fmt == "fill":
+                    prediction = extract_answer_number(full_output)
+                else:
+                    prediction = extract_answer_letter(full_output)
+                results.append({
+                    "prediction": prediction,
+                    "answer": item.get("answer", ""),
+                    "category": item.get("category", "unknown"),
+                    "format_type": fmt,
+                })
+            except Exception as exc:
+                log.warning(f"[eval] {ds_name} sample {item.get('index')}: {exc}",
+                            exc_info=True)
+                results.append({
+                    "prediction": "",
+                    "answer": item.get("answer", ""),
+                    "category": item.get("category", "unknown"),
+                    "format_type": item.get("format_type", "select"),
+                })
+            if local_rank == 0 and (i + 1) % 50 == 0:
+                log.info(f"[eval] {ds_name}: {i + 1}/{len(shard)} samples done")
+
+        # Gather results from all ranks to rank 0
+        if world_size > 1:
+            gathered = [None] * world_size
+            dist.all_gather_object(gathered, results)
+            if local_rank == 0:
+                results = [r for shard_results in gathered for r in shard_results]
+
+        if local_rank == 0:
+            metrics = compute_metrics(results)
+            all_metrics[ds_name] = metrics
+            log_metrics(metrics, f"[eval] {ds_name}", log)
+
+    spa.config.use_cache = False  # restore for gradient-checkpointed training
+    os.environ["CUDA_LAUNCH_BLOCKING"] = _prev_blocking  # restore for training
+    _model.train()
+    return all_metrics
 
 
 # ── training loop ─────────────────────────────────────────────────────────────
@@ -931,14 +569,9 @@ def train(args: argparse.Namespace) -> None:
         args.model_path, trust_remote_code=True
     )
     tokenizer = processor.tokenizer
-    if args.ablation is None:
-        # Only add <pose> token when pose prediction is used (non-ablation modes)
-        tokenizer.add_special_tokens({"additional_special_tokens": [POSE_TOKEN]})
-        pose_token_id = tokenizer.convert_tokens_to_ids(POSE_TOKEN)
-        rank0_print(f"<pose> token id = {pose_token_id}")
-    else:
-        pose_token_id = -1  # unused in ablation modes
-        rank0_print(f"Ablation '{args.ablation}': <pose> token not added")
+
+    pose_token_id = -1  # unused in ablation modes
+    rank0_print(f"Ablation '{args.ablation}': <pose> token not added")
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = build_model(
@@ -953,12 +586,8 @@ def train(args: argparse.Namespace) -> None:
     )
     model = model.to(device)
 
-    # Normalise --pos3d_dir (empty string → None to disable 3D pos loading)
-    if args.pos3d_dir == "":
-        args.pos3d_dir = None
     # vanilla ablation: disable 3D position maps (uses original 3D M-RoPE)
-    if args.ablation == "vanilla":
-        args.pos3d_dir = None
+    args.pos3d_dir = None
     rank0_print(f"pos3d_dir = {args.pos3d_dir}")
 
     # ── resolve spatial_merge_size from vision config ─────────────────────────
@@ -1019,6 +648,32 @@ def train(args: argparse.Namespace) -> None:
 
     if local_rank == 0:
         os.makedirs(args.output_dir, exist_ok=True)
+        _log_path = os.path.join(args.output_dir, "train.log")
+        _fh = logging.FileHandler(_log_path, mode="a", encoding="utf-8")
+        _fh.setLevel(logging.INFO)
+        _fh.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S"
+        ))
+        logging.getLogger().addHandler(_fh)
+        log.info(f"Log file: {_log_path}")
+
+    # ── evaluation datasets (all ranks) ─────────────────────────────────────
+    # All ranks build the same dict so the eval condition is consistent across
+    # ranks (needed for dist.barrier() and distributed sample sharding).
+    eval_datasets: dict[str, str] = {}
+    if args.eval_steps > 0:
+        if os.path.isdir(args.mindcube_dir):
+            eval_datasets["mindcube"] = args.mindcube_dir
+            if local_rank == 0:
+                log.info(f"Eval dataset: mindcube → {args.mindcube_dir}")
+        elif local_rank == 0:
+            log.warning(f"MindCube dir not found: {args.mindcube_dir} — skipping")
+        if os.path.isdir(args.sparbench_dir):
+            eval_datasets["sparbench_multi_view"] = args.sparbench_dir
+            if local_rank == 0:
+                log.info(f"Eval dataset: sparbench_multi_view → {args.sparbench_dir}")
+        elif local_rank == 0:
+            log.warning(f"SPARBench dir not found: {args.sparbench_dir} — skipping")
 
     # ── WandB (rank 0 only) ───────────────────────────────────────────────────
     use_wandb = _WANDB_AVAILABLE and args.wandb_project and local_rank == 0
@@ -1135,9 +790,55 @@ def train(args: argparse.Namespace) -> None:
                     if global_step % args.save_steps == 0:
                         _save_checkpoint(_model, tokenizer, args.output_dir,
                                          global_step)
+
                 else:
                     running_loss = 0.0
                     running_loss_dict.clear()
+
+                # ── periodic evaluation (all ranks participate) ───────────
+                if (args.eval_steps > 0
+                        and global_step % args.eval_steps == 0
+                        and eval_datasets):
+                    if local_rank == 0:
+                        log.info(f"[eval] Starting evaluation at step {global_step}")
+                    eval_metrics = evaluate_benchmarks(
+                        model=_model,
+                        processor=processor,
+                        device=device,
+                        eval_datasets=eval_datasets,
+                        spatial_merge_size=spatial_merge_size,
+                        max_new_tokens=args.eval_max_new_tokens,
+                        local_rank=local_rank,
+                        world_size=world_size,
+                        eval_limit=args.eval_max_samples,
+                    )
+                    if local_rank == 0 and eval_metrics:
+                        # Save eval results to JSON
+                        eval_json_path = os.path.join(
+                            args.output_dir,
+                            f"eval_step_{global_step:05d}.json",
+                        )
+                        with open(eval_json_path, "w", encoding="utf-8") as _ef:
+                            json.dump(
+                                {"step": global_step, "results": {
+                                    ds: {
+                                        "accuracy": m["overall_accuracy"],
+                                        "correct":  m["correct_samples"],
+                                        "total":    m["total_samples"],
+                                        "category_accuracy": m.get("category_accuracy", {}),
+                                    }
+                                    for ds, m in eval_metrics.items()
+                                }},
+                                _ef, indent=2,
+                            )
+                        log.info(f"[eval] Results saved → {eval_json_path}")
+                        if use_wandb:
+                            wandb_eval: dict = {}
+                            for ds_name, m in eval_metrics.items():
+                                wandb_eval[f"eval/{ds_name}/accuracy"] = m["overall_accuracy"]
+                                for cat, cat_acc in m.get("category_accuracy", {}).items():
+                                    wandb_eval[f"eval/{ds_name}/{cat}_accuracy"] = cat_acc
+                            wandb.log(wandb_eval, step=global_step, commit=True)
 
     # Final checkpoint (rank 0 only)
     if local_rank == 0:
@@ -1151,7 +852,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 def _save_checkpoint(
-    model: nn.Module,
+    model: AnswerOnlyModel,
     tokenizer,
     output_dir: str,
     step: int,
@@ -1242,12 +943,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ablation",
         choices=["no_cam", "vanilla"],
-        default=None,
+        default="vanilla",
         help="Ablation study mode. "
              "no_cam: keeps 4D M-RoPE position embedding, removes pose prediction, "
              "only LM answer loss. "
              "vanilla: uses original Qwen 3D M-RoPE, removes pose prediction, "
              "only LM answer loss.",
+    )
+    # ── Periodic evaluation ──────────────────────────────────────────────────
+    p.add_argument(
+        "--eval_steps", type=int, default=2,
+        help="Run evaluation every N optimizer steps (default: 2). "
+             "Set to 0 to disable periodic evaluation.",
+    )
+    p.add_argument(
+        "--mindcube_dir",
+        default=os.path.join(_ROOT, "datasets/evaluation/MindCube"),
+        help="Path to MindCube evaluation dataset directory.",
+    )
+    p.add_argument(
+        "--sparbench_dir",
+        default=os.path.join(_ROOT, "datasets/evaluation/SPARBench"),
+        help="Path to SPARBench evaluation dataset directory.",
+    )
+    p.add_argument(
+        "--eval_max_new_tokens", type=int, default=512,
+        help="Max new tokens for evaluation generation.",
+    )
+    p.add_argument(
+        "--eval_max_samples", type=int, default=None,
+        help="Max samples per eval dataset (None = full dataset).",
     )
     # ── WandB ─────────────────────────────────────────────────────────────────
     p.add_argument(

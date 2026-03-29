@@ -95,6 +95,7 @@ NUM_WORKERS=4
 SKIP_LAYERS="-1"
 CYCLE_WEIGHT=0.1
 SAVE_STEPS=500
+EVAL_STEPS=100
 
 WANDB_PROJECT="SPI"
 WANDB_ENTITY="actmrv"
@@ -110,6 +111,7 @@ mkdir -p "$OUTPUT_DIR"
 echo "[INFO] NPROC_PER_NODE      = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
+echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] PLUS mode            = ${PLUS_FLAG:-disabled}"
 echo "[INFO] ABLATION             = ${ABLATION_FLAG:-disabled}"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
@@ -147,6 +149,7 @@ $TORCHRUN \
     --skip_layers    $SKIP_LAYERS     \
     --cycle_weight   "$CYCLE_WEIGHT"  \
     --save_steps     "$SAVE_STEPS"    \
+    --eval_steps     "$EVAL_STEPS"    \
     --wandb_project  "$WANDB_PROJECT" \
     --wandb_entity   "$WANDB_ENTITY"  \
     --wandb_run_name "$WANDB_RUN_NAME" \

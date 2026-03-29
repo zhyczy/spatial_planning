@@ -55,7 +55,7 @@ POS3D_DIR="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/3D_pos"
 RUN_NAME="coordinate"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
-EPOCHS=3
+EPOCHS=5
 LR=2e-4
 LORA_RANK=16
 MAX_IMAGES=4
@@ -67,6 +67,7 @@ CYCLE_WEIGHT=0.1
 ANSWER_WEIGHT=1.0
 COORD_WEIGHT=1.0
 SAVE_STEPS=500
+EVAL_STEPS=100
 
 WANDB_PROJECT="SPI"
 WANDB_ENTITY="actmrv"
@@ -83,6 +84,7 @@ mkdir -p "$OUTPUT_DIR"
 echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
+echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -118,6 +120,7 @@ torchrun \
     --answer_weight  "$ANSWER_WEIGHT"  \
     --coord_weight   "$COORD_WEIGHT"   \
     --save_steps     "$SAVE_STEPS"     \
+    --eval_steps     "$EVAL_STEPS"     \
     --wandb_project  "$WANDB_PROJECT"  \
     --wandb_entity   "$WANDB_ENTITY"   \
     --wandb_run_name "$WANDB_RUN_NAME" \

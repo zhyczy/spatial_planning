@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -103,15 +102,30 @@ def load_vggt_model(repo_root: Path, checkpoint_path: Path, device: str):
     return model, load_and_preprocess_images
 
 
+def find_repo_root(script_path: Path) -> Path:
+    # Resolve against the spatial_planning root regardless of where this script is located.
+    for candidate in [script_path.parent] + list(script_path.parents):
+        if (candidate / "external" / "vggt").exists() and (candidate / "datasets").exists():
+            return candidate
+    # Fallback keeps behavior predictable if expected folders are absent.
+    return script_path.parent
+
+
+def resolve_path(path_arg: str, repo_root: Path) -> Path:
+    path = Path(path_arg).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (repo_root / path).resolve()
+
+
 def main():
     args = parse_args()
 
-    # This script lives in spatial_planning/, so repo_root is its parent dir.
-    repo_root = Path(__file__).resolve().parent
-    data_json = (repo_root / args.data_json).resolve() if not os.path.isabs(args.data_json) else Path(args.data_json).resolve()
-    spar_root = (repo_root / args.spar_root).resolve() if not os.path.isabs(args.spar_root) else Path(args.spar_root).resolve()
-    output_dir = (repo_root / args.output_dir).resolve() if not os.path.isabs(args.output_dir) else Path(args.output_dir).resolve()
-    checkpoint_path = (repo_root / args.checkpoint).resolve() if not os.path.isabs(args.checkpoint) else Path(args.checkpoint).resolve()
+    repo_root = find_repo_root(Path(__file__).resolve())
+    data_json = resolve_path(args.data_json, repo_root)
+    spar_root = resolve_path(args.spar_root, repo_root)
+    output_dir = resolve_path(args.output_dir, repo_root)
+    checkpoint_path = resolve_path(args.checkpoint, repo_root)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 

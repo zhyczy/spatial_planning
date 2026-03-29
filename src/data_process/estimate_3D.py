@@ -64,6 +64,7 @@ if str(_SPATIAL_PLANNING_DIR) not in sys.path:
 from coord_esti import CoordEstimator, save_results  # noqa: E402
 
 _EVAL_ROOT = _SPATIAL_PLANNING_DIR / "datasets" / "evaluation"
+_TRAIN_ROOT = _SPATIAL_PLANNING_DIR / "datasets" / "train"
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,19 @@ def _iter_mindcube(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
             imgs = _load_images_from_paths(root, entry.get("images", []))
             if imgs:
                 yield str(entry.get("id", i)), imgs
+
+
+def _iter_mindcube_train(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
+    img_root = _EVAL_ROOT / "MindCube"  # images shared with eval
+    json_path = _TRAIN_ROOT / "MindCube" / "train_10k.json"
+    with open(json_path) as f:
+        data = json.load(f)
+    for i, entry in enumerate(data):
+        if limit > 0 and i >= limit:
+            break
+        imgs = _load_images_from_paths(img_root, entry.get("image", []))
+        if imgs:
+            yield str(entry.get("id", i)), imgs
 
 
 def _iter_mmsibench(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
@@ -171,6 +185,10 @@ DATASETS = {
         ),
         "out_dir": _EVAL_ROOT / "SPARBench" / "3d_results",
     },
+    "mindcube_train": {
+        "iter": _iter_mindcube_train,
+        "out_dir": _TRAIN_ROOT / "MindCube" / "3d_results",
+    },
     "sparbench_mv": {
         "iter": lambda limit: _iter_sparbench(
             _EVAL_ROOT / "SPARBench" / "sparbench_mv.json", limit
@@ -218,6 +236,28 @@ def process_dataset(
 # CLI
 # ---------------------------------------------------------------------------
 
+def _iter_custom_json(json_path: str, img_root: str, img_key: str,
+                      id_key: str, limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
+    """Generic iterator for any JSON/JSONL file with image paths."""
+    p = Path(json_path)
+    root = Path(img_root)
+    if p.suffix == ".jsonl":
+        with open(p) as f:
+            data = [json.loads(line) for line in f]
+    else:
+        with open(p) as f:
+            data = json.load(f)
+    for i, entry in enumerate(data):
+        if limit > 0 and i >= limit:
+            break
+        paths = entry.get(img_key, [])
+        if isinstance(paths, str):
+            paths = [paths]
+        imgs = _load_images_from_paths(root, paths)
+        if imgs:
+            yield str(entry.get(id_key, i)), imgs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Batch 3D estimation for evaluation datasets."
@@ -225,9 +265,39 @@ def main() -> None:
     parser.add_argument(
         "--datasets",
         nargs="+",
-        default=list(DATASETS.keys()),
+        default=None,
         choices=list(DATASETS.keys()),
-        help="Datasets to process (default: all).",
+        help="Predefined datasets to process.",
+    )
+    parser.add_argument(
+        "--json_path",
+        type=str,
+        default=None,
+        help="Path to a custom JSON/JSONL file to process.",
+    )
+    parser.add_argument(
+        "--img_root",
+        type=str,
+        default=None,
+        help="Root directory for resolving image paths in --json_path.",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help="Output directory for 3d_results when using --json_path.",
+    )
+    parser.add_argument(
+        "--img_key",
+        type=str,
+        default="image",
+        help="JSON key for image paths (default: 'image').",
+    )
+    parser.add_argument(
+        "--id_key",
+        type=str,
+        default="id",
+        help="JSON key for entry id (default: 'id').",
     )
     parser.add_argument(
         "--limit",
@@ -250,12 +320,37 @@ def main() -> None:
     print("Loading CoordEstimator …")
     estimator = CoordEstimator(device=args.device)
 
-    for ds in args.datasets:
+    if args.json_path:
+        # Custom JSON mode
+        if not args.img_root or not args.out_dir:
+            parser.error("--json_path requires --img_root and --out_dir")
+        out_root = Path(args.out_dir)
+        out_root.mkdir(parents=True, exist_ok=True)
         print(f"\n{'='*60}")
-        print(f"  Dataset : {ds}")
-        print(f"  Out dir : {DATASETS[ds]['out_dir']}")
+        print(f"  JSON    : {args.json_path}")
+        print(f"  Img root: {args.img_root}")
+        print(f"  Out dir : {out_root}")
         print(f"{'='*60}")
-        process_dataset(ds, estimator, limit=args.limit, skip_existing=not args.no_skip)
+
+        # Register as temporary dataset
+        DATASETS["_custom"] = {
+            "iter": lambda limit: _iter_custom_json(
+                args.json_path, args.img_root, args.img_key, args.id_key, limit
+            ),
+            "out_dir": out_root,
+        }
+        process_dataset("_custom", estimator, limit=args.limit,
+                        skip_existing=not args.no_skip)
+    else:
+        # Predefined datasets mode
+        ds_list = args.datasets or list(DATASETS.keys())
+        for ds in ds_list:
+            print(f"\n{'='*60}")
+            print(f"  Dataset : {ds}")
+            print(f"  Out dir : {DATASETS[ds]['out_dir']}")
+            print(f"{'='*60}")
+            process_dataset(ds, estimator, limit=args.limit,
+                            skip_existing=not args.no_skip)
 
     print("\nAll done.")
 

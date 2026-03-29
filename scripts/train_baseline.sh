@@ -12,9 +12,8 @@ set -euo pipefail
 #
 # Positional args:
 #   1) num_gpus                  default: auto-detect
-#   2) model_preset              default: qwen2.5vl-3b
-#                                supported: qwen2.5vl-3b | qwen2.5 | qwen25 |
-#                                           qwen3.5-4b | qwen3.5 | qwen35
+#   2) model_preset              default: qwen2.5
+#                                supported: qwen2.5 | qwen3.5
 #   3) model_name_or_path        optional, overrides preset path/id
 #   4) allow_incompatible_qwen35 optional, true/false (default: false)
 #                                only applies to qwen3.5 preset
@@ -23,13 +22,13 @@ set -euo pipefail
 # Examples:
 #   bash scripts/train_baseline.sh
 #   bash scripts/train_baseline.sh 8 qwen2.5
-#   bash scripts/train_baseline.sh 8 qwen3.5 /path/to/ckpt true
+#   bash scripts/train_baseline.sh 8 qwen3.5
 #   bash scripts/train_baseline.sh 8 qwen3.5 "" false --global-batch-size 32
 #
 # Teacher feature env vars (optional):
 #   USE_TEACHER_FEATURE=true|false       default: true
 #   REQUIRE_TEACHER_FEATURE=true|false   default: true
-#   TEACHER_FEATURE_DIR=/abs/path        default: datasets/train/SPAR_7M/spar/vggt_teacher_features
+#   TEACHER_FEATURE_DIR=/abs/path        default: /egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning/datasets/train/SPAR_7M/spar/vggt_teacher_features
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,18 +62,18 @@ CUDA_IDS=$(seq -s ',' 0 $((NPROC - 1)))
 export CUDA_VISIBLE_DEVICES="$CUDA_IDS"
 
 # model preset: positional arg 2
-MODEL_PRESET_RAW="${2:-qwen2.5vl-3b}"
+MODEL_PRESET_RAW="${2:-qwen2.5}"
 
 case "$MODEL_PRESET_RAW" in
-    qwen2.5vl-3b|qwen2.5|qwen25)
+    qwen2.5)
         MODEL_PRESET="qwen2.5vl-3b"
         ;;
-    qwen3.5-4b|qwen3.5|qwen35)
+    qwen3.5)
         MODEL_PRESET="qwen3.5-4b"
         ;;
     *)
         echo "[ERROR] Unsupported model_preset: $MODEL_PRESET_RAW"
-        echo "[ERROR] Choose one of: qwen2.5vl-3b, qwen2.5, qwen25, qwen3.5-4b, qwen3.5, qwen35"
+        echo "[ERROR] Choose one of: qwen2.5, qwen3.5"
         usage
         exit 1
         ;;
@@ -132,7 +131,11 @@ LR=2e-4
 # Teacher Feature Options
 # =============================================================================
 
-USE_TEACHER_FEATURE_RAW="${USE_TEACHER_FEATURE:-true}"
+DEFAULT_USE_TEACHER_FEATURE="true"
+DEFAULT_REQUIRE_TEACHER_FEATURE="true"
+DEFAULT_TEACHER_FEATURE_DIR="/egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning/datasets/train/SPAR_7M/spar/vggt_teacher_features"
+
+USE_TEACHER_FEATURE_RAW="${USE_TEACHER_FEATURE:-$DEFAULT_USE_TEACHER_FEATURE}"
 case "${USE_TEACHER_FEATURE_RAW,,}" in
     true|1|yes|y) USE_TEACHER_FEATURE="true" ;;
     false|0|no|n) USE_TEACHER_FEATURE="false" ;;
@@ -142,7 +145,7 @@ case "${USE_TEACHER_FEATURE_RAW,,}" in
         ;;
 esac
 
-REQUIRE_TEACHER_FEATURE_RAW="${REQUIRE_TEACHER_FEATURE:-true}"
+REQUIRE_TEACHER_FEATURE_RAW="${REQUIRE_TEACHER_FEATURE:-$DEFAULT_REQUIRE_TEACHER_FEATURE}"
 case "${REQUIRE_TEACHER_FEATURE_RAW,,}" in
     true|1|yes|y) REQUIRE_TEACHER_FEATURE="true" ;;
     false|0|no|n) REQUIRE_TEACHER_FEATURE="false" ;;
@@ -152,7 +155,7 @@ case "${REQUIRE_TEACHER_FEATURE_RAW,,}" in
         ;;
 esac
 
-TEACHER_FEATURE_DIR="${TEACHER_FEATURE_DIR:-$SPATIAL_DIR/datasets/train/SPAR_7M/spar/vggt_teacher_features}"
+TEACHER_FEATURE_DIR="${TEACHER_FEATURE_DIR:-$DEFAULT_TEACHER_FEATURE_DIR}"
 
 if [ "$USE_TEACHER_FEATURE" = "true" ] && [ "$REQUIRE_TEACHER_FEATURE" = "true" ] && [ ! -d "$TEACHER_FEATURE_DIR" ]; then
     echo "[ERROR] Teacher feature dir not found: $TEACHER_FEATURE_DIR"
@@ -165,6 +168,7 @@ fi
 # Setup
 # =============================================================================
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 mkdir -p "$OUTPUT_DIR"
 
 PYTHON_BIN="$(command -v python || true)"

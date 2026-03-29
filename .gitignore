@@ -201,3 +201,4 @@ train_records/
 eval_results/
 eval_results_baseline/
 train_records_baseline/
+train_debug/
