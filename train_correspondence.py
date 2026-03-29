@@ -30,10 +30,8 @@ Usage:
 
 import argparse
 import logging
-import math
 import os
 import sys
-from itertools import combinations
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -47,24 +45,20 @@ except ImportError:
     _WANDB_AVAILABLE = False
 
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoProcessor
 from peft import LoraConfig, TaskType, get_peft_model
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
-from models.spa_emb import SpaForConditionalGeneration
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+from src.models import AnswerOnlyModel, SpaCorrespondenceModel, CorrespondencePlusModel, PoseRegressionHead, SpaForConditionalGeneration
+from src.dataset import Train_Dataset, Eval_Dataset, load_testing_dataset
 
-# Re-use dataset detection logic from the data processing pipeline
-sys.path.insert(0, os.path.join(_ROOT, "src", "data_process"))
-from reconstruct_3d import detect_dataset, _scene_id_from_path  # noqa: E402
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,703 +87,6 @@ POS3D_DIR       = os.path.join(SPAR_ROOT, "3D_pos")
 POSE_TOKEN = "<pose>"
 
 
-# ── 3D coordinate helper ──────────────────────────────────────────────────────
-
-def resize_xyz(
-    xyz:      np.ndarray,
-    target_h: int,
-    target_w: int,
-    valid:    np.ndarray | None = None,
-) -> torch.Tensor:
-    """
-    Compute the mean 3D position of all valid pixels within each LLM patch.
-
-    Args:
-        xyz:      (H, W, 3) float  — per-pixel XYZ map (any float dtype)
-        target_h: output patch rows (= image_grid_thw[1] // spatial_merge_size)
-        target_w: output patch cols (= image_grid_thw[2] // spatial_merge_size)
-        valid:    (H, W) bool mask — True where XYZ is reliable;
-                  if None all pixels are treated as valid
-
-    Returns:
-        (target_h, target_w, 3) float32 tensor; patches with no valid pixels
-        are set to zero.
-    """
-    H, W = xyz.shape[:2]
-    xyz_f = xyz.astype(np.float32)                     # (H, W, 3)
-
-    if valid is None:
-        valid = np.ones((H, W), dtype=bool)
-
-    # Stride per LLM patch (integer division; crop any remainder)
-    stride_h = H // target_h
-    stride_w = W // target_w
-    H_crop   = target_h * stride_h
-    W_crop   = target_w * stride_w
-    xyz_f    = xyz_f[:H_crop, :W_crop]                 # (H_crop, W_crop, 3)
-    valid    = valid[:H_crop, :W_crop].astype(np.float32)  # (H_crop, W_crop)
-
-    # Reshape into patch blocks
-    # (target_h, stride_h, target_w, stride_w, 3)
-    xyz_blocks   = xyz_f.reshape(target_h, stride_h, target_w, stride_w, 3)
-    valid_blocks = valid.reshape(target_h, stride_h, target_w, stride_w)
-
-    # Masked sum → mean over the stride_h × stride_w pixel block per patch
-    xyz_sum   = (xyz_blocks * valid_blocks[..., None]).sum(axis=(1, 3))  # (th, tw, 3)
-    valid_cnt = valid_blocks.sum(axis=(1, 3))                            # (th, tw)
-
-    denom    = np.maximum(valid_cnt, 1)[..., None]     # avoid ÷0
-    xyz_mean = xyz_sum / denom                         # (target_h, target_w, 3)
-    xyz_mean[valid_cnt == 0] = 0.0                     # patches with no valid px
-
-    return torch.from_numpy(xyz_mean)                  # (target_h, target_w, 3)
-
-
-# ── rotation utilities ────────────────────────────────────────────────────────
-
-def rot6d_to_rotmat(r6d: torch.Tensor) -> torch.Tensor:
-    """
-    6D continuous rotation → 3×3 rotation matrix via Gram-Schmidt.
-    (..., 6)  →  (..., 3, 3)
-
-    The first two columns of R are encoded in r6d[..., :3] and r6d[..., 3:6].
-    Reference: Zhou et al., "On the Continuity of Rotation Representations in
-    Neural Networks", CVPR 2019.
-    """
-    # Cast to float32: bfloat16 lacks precision for Gram-Schmidt (eps=1e-6 ≈ 0
-    # in bf16, causing 0/0 NaN when a1 ∥ a2 at random initialisation).
-    orig_dtype = r6d.dtype
-    r6d = r6d.float()
-    a1, a2 = r6d[..., :3], r6d[..., 3:6]
-    b1 = F.normalize(a1, dim=-1, eps=1e-6)
-    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1, eps=1e-6)
-    b3 = torch.cross(b1, b2, dim=-1)
-    # Stack as columns: R = [b1 | b2 | b3], restore original dtype
-    return torch.stack([b1, b2, b3], dim=-1).to(orig_dtype)   # (..., 3, 3)
-
-
-def geodesic_loss(
-    R_pred: torch.Tensor,
-    R_gt: torch.Tensor,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """
-    Mean rotation-angle loss between predicted and GT rotation matrices.
-    R_pred, R_gt: (N, 3, 3)
-    """
-    # Compute in float32: acos gradient blows up near ±1 in bfloat16
-    R_pred = R_pred.float()
-    R_gt   = R_gt.float()
-    R_diff = torch.bmm(R_pred, R_gt.transpose(-1, -2))         # (N, 3, 3)
-    trace  = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)         # (N,)
-    cos    = ((trace - 1.0) / 2.0).clamp(-1.0 + eps, 1.0 - eps)
-    return torch.acos(cos).mean()
-
-
-def cycle_consistency_loss(
-    R_preds: torch.Tensor,
-    t_preds: torch.Tensor,
-    N: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Rotation + translation cycle-consistency loss.
-
-    Rotation (Frobenius norm):
-      Pair round-trip (i < j):   ||R_{i→j} @ R_{j→i} - I||_F
-      Triangle {a, b, c}:        ||R_{a→b} @ R_{b→c} @ R_{c→a} - I||_F
-
-    Translation (L1 norm, more robust to outliers):
-      Pair round-trip (i < j):   ||R_{i→j} @ t_{j→i} + t_{i→j}||_1
-      Triangle {a, b, c}:        ||R_{a→b} @ R_{b→c} @ t_{c→a}
-                                    + R_{a→b} @ t_{b→c} + t_{a→b}||_1
-
-    Args:
-      R_preds: (K, 3, 3)  where K = N*(N-1), ordered by
-               [(i,j) for i in range(N) for j in range(N) if i != j]
-      t_preds: (K, 3)     same ordering as R_preds
-      N:       number of views
-
-    Returns:
-      (cycle_r, cycle_t) — two scalars, mean over all terms.
-      Returns (0, 0) when N < 2.
-    """
-    zero = R_preds.new_tensor(0.0)
-    if N < 2:
-        return zero, zero
-
-    pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-    p2k   = {p: k for k, p in enumerate(pairs)}
-    I3    = torch.eye(3, device=R_preds.device, dtype=R_preds.dtype)
-
-    r_errs = []
-    t_errs = []
-
-    # Pair round-trips for all i < j
-    for i in range(N):
-        for j in range(i + 1, N):
-            kij, kji = p2k[(i, j)], p2k[(j, i)]
-            # Rotation: R_{i→j} @ R_{j→i} = I
-            R_cycle = R_preds[kij] @ R_preds[kji]
-            r_errs.append(torch.norm(R_cycle - I3, p="fro"))
-            # Translation: R_{i→j} @ t_{j→i} + t_{i→j} = 0
-            t_cycle = R_preds[kij] @ t_preds[kji] + t_preds[kij]
-            t_errs.append(t_cycle.abs().sum())          # L1 norm
-
-    # Triangle cycles for all triples {a, b, c}
-    for a, b, c in combinations(range(N), 3):
-        kab, kbc, kca = p2k[(a, b)], p2k[(b, c)], p2k[(c, a)]
-        # Rotation: R_{a→b} @ R_{b→c} @ R_{c→a} = I
-        R_cycle = R_preds[kab] @ R_preds[kbc] @ R_preds[kca]
-        r_errs.append(torch.norm(R_cycle - I3, p="fro"))
-        # Translation: R_{a→b} @ R_{b→c} @ t_{c→a} + R_{a→b} @ t_{b→c} + t_{a→b} = 0
-        t_cycle = (R_preds[kab] @ R_preds[kbc] @ t_preds[kca]
-                   + R_preds[kab] @ t_preds[kbc]
-                   + t_preds[kab])
-        t_errs.append(t_cycle.abs().sum())              # L1 norm
-
-    cycle_r = torch.stack(r_errs).mean()
-    cycle_t = torch.stack(t_errs).mean()
-    return cycle_r, cycle_t
-
-
-# ── model components ──────────────────────────────────────────────────────────
-
-class PoseRegressionHead(nn.Module):
-    """
-    MLP regression head: input_dim → 9D pose vector.
-    Output layout: first 6 dims = 6D rotation, last 3 dims = translation.
-
-    input_dim = hidden_size * len(skip_layers), e.g.:
-      skip_layers=[-1]     → input_dim = 2560  (last layer only)
-      skip_layers=[-4,-1]  → input_dim = 5120  (concat of two layers)
-    """
-
-    def __init__(self, input_dim: int = 2560):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.GELU(),
-            nn.Linear(1024, 9),
-        )
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        """latent: (input_dim,) or (N, input_dim) → (9,) or (N, 9)"""
-        return self.mlp(latent)
-
-
-class SpaCorrespondenceModel(nn.Module):
-    """
-    SpaForConditionalGeneration (+ LoRA) wrapped with a PoseRegressionHead.
-
-    Forward:
-      1. Runs the backbone with output_hidden_states=True.
-      2. Finds all <pose> token positions in input_ids.
-      3. Concatenates hidden states from skip_layers at each <pose> position
-         (skip connection from intermediate layers preserves geometric detail).
-      4. Passes each latent through PoseRegressionHead → 9D prediction.
-      5. Optionally computes geodesic + translation + cycle-consistency loss.
-
-    skip_layers: list of layer indices into outputs.hidden_states, e.g.
-      [-1]      → last layer only  (input_dim = hidden_size)
-      [-4, -1]  → concat 4th-from-last + last  (input_dim = 2 * hidden_size)
-
-    Returns:
-      preds_9d : (K, 9) tensor  —  K = number of <pose> tokens found
-      loss     : scalar or None
-    """
-
-    def __init__(
-        self,
-        spa_model:      nn.Module,
-        pose_head:      PoseRegressionHead,
-        pose_token_id:  int,
-        skip_layers:    tuple[int, ...] = (-1,),
-    ):
-        super().__init__()
-        self.spa_model     = spa_model
-        self.pose_head     = pose_head
-        self.pose_token_id = pose_token_id
-        self.skip_layers   = list(skip_layers)
-
-    def forward(
-        self,
-        input_ids:      torch.Tensor,                    # (1, seq_len)
-        attention_mask: torch.Tensor,                    # (1, seq_len)
-        pixel_values:   torch.Tensor | None,             # (total_patches, C, H, W)
-        image_grid_thw: torch.Tensor | None,             # (num_images, 3)
-        gt_transforms:  torch.Tensor | None = None,      # (K, 4, 4)
-        image_xyz:      list | None = None,              # list of (llm_H, llm_W, 3)
-        coord_scale:    float = 100.0,
-        cycle_weight:   float = 0.0,
-        **kwargs,
-    ):
-        outputs = self.spa_model(
-            input_ids            = input_ids,
-            attention_mask       = attention_mask,
-            pixel_values         = pixel_values,
-            image_grid_thw       = image_grid_thw,
-            output_hidden_states = True,
-            return_dict          = True,
-            image_xyz            = image_xyz,
-            coord_scale          = coord_scale,
-            **kwargs,
-        )
-
-        # Skip connection: concatenate hidden states from selected layers
-        # outputs.hidden_states: tuple[num_layers+1] of (1, seq_len, hidden_dim)
-        if len(self.skip_layers) == 1:
-            hidden = outputs.hidden_states[self.skip_layers[0]]    # (1, seq, H)
-        else:
-            hidden = torch.cat(
-                [outputs.hidden_states[i] for i in self.skip_layers], dim=-1
-            )                                                        # (1, seq, H*n)
-
-        # Locate <pose> tokens (batch item 0)
-        pose_positions = (input_ids[0] == self.pose_token_id).nonzero(
-            as_tuple=True
-        )[0]
-        if len(pose_positions) == 0:
-            return None, None, None
-
-        # Predict pose at each <pose> token
-        latents  = hidden[0, pose_positions]       # (K, input_dim)
-        preds_9d = self.pose_head(latents)          # (K, 9)
-
-        if gt_transforms is None:
-            return preds_9d, None, None
-
-        K  = preds_9d.shape[0]
-        gt = gt_transforms[:K].to(preds_9d.device, dtype=preds_9d.dtype)  # (K, 4, 4)
-
-        R_gt   = gt[:, :3, :3]                       # (K, 3, 3)
-        t_gt   = gt[:, :3,  3]                       # (K, 3)
-        R_pred = rot6d_to_rotmat(preds_9d[:, :6])    # (K, 3, 3)
-        t_pred = preds_9d[:, 6:]                     # (K, 3)
-
-        rot_loss   = geodesic_loss(R_pred, R_gt)
-        trans_loss = F.smooth_l1_loss(t_pred, t_gt, beta=0.5)
-        loss = rot_loss + trans_loss
-
-        _ldict: dict = {"rot_loss": rot_loss.item(), "trans_loss": trans_loss.item()}
-
-        # Cycle consistency (rotation + translation)
-        if cycle_weight > 0.0:
-            N = round((1 + math.sqrt(1 + 4 * K)) / 2)
-            if N * (N - 1) == K:                     # valid A(N,2) count
-                c_r, c_t = cycle_consistency_loss(R_pred, t_pred, N)
-                c_loss = cycle_weight * (c_r + c_t)
-                loss   = loss + c_loss
-                _ldict["cycle_loss"]   = c_loss.item()
-                _ldict["cycle_r_loss"] = c_r.item()
-                _ldict["cycle_t_loss"] = c_t.item()
-
-        _ldict["pose_loss"] = loss.item()
-        return preds_9d, loss, _ldict
-
-
-class CorrespondencePlusModel(SpaCorrespondenceModel):
-    """
-    SpaCorrespondenceModel + auxiliary LM answer-prediction loss.
-
-    When ``labels`` (1, seq_len) are provided the model additionally
-    computes causal cross-entropy on the answer tokens and adds it
-    (scaled by ``answer_weight``) to the pose regression loss.
-    """
-
-    def __init__(
-        self,
-        spa_model:      nn.Module,
-        pose_head:      PoseRegressionHead,
-        pose_token_id:  int,
-        skip_layers:    tuple[int, ...] = (-1,),
-        answer_weight:  float = 1.0,
-    ):
-        super().__init__(spa_model, pose_head, pose_token_id, skip_layers)
-        self.answer_weight = answer_weight
-
-    def forward(
-        self,
-        input_ids:      torch.Tensor,
-        attention_mask: torch.Tensor,
-        pixel_values:   torch.Tensor | None,
-        image_grid_thw: torch.Tensor | None,
-        gt_transforms:  torch.Tensor | None = None,
-        image_xyz:      list | None = None,
-        coord_scale:    float = 100.0,
-        cycle_weight:   float = 0.0,
-        labels:         torch.Tensor | None = None,
-        **kwargs,
-    ):
-        outputs = self.spa_model(
-            input_ids            = input_ids,
-            attention_mask       = attention_mask,
-            pixel_values         = pixel_values,
-            image_grid_thw       = image_grid_thw,
-            output_hidden_states = True,
-            return_dict          = True,
-            image_xyz            = image_xyz,
-            coord_scale          = coord_scale,
-            **kwargs,
-        )
-
-        # ── pose prediction ───────────────────────────────────────────────────
-        if len(self.skip_layers) == 1:
-            hidden = outputs.hidden_states[self.skip_layers[0]]
-        else:
-            hidden = torch.cat(
-                [outputs.hidden_states[i] for i in self.skip_layers], dim=-1
-            )
-
-        pose_positions = (input_ids[0] == self.pose_token_id).nonzero(
-            as_tuple=True
-        )[0]
-        if len(pose_positions) == 0:
-            return None, None, None
-
-        latents  = hidden[0, pose_positions]
-        preds_9d = self.pose_head(latents)
-
-        pose_loss = None
-        _ldict: dict = {}
-        if gt_transforms is not None:
-            K  = preds_9d.shape[0]
-            gt = gt_transforms[:K].to(preds_9d.device, dtype=preds_9d.dtype)
-            R_gt   = gt[:, :3, :3]
-            t_gt   = gt[:, :3,  3]
-            R_pred = rot6d_to_rotmat(preds_9d[:, :6])
-            t_pred = preds_9d[:, 6:]
-            rot_loss   = geodesic_loss(R_pred, R_gt)
-            trans_loss = F.smooth_l1_loss(t_pred, t_gt, beta=0.5)
-            pose_loss  = rot_loss + trans_loss
-            _ldict = {"rot_loss": rot_loss.item(), "trans_loss": trans_loss.item()}
-            if cycle_weight > 0.0:
-                N = round((1 + math.sqrt(1 + 4 * K)) / 2)
-                if N * (N - 1) == K:
-                    c_r, c_t  = cycle_consistency_loss(R_pred, t_pred, N)
-                    c_loss    = cycle_weight * (c_r + c_t)
-                    pose_loss = pose_loss + c_loss
-                    _ldict["cycle_loss"]   = c_loss.item()
-                    _ldict["cycle_r_loss"] = c_r.item()
-                    _ldict["cycle_t_loss"] = c_t.item()
-            _ldict["pose_loss"] = pose_loss.item()
-
-        # ── LM answer-prediction loss ─────────────────────────────────────────
-        lm_loss = None
-        if labels is not None:
-            logits = outputs.logits                          # (1, seq_len, vocab_size)
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous().to(logits.device)
-            lm_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-
-        # ── combine ───────────────────────────────────────────────────────────
-        # _ldict already holds rot_loss / trans_loss / cycle_loss / pose_loss
-        if pose_loss is not None and lm_loss is not None:
-            loss = pose_loss + self.answer_weight * lm_loss
-            _ldict["lm_loss"] = lm_loss.item()
-        elif pose_loss is not None:
-            loss = pose_loss
-        elif lm_loss is not None:
-            loss = self.answer_weight * lm_loss
-            _ldict["lm_loss"] = lm_loss.item()
-        else:
-            loss = None
-
-        return preds_9d, loss, (_ldict if _ldict else None)
-
-
-class AnswerOnlyModel(nn.Module):
-    """
-    Ablation model: LoRA fine-tuning with only LM answer-prediction loss.
-    No pose regression head, no <pose> tokens.
-
-    Used for two ablation studies:
-      - no_cam:  keeps 4D M-RoPE (image_xyz passed), removes pose prediction
-      - vanilla: uses original 3D M-RoPE (no image_xyz), removes pose prediction
-    """
-
-    def __init__(self, spa_model: nn.Module, use_xyz: bool = True):
-        super().__init__()
-        self.spa_model = spa_model
-        self.use_xyz = use_xyz
-
-    def forward(
-        self,
-        input_ids:      torch.Tensor,
-        attention_mask: torch.Tensor,
-        pixel_values:   torch.Tensor | None,
-        image_grid_thw: torch.Tensor | None,
-        image_xyz:      list | None = None,
-        coord_scale:    float = 100.0,
-        labels:         torch.Tensor | None = None,
-        **kwargs,
-    ):
-        fwd_kwargs = dict(
-            input_ids            = input_ids,
-            attention_mask       = attention_mask,
-            pixel_values         = pixel_values,
-            image_grid_thw       = image_grid_thw,
-            output_hidden_states = False,
-            return_dict          = True,
-        )
-        if self.use_xyz:
-            fwd_kwargs["image_xyz"]   = image_xyz
-            fwd_kwargs["coord_scale"] = coord_scale
-
-        outputs = self.spa_model(**fwd_kwargs)
-
-        if labels is None:
-            return None, None, None
-
-        logits = outputs.logits                          # (1, seq_len, V)
-        shift_logits = logits[:, :-1, :]                   # (1, seq_len-1, V)
-        shift_labels = labels[:, 1:].to(logits.device)     # (1, seq_len-1)
-
-        # 只取有效 label 位置的 logits，避免整个 (seq_len, V) 留在显存里
-        mask = shift_labels[0] != -100                     # (seq_len-1,)
-        shift_logits = shift_logits[0, mask]               # (N_valid, V)
-        shift_labels = shift_labels[0, mask]               # (N_valid,)
-        lm_loss = F.cross_entropy(shift_logits, shift_labels)
-        _ldict = {"lm_loss": lm_loss.item()}
-        return None, lm_loss, _ldict
-
-
-# ── dataset ───────────────────────────────────────────────────────────────────
-
-class SPARDataset(Dataset):
-    """
-    One sample = one SPAR scene entry.
-
-    For each entry with N images (capped at max_images):
-      - Builds a multi-image chat prompt with A(N,2) = N*(N-1) <pose> tokens,
-        one per ordered pair (i, j) with i≠j, enumerated as:
-            (0,1), (0,2), ..., (0,N-1),
-            (1,0), (1,2), ..., (1,N-1),
-            ...
-            (N-1,0), ..., (N-1,N-2)
-      - Returns processor tensors + GT relative transforms T_{i→j}.
-
-    GT transforms come from reconstruct/{entry_id}.npz:
-        relative_transforms[i, j] = T_{i→j}
-        = inv(poses_ff[j]) @ poses_ff[i]
-        Transforms a 3-D point from camera-i frame to camera-j frame.
-    """
-
-    def __init__(
-        self,
-        json_path:           str,
-        spar_root:           str,
-        reconstruct_dir:     str,
-        processor,
-        pose_token_id:       int,
-        max_images:          int = 4,
-        pos3d_dir:           str | None = None,
-        spatial_merge_size:  int = 2,
-        max_samples:         int | None = None,
-        plus:                bool = False,
-        no_pose:             bool = False,
-    ):
-        import json
-        with open(json_path) as fh:
-            entries = json.load(fh)
-
-        self.samples = []
-        for e in entries:
-            eid = e.get("id", "")
-            npz = os.path.join(reconstruct_dir, f"{eid}.npz")
-            if not (os.path.exists(npz) and e.get("image")):
-                continue
-            # also require 3D_pos file if a pos3d_dir is given
-            if pos3d_dir is not None:
-                p3d = os.path.join(pos3d_dir, f"{eid}.npz")
-                if not os.path.exists(p3d):
-                    continue
-            else:
-                p3d = None
-            self.samples.append((e, npz, p3d))
-
-        if max_samples is not None and max_samples > 0:
-            self.samples = self.samples[:max_samples]
-
-        self.spar_root           = spar_root
-        self.processor           = processor
-        self.pose_token_id       = pose_token_id
-        self.max_images          = max_images
-        self.pos3d_dir           = pos3d_dir
-        self.spatial_merge_size  = spatial_merge_size
-        self.plus                = plus
-        self.no_pose             = no_pose
-        log.info(f"SPARDataset: {len(self.samples)} valid entries "
-                 f"(out of {len(entries)} total)")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        entry, npz_path, p3d_path = self.samples[idx]
-
-        # ── load images ───────────────────────────────────────────────────────
-        # Paths in the JSON are relative to {dataset}/images/; resolve using
-        # detect_dataset() (scannet / scannetpp / structured3d).
-        images = []
-        for rel in entry["image"]:
-            scene_id = _scene_id_from_path(rel)
-            dataset  = detect_dataset(scene_id)
-            full = os.path.join(self.spar_root, dataset, "images", rel)
-            try:
-                images.append(Image.open(full).convert("RGB"))
-            except (FileNotFoundError, OSError):
-                break
-            if len(images) == self.max_images:
-                break
-
-        # ── validate against GT ───────────────────────────────────────────────
-        data     = np.load(npz_path)
-        n_stored = data["relative_transforms"].shape[0]
-        N        = min(len(images), n_stored)
-
-        if N < 2:
-            raise RuntimeError(
-                f"Sample {idx} (id={entry.get('id')}) has only {N} valid "
-                f"images after loading; skipping. Check image paths."
-            )
-
-        images = images[:N]
-
-        # ── GT transforms (skipped in no_pose ablation mode) ─────────────────
-        if self.no_pose:
-            gt_transforms = None
-        else:
-            rel_transforms = torch.tensor(
-                data["relative_transforms"][:N, :N], dtype=torch.float32
-            )  # (N, N, 4, 4)
-
-            # All ordered pairs (i, j) with i≠j — A(N,2) = N*(N-1) pairs
-            pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-
-            # GT: T_{i→j} for every ordered pair
-            gt_transforms = torch.stack(
-                [rel_transforms[i, j] for (i, j) in pairs], dim=0
-            )  # (N*(N-1), 4, 4)
-
-        # ── build multi-image prompt ──────────────────────────────────────────
-        content: list = []
-        for img in images:
-            content.append({"type": "image", "image": img})
-
-        pose_sentences = []
-        if not self.no_pose:
-            pose_sentences = [
-                f"The camera pose of image {j + 1} relative to image {i + 1} is "
-                f"{POSE_TOKEN}."
-                for (i, j) in pairs
-            ]
-            content.append({"type": "text", "text": " ".join(pose_sentences)})
-
-        # ── build prompt (plus / no_pose modes append QA for LM loss) ────────
-        # Extract question/answer from conversations list (ShareGPT format)
-        # or from flat "question"/"answer" fields.
-        _convs = entry.get("conversations", [])
-        _question = (
-            entry.get("question")
-            or next((c["value"] for c in _convs if c.get("from") == "human"), None)
-        )
-        _answer = (
-            entry.get("answer")
-            or next((c["value"] for c in _convs if c.get("from") == "gpt"), None)
-        )
-
-        labels = None
-        if (self.plus or self.no_pose) and _question and _answer:
-            question = _question
-            answer   = _answer
-            qa_content = list(content)
-            if self.no_pose:
-                # No pose sentences — just append the question
-                qa_content.append({"type": "text", "text": question})
-            else:
-                # Replace the last text element to include the question
-                qa_content[-1] = {
-                    "type": "text",
-                    "text": " ".join(pose_sentences) + " " + question,
-                }
-            # Full conversation with assistant answer
-            text_full = self.processor.apply_chat_template(
-                [{"role": "user", "content": qa_content},
-                 {"role": "assistant", "content": answer}],
-                tokenize=False, add_generation_prompt=False,
-            )
-            proc_out = self.processor(
-                text=[text_full], images=images,
-                return_tensors="pt", padding=False,
-            )
-            # Supervise only the answer tokens at the tail of the sequence.
-            # Mask everything before (including the <think> block) so the
-            # model's reasoning behaviour is not suppressed.
-            # <|im_end|> is a special token so suffix tokenisation is stable.
-            suffix_ids = self.processor.tokenizer(
-                answer + "<|im_end|>\n", add_special_tokens=False
-            )["input_ids"]
-            suffix_len = len(suffix_ids)
-            labels = proc_out["input_ids"].clone()
-            labels[0, :-suffix_len] = -100          # mask all except answer tokens
-        else:
-            messages = [{"role": "user", "content": content}]
-            prompt_text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
-            )
-            # ── tokenise + encode images ──────────────────────────────────────
-            proc_out = self.processor(
-                text   = [prompt_text],
-                images = images,
-                return_tensors = "pt",
-                padding        = False,
-            )
-
-        # ── 3D position maps ──────────────────────────────────────────────────
-        # Load per-pixel XYZ from 3D_pos file and downsample to the LLM patch
-        # grid resolution consumed by get_rope_index() as image_xyz.
-        # Each element: (llm_H_i, llm_W_i, 3) where
-        #   llm_H_i = grid_thw[i,1] // spatial_merge_size
-        #   llm_W_i = grid_thw[i,2] // spatial_merge_size
-        image_xyz = None
-        if p3d_path is not None:
-            try:
-                d3d   = np.load(p3d_path)
-                thw_all = proc_out["image_grid_thw"]          # (N, 3)
-                sms     = self.spatial_merge_size
-                xyz_list = []
-                n_3d = int(d3d["n_frames"])
-                for k in range(min(N, n_3d)):
-                    xyz_raw   = d3d[f"frame_{k}_xyz"]         # (H_img, W_img, 3)
-                    valid_raw = d3d.get(f"frame_{k}_valid")   # (H_img, W_img) bool | None
-                    thw_k     = thw_all[k]                    # (T, H, W) patch units
-                    llm_h     = int(thw_k[1]) // sms
-                    llm_w     = int(thw_k[2]) // sms
-                    xyz_list.append(resize_xyz(xyz_raw, llm_h, llm_w, valid=valid_raw))
-                # Pad missing frames with zeros if needed
-                for k in range(len(xyz_list), N):
-                    thw_k = thw_all[k]
-                    llm_h = int(thw_k[1]) // sms
-                    llm_w = int(thw_k[2]) // sms
-                    xyz_list.append(torch.zeros(llm_h, llm_w, 3))
-                image_xyz = xyz_list                          # list of N tensors
-            except Exception as exc:
-                log.debug(f"3D_pos load failed for {p3d_path}: {exc}")
-                image_xyz = None
-
-        return {
-            **proc_out,                      # input_ids, attention_mask,
-                                             # pixel_values, image_grid_thw …
-            "gt_transforms": gt_transforms,  # (N*(N-1), 4, 4)
-            "image_xyz":     image_xyz,      # list of (llm_H, llm_W, 3) or None
-            "labels":        labels,         # (1, seq_len) for plus mode, else None
-        }
-
-
 def collate_fn(batch):
     """
     Identity collation for batch_size=1.
@@ -801,7 +98,6 @@ def collate_fn(batch):
 
 
 # ── model building ────────────────────────────────────────────────────────────
-
 def build_model(
     model_path:    str,
     pose_token_id: int,
@@ -982,12 +278,13 @@ def train(args: argparse.Namespace) -> None:
 
     # ── dataset / loader ──────────────────────────────────────────────────────
     _no_pose = args.ablation is not None
-    dataset = SPARDataset(
+    train_dataset = Train_Dataset(
         json_path           = args.json_path,
         spar_root           = SPAR_ROOT,
         reconstruct_dir     = RECONSTRUCT_DIR,
         processor           = processor,
         pose_token_id       = pose_token_id,
+        log                 = log,
         max_images          = args.max_images,
         pos3d_dir           = args.pos3d_dir,
         spatial_merge_size  = spatial_merge_size,
@@ -995,30 +292,83 @@ def train(args: argparse.Namespace) -> None:
         plus                = args.plus or _no_pose,
         no_pose             = _no_pose,
     )
-    sampler = (
-        DistributedSampler(dataset, num_replicas=world_size,
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size,
                            rank=local_rank, shuffle=True)
         if world_size > 1 else None
     )
-    loader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size  = 1,
-        shuffle     = (sampler is None),
+        shuffle     = (train_sampler is None),
         num_workers = args.num_workers,
         collate_fn  = collate_fn,
-        sampler     = sampler,
+        sampler     = train_sampler,
     )
+
+    # ── test datasets (for periodic LM loss evaluation) ────────────────────
+    _eval_dir = os.path.join(_ROOT, "datasets/evaluation")
+    test_loaders = {}
+    test_samplers = {}
+    for _ds_name, _ds_dir in [
+        ("mindcube",             os.path.join(_eval_dir, "MindCube")),
+        ("sparbench_multi_view", os.path.join(_eval_dir, "SPARBench")),
+    ]:
+        try:
+            raw_samples = load_testing_dataset(data_dir=_ds_dir, dataset=_ds_name)
+            ds = Eval_Dataset(raw_samples, processor)
+            _eval_sampler = (
+                DistributedSampler(ds, num_replicas=world_size,
+                                   rank=local_rank, shuffle=False)
+                if world_size > 1 else None
+            )
+            test_loaders[_ds_name] = DataLoader(
+                ds, batch_size=1, shuffle=False,
+                num_workers=args.num_workers, collate_fn=collate_fn,
+                sampler=_eval_sampler,
+            )
+            test_samplers[_ds_name] = _eval_sampler
+            log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
+        except Exception as exc:
+            log.warning(f"Failed to load eval dataset '{_ds_name}': {exc}")
+
 
     # ── optimiser ─────────────────────────────────────────────────────────────
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
-    total_steps = args.epochs * len(loader) // args.grad_accum
+    total_steps = args.epochs * len(train_loader) // args.grad_accum
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1)
     )
 
-    if local_rank == 0:
-        os.makedirs(args.output_dir, exist_ok=True)
+    # Create output directory (all ranks can do this safely with exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # ── logging to file ───────────────────────────────────────────────────────
+    # Per-rank log file (all ranks)
+    rank_log_file = os.path.join(
+        args.output_dir,
+        f"train_rank{local_rank}.log" if world_size > 1 else "train.log"
+    )
+    rank_handler = logging.FileHandler(rank_log_file, mode="w", encoding="utf-8")
+    rank_handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    log.addHandler(rank_handler)
+
+    # Aggregate log file (rank 0 only, for multi-GPU)
+    if world_size > 1 and local_rank == 0:
+        summary_log_file = os.path.join(args.output_dir, "train.log")
+        summary_handler = logging.FileHandler(summary_log_file, mode="w", encoding="utf-8")
+        summary_handler.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)s  %(message)s",
+            datefmt="%H:%M:%S"
+        ))
+        log.addHandler(summary_handler)
+        rank0_print(f"Per-rank logs: train_rank*.log  |  Summary log: {summary_log_file}")
+    else:
+        rank0_print(f"Logging to {rank_log_file}")
 
     # ── WandB (rank 0 only) ───────────────────────────────────────────────────
     use_wandb = _WANDB_AVAILABLE and args.wandb_project and local_rank == 0
@@ -1040,10 +390,10 @@ def train(args: argparse.Namespace) -> None:
     optimizer.zero_grad()
 
     for epoch in range(args.epochs):
-        if sampler is not None:
-            sampler.set_epoch(epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
-        for step, batch in enumerate(loader):
+        for step, batch in enumerate(train_loader):
 
             # ── move batch to device ──────────────────────────────────────────
             input_ids      = batch["input_ids"].to(device)
@@ -1102,23 +452,35 @@ def train(args: argparse.Namespace) -> None:
                 optimizer.zero_grad()
                 global_step += 1
 
+                avg_loss = running_loss / args.grad_accum
+                avg_loss_dict = {
+                    k: v / args.grad_accum
+                    for k, v in running_loss_dict.items()
+                }
+                running_loss = 0.0
+                running_loss_dict.clear()
+
+                # All-reduce training losses across ranks
+                if world_size > 1:
+                    _loss_keys = sorted(avg_loss_dict.keys())
+                    _loss_vals = [avg_loss] + [avg_loss_dict[k] for k in _loss_keys]
+                    _loss_t = torch.tensor(_loss_vals, dtype=torch.float64, device=device)
+                    dist.all_reduce(_loss_t, op=dist.ReduceOp.SUM)
+                    _loss_t /= world_size
+                    avg_loss = _loss_t[0].item()
+                    avg_loss_dict = {k: _loss_t[i + 1].item() for i, k in enumerate(_loss_keys)}
+
                 if local_rank == 0:
-                    avg_loss = running_loss / args.grad_accum
-                    avg_loss_dict = {
-                        k: v / args.grad_accum
-                        for k, v in running_loss_dict.items()
-                    }
-                    running_loss = 0.0
-                    running_loss_dict.clear()
                     current_lr = scheduler.get_last_lr()[0]
                     detail = "  ".join(
                         f"{k}={v:.4f}" for k, v in avg_loss_dict.items()
                     )
                     log.info(
-                        f"epoch={epoch+1:02d}  step={global_step:05d}  "
+                        f"[train] epoch={epoch+1:02d}  global_step={global_step:05d}  "
                         f"loss={avg_loss:.4f}"
                         + (f"  ({detail})" if detail else "")
-                        + f"  lr={current_lr:.2e}"
+                        + f"  lr={current_lr:.2e}  "
+                        f"(aggregated across {world_size} GPU{'s' if world_size > 1 else ''})"
                     )
                     if use_wandb:
                         wandb.log(
@@ -1135,9 +497,75 @@ def train(args: argparse.Namespace) -> None:
                     if global_step % args.save_steps == 0:
                         _save_checkpoint(_model, tokenizer, args.output_dir,
                                          global_step)
-                else:
-                    running_loss = 0.0
-                    running_loss_dict.clear()
+
+                # ── periodic evaluation on test sets ──────────────────────────
+                if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
+                    model.eval()
+                    _spa = _model.spa_model if hasattr(_model, 'spa_model') else _model
+                    for ds_name, loader in test_loaders.items():
+                        if ds_name in test_samplers and test_samplers[ds_name] is not None:
+                            test_samplers[ds_name].set_epoch(global_step)
+                        local_loss_sum = 0.0
+                        local_count = 0
+                        for test_batch in loader:
+                            t_ids   = test_batch["input_ids"].to(device)
+                            t_mask  = test_batch["attention_mask"].to(device)
+                            t_pv    = test_batch.get("pixel_values")
+                            t_thw   = test_batch.get("image_grid_thw")
+                            t_labels = test_batch.get("labels")
+                            if t_pv is not None:
+                                t_pv = t_pv.to(device, dtype=torch.bfloat16)
+                            if t_thw is not None:
+                                t_thw = t_thw.to(device)
+                            if t_labels is not None:
+                                t_labels = t_labels.to(device)
+                            try:
+                                with torch.no_grad():
+                                    out = _spa(
+                                        input_ids=t_ids, attention_mask=t_mask,
+                                        pixel_values=t_pv, image_grid_thw=t_thw,
+                                        return_dict=True,
+                                    )
+                                    logits = out.logits
+                                    shift_logits = logits[..., :-1, :].contiguous()
+                                    shift_labels = t_labels[..., 1:].contiguous()
+                                    lm_loss = F.cross_entropy(
+                                        shift_logits.view(-1, shift_logits.size(-1)),
+                                        shift_labels.view(-1),
+                                        ignore_index=-100,
+                                    )
+                                    local_loss_sum += lm_loss.item()
+                                    local_count += 1
+                            except Exception as exc:
+                                log.debug(f"Eval skip ({ds_name}): {exc}")
+                                continue
+
+                        # Aggregate across all ranks
+                        if world_size > 1:
+                            stats = torch.tensor(
+                                [local_loss_sum, local_count],
+                                dtype=torch.float64, device=device,
+                            )
+                            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                            total_loss = stats[0].item()
+                            total_count = int(stats[1].item())
+                        else:
+                            total_loss = local_loss_sum
+                            total_count = local_count
+
+                        if total_count > 0 and local_rank == 0:
+                            avg = total_loss / total_count
+                            log.info(
+                                f"[eval] global_step={global_step:05d}  "
+                                f"{ds_name}_lm_loss={avg:.4f}  "
+                                f"(n={total_count} samples, aggregated across {world_size} GPU{'s' if world_size > 1 else ''})"
+                            )
+                            if use_wandb:
+                                wandb.log(
+                                    {f"eval/{ds_name}_lm_loss": avg},
+                                    step=global_step,
+                                )
+                    model.train()
 
     # Final checkpoint (rank 0 only)
     if local_rank == 0:
@@ -1201,6 +629,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_accum",   type=int,   default=8,
                    help="Gradient accumulation steps")
     p.add_argument("--save_steps",   type=int,   default=200)
+    p.add_argument("--eval_steps",   type=int,   default=100)
     p.add_argument("--num_workers",  type=int,   default=4)
     p.add_argument("--max_samples",  type=int,   default=None,
                    help="Truncate dataset to this many samples (None = use all)")
