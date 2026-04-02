@@ -1,0 +1,3 @@
+{"problem": "Look at the following four people:\nA. <image>\nB. <image>\nC. <image>\nD. <image>\nWhich image shows a different person?\nOnly answer with the capital letter from (A, B, C, D).", "answer": "C", "images": ["images/face_rotation_1e13a87d8a.jpg", "images/face_rotation_2579b8775b.jpg", "images/face_rotation_1b87d17b74.jpg", "images/face_rotation_ebae9f510d.jpg"], "metadata": {"task_type": "face_identity_quartet_interleaved", "dataset_type": "faces", "person_ids": ["037", "037", "040", "037"], "angles": [0, 45, 90, 90], "distractor_position": 2, "distractor_person_id": "040", "same_person_id": "037", "num_same_views": 3, "correct_answer_text": "Image C"}, "id": "0ab6e06c2826"}
+
+question category: face_identity_quartet_interleaved

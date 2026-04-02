@@ -17,7 +17,8 @@
 #                 "mindcube,mmsibench"
 #               Available: mindcube  mmsibench  sparbench_multi_view
 #                          sparbench_single_view  sparbench_mv  sat_real
-#               Default: all five datasets
+#                          spinbench
+#               Default: all datasets
 #   --gpus      comma-separated GPU IDs, e.g. "0,1,2,3"
 #               Default: auto-detect all available GPUs
 #   --limit     truncate each dataset to N samples (debug / smoke test)
@@ -77,7 +78,7 @@ THINKING=""
 MAX_NEW_TOKENS=512
 
 # All supported datasets (in evaluation order)
-ALL_DATASETS="mindcube mmsibench sparbench_multi_view sparbench_single_view sat_real"
+ALL_DATASETS="mindcube mmsibench sparbench_multi_view sparbench_single_view sat_real spinbench"
 
 # Dataset → data_dir mapping (relative to SPATIAL_DIR)
 declare -A DATASET_DIR
@@ -87,6 +88,7 @@ DATASET_DIR["sparbench_multi_view"]="datasets/evaluation/SPARBench"
 DATASET_DIR["sparbench_single_view"]="datasets/evaluation/SPARBench"
 DATASET_DIR["sparbench_mv"]="datasets/evaluation/SPARBench"
 DATASET_DIR["sat_real"]="datasets/evaluation/SAT"
+DATASET_DIR["spinbench"]="datasets/evaluation/spinbench_data"
 
 # =============================================================================
 # Parse arguments

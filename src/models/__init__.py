@@ -5,3 +5,7 @@ from .correspondence_llm import (
 )
 from .answer_llm import AnswerOnlyModel
 from .spa_emb import SpaForConditionalGeneration
+from .coordinate_llm import (
+    CoordinateRegressionHead,
+    CoordinatePlusModel,
+)

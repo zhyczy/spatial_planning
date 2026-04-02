@@ -35,11 +35,65 @@ SPAR_ROOT = os.path.join(
 )
 RECONSTRUCT_DIR = os.path.join(SPAR_ROOT, "reconstruct")
 POS3D_DIR       = os.path.join(SPAR_ROOT, "3D_pos")
-POSE_TOKEN = "<pose>"
+POSE_TOKEN  = "<pose>"
+COORD_TOKEN = "<coord>"
 
-# ── dataset ───────────────────────────────────────────────────────────────────
 
-class Train_Dataset(Dataset):
+# ── 3D coordinate helper ──────────────────────────────────────────────────────
+
+def resize_xyz(
+    xyz:      np.ndarray,
+    target_h: int,
+    target_w: int,
+    valid:    np.ndarray | None = None,
+) -> torch.Tensor:
+    """
+    Compute the mean 3D position of all valid pixels within each LLM patch.
+
+    Args:
+        xyz:      (H, W, 3) float  — per-pixel XYZ map (any float dtype)
+        target_h: output patch rows (= image_grid_thw[1] // spatial_merge_size)
+        target_w: output patch cols (= image_grid_thw[2] // spatial_merge_size)
+        valid:    (H, W) bool mask — True where XYZ is reliable;
+                  if None all pixels are treated as valid
+
+    Returns:
+        (target_h, target_w, 3) float32 tensor; patches with no valid pixels
+        are set to zero.
+    """
+    H, W = xyz.shape[:2]
+    xyz_f = xyz.astype(np.float32)                     # (H, W, 3)
+
+    if valid is None:
+        valid = np.ones((H, W), dtype=bool)
+
+    # Stride per LLM patch (integer division; crop any remainder)
+    stride_h = H // target_h
+    stride_w = W // target_w
+    H_crop   = target_h * stride_h
+    W_crop   = target_w * stride_w
+    xyz_f    = xyz_f[:H_crop, :W_crop]                 # (H_crop, W_crop, 3)
+    valid    = valid[:H_crop, :W_crop].astype(np.float32)  # (H_crop, W_crop)
+
+    # Reshape into patch blocks
+    # (target_h, stride_h, target_w, stride_w, 3)
+    xyz_blocks   = xyz_f.reshape(target_h, stride_h, target_w, stride_w, 3)
+    valid_blocks = valid.reshape(target_h, stride_h, target_w, stride_w)
+
+    # Masked sum → mean over the stride_h × stride_w pixel block per patch
+    xyz_sum   = (xyz_blocks * valid_blocks[..., None]).sum(axis=(1, 3))  # (th, tw, 3)
+    valid_cnt = valid_blocks.sum(axis=(1, 3))                            # (th, tw)
+
+    denom    = np.maximum(valid_cnt, 1)[..., None]     # avoid ÷0
+    xyz_mean = xyz_sum / denom                         # (target_h, target_w, 3)
+    xyz_mean[valid_cnt == 0] = 0.0                     # patches with no valid px
+
+    return torch.from_numpy(xyz_mean)                  # (target_h, target_w, 3)
+
+
+# ── SPAR training dataset ───────────────────────────────────────────────────────────────────
+
+class SPAR_Train_Dataset(Dataset):
     """
     One sample = one SPAR scene entry.
 
@@ -272,56 +326,224 @@ class Train_Dataset(Dataset):
         }
 
 
-# ── 3D coordinate helper ──────────────────────────────────────────────────────
-
-def resize_xyz(
-    xyz:      np.ndarray,
-    target_h: int,
-    target_w: int,
-    valid:    np.ndarray | None = None,
-) -> torch.Tensor:
+class SPAR_Train_Dataset_Coord(Dataset):
     """
-    Compute the mean 3D position of all valid pixels within each LLM patch.
-
-    Args:
-        xyz:      (H, W, 3) float  — per-pixel XYZ map (any float dtype)
-        target_h: output patch rows (= image_grid_thw[1] // spatial_merge_size)
-        target_w: output patch cols (= image_grid_thw[2] // spatial_merge_size)
-        valid:    (H, W) bool mask — True where XYZ is reliable;
-                  if None all pixels are treated as valid
-
-    Returns:
-        (target_h, target_w, 3) float32 tensor; patches with no valid pixels
-        are set to zero.
+    Dataset for coordinate training.  Every sample must have a QA pair and a
+    3D position map (pos3d_dir).  Samples missing either are skipped at init.
     """
-    H, W = xyz.shape[:2]
-    xyz_f = xyz.astype(np.float32)                     # (H, W, 3)
 
-    if valid is None:
-        valid = np.ones((H, W), dtype=bool)
+    def __init__(
+        self,
+        json_path:           str,
+        spar_root:           str,
+        reconstruct_dir:     str,
+        processor,
+        pose_token_id:       int,
+        max_images:          int = 4,
+        pos3d_dir:           str | None = None,
+        spatial_merge_size:  int = 2,
+        coord_upscale:       int = 4,
+        max_samples:         int | None = None,
+    ):
+        import json
+        with open(json_path) as fh:
+            entries = json.load(fh)
 
-    # Stride per LLM patch (integer division; crop any remainder)
-    stride_h = H // target_h
-    stride_w = W // target_w
-    H_crop   = target_h * stride_h
-    W_crop   = target_w * stride_w
-    xyz_f    = xyz_f[:H_crop, :W_crop]                 # (H_crop, W_crop, 3)
-    valid    = valid[:H_crop, :W_crop].astype(np.float32)  # (H_crop, W_crop)
+        self.samples = []
+        for e in entries:
+            eid = e.get("id", "")
+            npz = os.path.join(reconstruct_dir, f"{eid}.npz")
+            if not (os.path.exists(npz) and e.get("image")):
+                continue
+            if pos3d_dir is not None:
+                p3d = os.path.join(pos3d_dir, f"{eid}.npz")
+                if not os.path.exists(p3d):
+                    continue
+            else:
+                p3d = None
+            self.samples.append((e, npz, p3d))
 
-    # Reshape into patch blocks
-    # (target_h, stride_h, target_w, stride_w, 3)
-    xyz_blocks   = xyz_f.reshape(target_h, stride_h, target_w, stride_w, 3)
-    valid_blocks = valid.reshape(target_h, stride_h, target_w, stride_w)
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
 
-    # Masked sum → mean over the stride_h × stride_w pixel block per patch
-    xyz_sum   = (xyz_blocks * valid_blocks[..., None]).sum(axis=(1, 3))  # (th, tw, 3)
-    valid_cnt = valid_blocks.sum(axis=(1, 3))                            # (th, tw)
+        self.spar_root          = spar_root
+        self.processor          = processor
+        self.pose_token_id      = pose_token_id
+        self.max_images         = max_images
+        self.pos3d_dir          = pos3d_dir
+        self.spatial_merge_size = spatial_merge_size
+        self.coord_upscale      = coord_upscale
+        log.info(f"SPARDataset: {len(self.samples)} valid entries "
+                 f"(out of {len(entries)} total)")
 
-    denom    = np.maximum(valid_cnt, 1)[..., None]     # avoid ÷0
-    xyz_mean = xyz_sum / denom                         # (target_h, target_w, 3)
-    xyz_mean[valid_cnt == 0] = 0.0                     # patches with no valid px
+    def __len__(self):
+        return len(self.samples)
 
-    return torch.from_numpy(xyz_mean)                  # (target_h, target_w, 3)
+    def __getitem__(self, idx):
+        entry, npz_path, p3d_path = self.samples[idx]
+
+        # ── load images ───────────────────────────────────────────────────────
+        images = []
+        for rel in entry["image"]:
+            scene_id = _scene_id_from_path(rel)
+            dataset  = detect_dataset(scene_id)
+            full = os.path.join(self.spar_root, dataset, "images", rel)
+            try:
+                images.append(Image.open(full).convert("RGB"))
+            except (FileNotFoundError, OSError):
+                break
+            if len(images) == self.max_images:
+                break
+
+        # ── validate against GT ───────────────────────────────────────────────
+        data     = np.load(npz_path)
+        n_stored = data["relative_transforms"].shape[0]
+        N        = min(len(images), n_stored)
+
+        if N < 2:
+            raise RuntimeError(
+                f"Sample {idx} (id={entry.get('id')}) has only {N} valid "
+                f"images after loading; skipping."
+            )
+
+        images = images[:N]
+
+        rel_transforms = torch.tensor(
+            data["relative_transforms"][:N, :N], dtype=torch.float32
+        )  # (N, N, 4, 4)
+
+        pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
+        gt_transforms = torch.stack(
+            [rel_transforms[i, j] for (i, j) in pairs], dim=0
+        )  # (N*(N-1), 4, 4)
+
+        # ── build multi-image prompt ──────────────────────────────────────────
+        content: list = []
+        for img in images:
+            content.append({"type": "image", "image": img})
+
+        pose_sentences = [
+            f"The camera pose of image {j + 1} relative to image {i + 1} is "
+            f"{POSE_TOKEN}."
+            for (i, j) in pairs
+        ]
+
+        # ── QA prompt ─────────────────────────────────────────────────────────
+        _convs    = entry.get("conversations", [])
+        _question = (
+            entry.get("question")
+            or next((c["value"] for c in _convs if c.get("from") == "human"), None)
+        )
+        _answer   = (
+            entry.get("answer")
+            or next((c["value"] for c in _convs if c.get("from") == "gpt"), None)
+        )
+
+        if not (_question and _answer):
+            raise RuntimeError(
+                f"Sample {idx} (id={entry.get('id')}) has no QA pair."
+            )
+
+        # ── Probe image_grid_thw first (to know patch counts per image) ────────
+        # Build a temporary prompt with pose but no coord, process to get thw
+        content_probe = list(content)
+        content_probe.append({
+            "type": "text",
+            "text": " ".join(pose_sentences) + " " + _question,
+        })
+        text_probe = self.processor.apply_chat_template(
+            [{"role": "user", "content": content_probe}],
+            tokenize=False, add_generation_prompt=False,
+        )
+        proc_probe = self.processor(
+            text=[text_probe], images=images,
+            return_tensors="pt", padding=False,
+        )
+        thw_all = proc_probe["image_grid_thw"]  # (N, 3)
+        sms = self.spatial_merge_size
+
+        # ── Build coord sentences (one token per LLM patch) ────────────────────
+        coord_sentences = []
+        for k in range(N):
+            llm_h = int(thw_all[k][1]) // sms
+            llm_w = int(thw_all[k][2]) // sms
+            n_tok = llm_h * llm_w
+            coord_tokens = " ".join([COORD_TOKEN] * n_tok)
+            coord_sentences.append(
+                f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
+            )
+
+        # ── Build final prompt with dense coord tokens ──────────────────────────
+        content.append({
+            "type": "text",
+            "text": (
+                " ".join(pose_sentences)
+                + " "
+                + " ".join(coord_sentences)
+                + " "
+                + _question
+            ),
+        })
+        text_full = self.processor.apply_chat_template(
+            [{"role": "user",      "content": content},
+             {"role": "assistant", "content": _answer}],
+            tokenize=False, add_generation_prompt=False,
+        )
+        proc_out = self.processor(
+            text=[text_full], images=images,
+            return_tensors="pt", padding=False,
+        )
+        # Supervise only the answer tokens (tail of sequence).
+        # Mask everything before — including <think> block — so the model's
+        # reasoning behaviour is not suppressed.
+        suffix_ids = self.processor.tokenizer(
+            _answer + "<|im_end|>\n", add_special_tokens=False
+        )["input_ids"]
+        labels = proc_out["input_ids"].clone()
+        labels[0, :-len(suffix_ids)] = -100
+
+        # ── 3D position maps ──────────────────────────────────────────────────
+        # image_xyz:       patch-level (llm_h, llm_w, 3) — used for 4D M-RoPE
+        # image_xyz_hires: sub-pixel   (llm_h*up, llm_w*up, 3) — used for coord loss
+        image_xyz = None
+        image_xyz_hires = None
+        if p3d_path is not None:
+            try:
+                d3d     = np.load(p3d_path)
+                thw_all = proc_out["image_grid_thw"]   # (N, 3)
+                sms     = self.spatial_merge_size
+                up      = self.coord_upscale
+                xyz_list = []
+                xyz_hires_list = []
+                n_3d = int(d3d["n_frames"])
+                for k in range(min(N, n_3d)):
+                    xyz_raw   = d3d[f"frame_{k}_xyz"]
+                    valid_raw = d3d.get(f"frame_{k}_valid")
+                    thw_k     = thw_all[k]
+                    llm_h     = int(thw_k[1]) // sms
+                    llm_w     = int(thw_k[2]) // sms
+                    xyz_list.append(resize_xyz(xyz_raw, llm_h, llm_w, valid=valid_raw))
+                    xyz_hires_list.append(resize_xyz(xyz_raw, llm_h * up, llm_w * up, valid=valid_raw))
+                for k in range(len(xyz_list), N):
+                    thw_k = thw_all[k]
+                    llm_h = int(thw_k[1]) // sms
+                    llm_w = int(thw_k[2]) // sms
+                    xyz_list.append(torch.zeros(llm_h, llm_w, 3))
+                    xyz_hires_list.append(torch.zeros(llm_h * up, llm_w * up, 3))
+                image_xyz = xyz_list
+                image_xyz_hires = xyz_hires_list
+            except Exception as exc:
+                log.debug(f"3D_pos load failed for {p3d_path}: {exc}")
+                image_xyz = None
+                image_xyz_hires = None
+
+        return {
+            **proc_out,
+            "gt_transforms": gt_transforms,
+            "image_xyz":     image_xyz,
+            "image_xyz_hires": image_xyz_hires,
+            "labels":        labels,
+        }
 
 
 # ── MindCube training dataset ─────────────────────────────────────────────────
@@ -518,4 +740,215 @@ class MindCube_Train_Dataset(Dataset):
             "gt_transforms": gt_transforms,
             "image_xyz":     image_xyz,
             "labels":        labels,
+        }
+
+
+class MindCube_Train_Dataset_Coord(Dataset):
+    """
+    MindCube training dataset with coordinate prediction support.
+
+    Extends MindCube_Train_Dataset by:
+      - Inserting <coord> tokens (one per LLM patch per image) into the prompt
+      - Computing both patch-level image_xyz (for 4D M-RoPE) and
+        sub-pixel image_xyz_hires (for PixelShuffle coord loss)
+      - Always including QA supervision (like plus mode)
+    """
+
+    def __init__(
+        self,
+        jsonl_path:         str,
+        results_dir:        str,
+        processor,
+        pose_token_id:      int,
+        coord_token_id:     int,
+        log,
+        max_images:         int = 4,
+        spatial_merge_size: int = 2,
+        coord_upscale:      int = 4,
+        max_samples:        int | None = None,
+    ):
+        import json
+        raw = []
+        with open(jsonl_path) as fh:
+            for line in fh:
+                if line.strip():
+                    raw.append(json.loads(line))
+
+        self.samples = []
+        for entry in raw:
+            eid = entry.get("id", "")
+            sample_dir = os.path.join(results_dir, eid)
+            if not os.path.isdir(sample_dir):
+                continue
+            self.samples.append((entry, sample_dir))
+
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
+
+        self.processor          = processor
+        self.pose_token_id      = pose_token_id
+        self.coord_token_id     = coord_token_id
+        self.max_images         = max_images
+        self.spatial_merge_size = spatial_merge_size
+        self.coord_upscale      = coord_upscale
+        self.log = log
+        log.info(
+            f"MindCube_Train_Dataset_Coord: {len(self.samples)} valid entries "
+            f"(out of {len(raw)} total) from {jsonl_path}"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        entry, sample_dir = self.samples[idx]
+
+        # ── load images and per-pixel xyz ─────────────────────────────────────
+        view_dirs = sorted(
+            d for d in os.listdir(sample_dir) if d.startswith("view_")
+        )
+        images, xyz_raw_list, mask_raw_list = [], [], []
+        for vd in view_dirs[: self.max_images]:
+            img_path = os.path.join(sample_dir, vd, "image.png")
+            try:
+                images.append(Image.open(img_path).convert("RGB"))
+            except (FileNotFoundError, OSError):
+                break
+            pts3d_path = os.path.join(sample_dir, vd, "pts3d.npy")
+            mask_path  = os.path.join(sample_dir, vd, "mask.npy")
+            xyz_raw_list.append(
+                np.load(pts3d_path).astype(np.float32)
+                if os.path.exists(pts3d_path) else None
+            )
+            mask_raw_list.append(
+                np.load(mask_path) if os.path.exists(mask_path) else None
+            )
+
+        N = len(images)
+        if N < 2:
+            raise RuntimeError(
+                f"MindCube sample {idx} (id={entry.get('id')}) has only {N} "
+                f"valid images; need >= 2."
+            )
+
+        # ── load camera poses and compute relative transforms ─────────────────
+        poses = []
+        for vd in view_dirs[:N]:
+            cp_path = os.path.join(sample_dir, vd, "camera_pose.npy")
+            poses.append(np.load(cp_path).astype(np.float64))  # (4, 4)
+
+        pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
+        rel_list = []
+        for i, j in pairs:
+            T = np.linalg.inv(poses[j]) @ poses[i]
+            rel_list.append(T)
+        gt_transforms = torch.tensor(
+            np.stack(rel_list, axis=0), dtype=torch.float32
+        )  # (N*(N-1), 4, 4)
+
+        # ── build prompt (pose + coord + QA) ──────────────────────────────────
+        content: list = [{"type": "image", "image": img} for img in images]
+
+        pose_sentences = [
+            f"The camera pose of image {j + 1} relative to image {i + 1} is "
+            f"{POSE_TOKEN}."
+            for (i, j) in pairs
+        ]
+
+        _question = entry.get("question", "")
+        _answer   = entry.get("gt_answer", "")
+
+        if not (_question and _answer):
+            raise RuntimeError(
+                f"MindCube sample {idx} (id={entry.get('id')}) has no QA pair."
+            )
+
+        # ── Probe: process without coord tokens to get image_grid_thw ─────────
+        content_probe = list(content)
+        content_probe.append({
+            "type": "text",
+            "text": " ".join(pose_sentences) + " " + _question,
+        })
+        text_probe = self.processor.apply_chat_template(
+            [{"role": "user", "content": content_probe}],
+            tokenize=False, add_generation_prompt=False,
+        )
+        proc_probe = self.processor(
+            text=[text_probe], images=images,
+            return_tensors="pt", padding=False,
+        )
+        thw_all = proc_probe["image_grid_thw"]  # (N, 3)
+        sms = self.spatial_merge_size
+
+        # ── Build coord sentences (one <coord> token per LLM patch) ───────────
+        coord_sentences = []
+        for k in range(N):
+            llm_h = int(thw_all[k][1]) // sms
+            llm_w = int(thw_all[k][2]) // sms
+            n_tok = llm_h * llm_w
+            coord_tokens = " ".join([COORD_TOKEN] * n_tok)
+            coord_sentences.append(
+                f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
+            )
+
+        # ── Build final prompt with pose + coord + QA ─────────────────────────
+        content.append({
+            "type": "text",
+            "text": (
+                " ".join(pose_sentences)
+                + " "
+                + " ".join(coord_sentences)
+                + " "
+                + _question
+            ),
+        })
+        text_full = self.processor.apply_chat_template(
+            [{"role": "user",      "content": content},
+             {"role": "assistant", "content": _answer}],
+            tokenize=False, add_generation_prompt=False,
+        )
+        proc_out = self.processor(
+            text=[text_full], images=images,
+            return_tensors="pt", padding=False,
+        )
+        # Supervise only the answer tokens
+        suffix_ids = self.processor.tokenizer(
+            _answer + "<|im_end|>\n", add_special_tokens=False
+        )["input_ids"]
+        labels = proc_out["input_ids"].clone()
+        labels[0, :-len(suffix_ids)] = -100
+
+        # ── 3D position maps (pts3d -> patch-level + sub-pixel) ───────────────
+        image_xyz = None
+        image_xyz_hires = None
+        try:
+            thw_all = proc_out["image_grid_thw"]  # (N, 3)
+            up      = self.coord_upscale
+            xyz_list = []
+            xyz_hires_list = []
+            for k in range(N):
+                xyz_raw  = xyz_raw_list[k]
+                mask_raw = mask_raw_list[k]
+                thw_k    = thw_all[k]
+                llm_h    = int(thw_k[1]) // sms
+                llm_w    = int(thw_k[2]) // sms
+                if xyz_raw is not None:
+                    xyz_list.append(resize_xyz(xyz_raw, llm_h, llm_w, valid=mask_raw))
+                    xyz_hires_list.append(resize_xyz(xyz_raw, llm_h * up, llm_w * up, valid=mask_raw))
+                else:
+                    xyz_list.append(torch.zeros(llm_h, llm_w, 3))
+                    xyz_hires_list.append(torch.zeros(llm_h * up, llm_w * up, 3))
+            image_xyz = xyz_list
+            image_xyz_hires = xyz_hires_list
+        except Exception as exc:
+            self.log.debug(f"pts3d load failed for {sample_dir}: {exc}")
+            image_xyz = None
+            image_xyz_hires = None
+
+        return {
+            **proc_out,
+            "gt_transforms":  gt_transforms,
+            "image_xyz":      image_xyz,
+            "image_xyz_hires": image_xyz_hires,
+            "labels":         labels,
         }

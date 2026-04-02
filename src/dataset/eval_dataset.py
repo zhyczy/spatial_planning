@@ -210,11 +210,36 @@ def load_testing_dataset(
                 "data_dir": str(data_dir),
             })
 
+    elif dataset == "spinbench":
+        # SPINBench — multi-view object spatial reasoning.
+        # Uses test.jsonl which includes an 'id' field matching
+        # the 3d_results/<id>/ directory for precomputed XYZ maps.
+        # Keys: problem, answer, images, metadata, id
+        jsonl_file = data_dir / "test.jsonl"
+        if not jsonl_file.exists():
+            raise FileNotFoundError(f"Dataset file not found: {jsonl_file}")
+        with open(jsonl_file, "r", encoding="utf-8") as f:
+            raw = [json.loads(line) for line in f if line.strip()]
+        if limit is not None:
+            raw = raw[:limit]
+        for item in raw:
+            image_paths = [str((data_dir / p).resolve()) for p in item.get("images", [])]
+            meta = item.get("metadata", {})
+            samples.append({
+                "index": item.get("id", len(samples)),
+                "image": image_paths,
+                "question": item.get("problem", ""),
+                "answer": item.get("answer", ""),
+                "category": meta.get("task_type", meta.get("dataset_type", "unknown")),
+                "thought": "",
+                "data_dir": str(data_dir),
+            })
+
     else:
         raise ValueError(
             f"Unknown dataset '{dataset}'. "
             "Choose: mmsibench | mindcube | sat | sat_real | vsibench | "
-            "sparbench_multi_view | sparbench_single_view | sparbench_mv"
+            "sparbench_multi_view | sparbench_single_view | sparbench_mv | spinbench"
         )
 
     return samples

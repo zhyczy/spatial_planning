@@ -82,8 +82,8 @@ fi
 RUN_NAME="correspondence_mindcube${PLUS_FLAG:+_plus}${_ablation_name}"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
-EPOCHS=3
-# EPOCHS=5
+# EPOCHS=3
+EPOCHS=9
 LR=2e-4
 LORA_RANK=16
 MAX_IMAGES=4

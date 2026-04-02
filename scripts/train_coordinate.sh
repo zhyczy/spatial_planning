@@ -49,13 +49,13 @@ MAX_SAMPLES="${2:-}"
 # =============================================================================
 
 MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
-JSON_PATH="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/train_10k.json"
-POS3D_DIR="$SPATIAL_DIR/datasets/train/SPAR_7M/spar/3D_pos"
+JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
+MINDCUBE_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
 
-RUN_NAME="coordinate"
+RUN_NAME="coordinate_mindcube"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
-EPOCHS=5
+EPOCHS=9
 LR=2e-4
 LORA_RANK=16
 MAX_IMAGES=4
@@ -66,12 +66,13 @@ SKIP_LAYERS="-1"
 CYCLE_WEIGHT=0.1
 ANSWER_WEIGHT=1.0
 COORD_WEIGHT=1.0
+COORD_UPSCALE=4
 SAVE_STEPS=500
-EVAL_STEPS=100
+EVAL_STEPS=50
 
-WANDB_PROJECT="SPI"
+WANDB_PROJECT="spc"
 WANDB_ENTITY="actmrv"
-WANDB_RUN_NAME="coord_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}_coord${COORD_WEIGHT}"
+WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}_coord${COORD_WEIGHT}"
 
 # =============================================================================
 # Setup
@@ -101,29 +102,32 @@ fi
 # Run via torchrun (DDP)
 # =============================================================================
 
-torchrun \
+TORCHRUN=/egr/research-actionlab/caizhon2/miniconda3/envs/spc/bin/torchrun
+
+$TORCHRUN \
     --nproc_per_node "$NPROC" \
     --master_port    29501 \
     train_coordinate.py \
-    --model_path     "$MODEL_PATH"     \
-    --json_path      "$JSON_PATH"      \
-    --output_dir     "$OUTPUT_DIR"     \
-    --pos3d_dir      "$POS3D_DIR"      \
-    --epochs         "$EPOCHS"         \
-    --lr             "$LR"             \
-    --lora_rank      "$LORA_RANK"      \
-    --max_images     "$MAX_IMAGES"     \
-    --grad_accum     "$GRAD_ACCUM"     \
-    --num_workers    "$NUM_WORKERS"    \
-    --skip_layers    $SKIP_LAYERS      \
-    --cycle_weight   "$CYCLE_WEIGHT"   \
-    --answer_weight  "$ANSWER_WEIGHT"  \
-    --coord_weight   "$COORD_WEIGHT"   \
-    --save_steps     "$SAVE_STEPS"     \
-    --eval_steps     "$EVAL_STEPS"     \
-    --wandb_project  "$WANDB_PROJECT"  \
-    --wandb_entity   "$WANDB_ENTITY"   \
-    --wandb_run_name "$WANDB_RUN_NAME" \
+    --model_path             "$MODEL_PATH"             \
+    --json_path              "$JSON_PATH"              \
+    --mindcube_results_dir   "$MINDCUBE_RESULTS_DIR"   \
+    --output_dir             "$OUTPUT_DIR"             \
+    --epochs                 "$EPOCHS"                 \
+    --lr                     "$LR"                     \
+    --lora_rank              "$LORA_RANK"              \
+    --max_images             "$MAX_IMAGES"             \
+    --grad_accum             "$GRAD_ACCUM"             \
+    --num_workers            "$NUM_WORKERS"            \
+    --skip_layers            $SKIP_LAYERS              \
+    --cycle_weight           "$CYCLE_WEIGHT"           \
+    --answer_weight          "$ANSWER_WEIGHT"          \
+    --coord_weight           "$COORD_WEIGHT"           \
+    --coord_upscale          "$COORD_UPSCALE"          \
+    --save_steps             "$SAVE_STEPS"             \
+    --eval_steps             "$EVAL_STEPS"             \
+    --wandb_project          "$WANDB_PROJECT"          \
+    --wandb_entity           "$WANDB_ENTITY"           \
+    --wandb_run_name         "$WANDB_RUN_NAME"         \
     $MAX_SAMPLES_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

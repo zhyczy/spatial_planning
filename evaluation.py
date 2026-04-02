@@ -66,6 +66,12 @@ import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
 
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from peft import PeftModel
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+from src.models import SpaForConditionalGeneration
+from src.dataset import load_testing_dataset, chunk_dataset
+
 # ── sys.path: ensure spatial_planning/ root is importable ──────────────────
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -99,182 +105,6 @@ EVAL_SYSTEM_PROMPT_THINKING = (
     "After your reasoning, output your final answer in the format "
     "<answer>X</answer> where X is the option letter (e.g. <answer>A</answer>)."
 )
-
-
-# ===========================================================================
-# Dataset utilities  (unchanged from previous version)
-# ===========================================================================
-
-def load_dataset(
-    data_dir: Path,
-    limit: Optional[int] = None,
-    dataset: str = "mmsibench",
-) -> List[Dict[str, Any]]:
-    """Load evaluation dataset.
-
-    Supports: mmsibench | mindcube | sat | vsibench
-    Image paths are resolved to absolute paths.
-    """
-    samples: List[Dict[str, Any]] = []
-
-    if dataset == "mmsibench":
-        json_file = data_dir / "data" / "test_data_final.json"
-        if not json_file.exists():
-            raise FileNotFoundError(
-                f"Dataset file not found: {json_file}\n"
-                "Run datasets/evaluation/MMSIBench/download.py first."
-            )
-        with open(json_file, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if limit is not None:
-            raw = raw[:limit]
-        for item in raw:
-            local_images = item.get("local_images", [])
-            image_paths = [str((data_dir / p).resolve()) for p in local_images]
-            samples.append({
-                "index": item.get("id", len(samples)),
-                "image": image_paths,
-                "question": item.get("question", ""),
-                "answer": item.get("answer", ""),
-                "category": item.get("type", "unknown"),
-                "thought": item.get("thought_gt", ""),
-                "data_dir": str(data_dir),
-            })
-
-    elif dataset == "mindcube":
-        jsonl_file = data_dir / "MindCube_tinybench.jsonl"
-        if not jsonl_file.exists():
-            raise FileNotFoundError(f"Dataset file not found: {jsonl_file}")
-        with open(jsonl_file, "r", encoding="utf-8") as f:
-            raw = [json.loads(line) for line in f if line.strip()]
-        if limit is not None:
-            raw = raw[:limit]
-        for item in raw:
-            image_paths = [str((data_dir / p).resolve()) for p in item.get("images", [])]
-            category = item.get("category", [])
-            samples.append({
-                "index": item.get("id", len(samples)),
-                "image": image_paths,
-                "question": item.get("question", ""),
-                "answer": item.get("gt_answer", ""),
-                "category": category[0] if category else "unknown",
-                "thought": "",
-                "data_dir": str(data_dir),
-            })
-
-    elif dataset in ("sat", "sat_real"):
-        # SAT (Spatial Awareness Tasks) — real image dataset.
-        # Keys: database_idx, question_type, question, answer_choices, correct_answer, img_paths
-        json_file = data_dir / "test.json"
-        if not json_file.exists():
-            raise FileNotFoundError(f"Dataset file not found: {json_file}")
-        with open(json_file, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if limit is not None:
-            raw = raw[:limit]
-        _letters = "ABCDEFGHIJ"
-        for item in raw:
-            img_paths = item.get("img_paths", item.get("images", []))
-            image_paths = [str((data_dir / p).resolve()) for p in img_paths]
-            choices = item.get("answer_choices", [])
-            correct = item.get("correct_answer", item.get("answer", ""))
-            # Format as "A. choice\nB. choice\n..." and store letter as answer
-            if choices:
-                formatted = "\n".join(
-                    f"{_letters[i]}. {c}" for i, c in enumerate(choices)
-                )
-                question_text = item.get("question", "") + "\n" + formatted
-                try:
-                    answer_letter = _letters[choices.index(correct)]
-                except ValueError:
-                    answer_letter = correct  # fallback: store raw text
-            else:
-                question_text = item.get("question", "")
-                answer_letter = correct
-            samples.append({
-                "index": item.get("database_idx", item.get("id", len(samples))),
-                "image": image_paths,
-                "question": question_text,
-                "answer": answer_letter,
-                "category": item.get("question_type", item.get("type", "unknown")),
-                "thought": "",
-                "data_dir": str(data_dir),
-            })
-
-    elif dataset == "vsibench":
-        jsonl_file = data_dir / "test.jsonl"
-        if not jsonl_file.exists():
-            raise FileNotFoundError(f"Dataset file not found: {jsonl_file}")
-        with open(jsonl_file, "r", encoding="utf-8") as f:
-            raw = [json.loads(line) for line in f if line.strip()]
-        if limit is not None:
-            raw = raw[:limit]
-        for item in raw:
-            image_paths = [str((data_dir / p).resolve()) for p in item.get("images", [])]
-            samples.append({
-                "index": item.get("id", len(samples)),
-                "image": image_paths,
-                "question": item.get("question", ""),
-                "answer": item.get("answer", item.get("gt_answer", "")),
-                "category": item.get("type", "unknown"),
-                "thought": "",
-                "data_dir": str(data_dir),
-            })
-
-    elif dataset in ("sparbench_multi_view", "sparbench_single_view", "sparbench_mv"):
-        # SPARBench — images are base64-encoded JPEG strings embedded in the JSON.
-        # Keys: id, img_type, format_type, task, source, question, answer, images
-        import base64, tempfile
-        if dataset == "sparbench_mv":
-            suffix = "mv"
-        elif dataset == "sparbench_multi_view":
-            suffix = "multi_view"
-        else:
-            suffix = "single_view"
-        json_file = data_dir / f"sparbench_{suffix}.json"
-        if not json_file.exists():
-            raise FileNotFoundError(f"Dataset file not found: {json_file}")
-        with open(json_file, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if limit is not None:
-            raw = raw[:limit]
-        # Create a single temp dir per dataset load; images persist for the process lifetime.
-        _tmp_dir = Path(tempfile.mkdtemp(prefix=f"sparbench_{suffix}_"))
-        for item in raw:
-            b64_images = item.get("images", [])
-            image_paths = []
-            item_id = item.get("id", len(samples))
-            for img_idx, b64 in enumerate(b64_images):
-                img_bytes = base64.b64decode(b64)
-                img_path = _tmp_dir / f"{item_id}_{img_idx}.jpg"
-                img_path.write_bytes(img_bytes)
-                image_paths.append(str(img_path))
-            samples.append({
-                "index": item_id,
-                "image": image_paths,
-                "question": item.get("question", ""),
-                "answer": item.get("answer", ""),
-                "category": item.get("task", "unknown"),
-                "format_type": item.get("format_type", "select"),
-                "thought": "",
-                "data_dir": str(data_dir),
-            })
-
-    else:
-        raise ValueError(
-            f"Unknown dataset '{dataset}'. "
-            "Choose: mmsibench | mindcube | sat | sat_real | vsibench | "
-            "sparbench_multi_view | sparbench_single_view | sparbench_mv"
-        )
-
-    return samples
-
-
-def chunk_dataset(dataset: List[Dict], num_shards: int) -> List[List[Dict]]:
-    if num_shards <= 1:
-        return [dataset]
-    chunk_size = math.ceil(len(dataset) / num_shards)
-    return [dataset[s : s + chunk_size] for s in range(0, len(dataset), chunk_size)]
 
 
 # ===========================================================================
@@ -378,15 +208,11 @@ def load_spa_model(
     logger = logging.getLogger(__name__)
     logger.info(f"[correspondence] Loading SPA model: base={base_model_path}  ckpt={ckpt_path}  vanilla={vanilla}")
 
-    from transformers import AutoConfig, AutoProcessor, AutoTokenizer
-    from peft import PeftModel
-
     config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
 
     if vanilla:
         # vanilla ablation: keep original 3D M-RoPE, use stock Qwen3.5 model
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
         logger.info(f"[correspondence] mrope_section: {orig_section} (original 3D M-RoPE, vanilla)")
         spa = Qwen3_5ForConditionalGeneration.from_pretrained(
             base_model_path,
@@ -396,7 +222,6 @@ def load_spa_model(
         )
     else:
         # 4D M-RoPE for normal / plus / no_cam
-        from models.spa_emb import SpaForConditionalGeneration
         section_size = sum(orig_section) // 4
         config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
         logger.info(f"[correspondence] mrope_section: {orig_section} → {[section_size]*4}")
@@ -1201,7 +1026,7 @@ def main() -> None:
             "mmsibench", "mindcube",
             "sat", "sat_real",
             "sparbench_multi_view", "sparbench_single_view", "sparbench_mv",
-            "vsibench",
+            "vsibench", "spinbench",
         ],
     )
     parser.add_argument("--data_dir", type=str, default="datasets/evaluation/MMSIBench")
@@ -1247,7 +1072,7 @@ def main() -> None:
 
     # ── load dataset ──────────────────────────────────────────────────────────
     data_dir = Path(args.data_dir).resolve()
-    dataset = load_dataset(data_dir, limit=args.limit, dataset=args.dataset)
+    dataset = load_testing_dataset(data_dir, limit=args.limit, dataset=args.dataset)
 
     # ── GPU setup ─────────────────────────────────────────────────────────────
     n_gpu = torch.cuda.device_count()
