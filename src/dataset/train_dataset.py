@@ -323,3 +323,199 @@ def resize_xyz(
 
     return torch.from_numpy(xyz_mean)                  # (target_h, target_w, 3)
 
+
+# ── MindCube training dataset ─────────────────────────────────────────────────
+
+class MindCube_Train_Dataset(Dataset):
+    """
+    Training dataset for MindCube JSONL + 3d_results structure.
+
+    Layout:
+        <results_dir>/<id>/
+            cameras.json          — list of {view, camera_pose (4×4), intrinsics}
+            view_0000/
+                image.png         — RGB image
+                pts3d.npy         — (H, W, 3) per-pixel 3D coords
+                mask.npy          — (H, W) bool valid mask
+            view_0001/ ...
+
+    Each JSONL line: { id, question, gt_answer, images, ... }
+
+    Builds the same <pose>-token prompt as Train_Dataset (SPAR).
+    relative_transform[i,j] = inv(pose_j) @ pose_i  (camera-to-world poses).
+    """
+
+    def __init__(
+        self,
+        jsonl_path:         str,
+        results_dir:        str,
+        processor,
+        pose_token_id:      int,
+        log,
+        max_images:         int = 4,
+        spatial_merge_size: int = 2,
+        max_samples:        int | None = None,
+        plus:               bool = False,
+        no_pose:            bool = False,
+    ):
+        import json
+        raw = []
+        with open(jsonl_path) as fh:
+            for line in fh:
+                if line.strip():
+                    raw.append(json.loads(line))
+
+        self.samples = []
+        for entry in raw:
+            eid = entry.get("id", "")
+            sample_dir = os.path.join(results_dir, eid)
+            if not os.path.isdir(sample_dir):
+                continue
+            self.samples.append((entry, sample_dir))
+
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
+
+        self.processor          = processor
+        self.pose_token_id      = pose_token_id
+        self.max_images         = max_images
+        self.spatial_merge_size = spatial_merge_size
+        self.plus               = plus
+        self.no_pose            = no_pose
+        self.log = log
+        log.info(
+            f"MindCube_Train_Dataset: {len(self.samples)} valid entries "
+            f"(out of {len(raw)} total) from {jsonl_path}"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        entry, sample_dir = self.samples[idx]
+
+        # ── load images and per-pixel xyz ─────────────────────────────────────
+        view_dirs = sorted(
+            d for d in os.listdir(sample_dir) if d.startswith("view_")
+        )
+        images, xyz_raw_list, mask_raw_list = [], [], []
+        for vd in view_dirs[: self.max_images]:
+            img_path = os.path.join(sample_dir, vd, "image.png")
+            try:
+                images.append(Image.open(img_path).convert("RGB"))
+            except (FileNotFoundError, OSError):
+                break
+            pts3d_path = os.path.join(sample_dir, vd, "pts3d.npy")
+            mask_path  = os.path.join(sample_dir, vd, "mask.npy")
+            xyz_raw_list.append(
+                np.load(pts3d_path).astype(np.float32)
+                if os.path.exists(pts3d_path) else None
+            )
+            mask_raw_list.append(
+                np.load(mask_path) if os.path.exists(mask_path) else None
+            )
+
+        N = len(images)
+        if N < 2:
+            raise RuntimeError(
+                f"MindCube sample {idx} (id={entry.get('id')}) has only {N} "
+                f"valid images; need ≥ 2."
+            )
+
+        # ── load camera poses and compute relative transforms ─────────────────
+        if not self.no_pose:
+            poses = []
+            for vd in view_dirs[:N]:
+                cp_path = os.path.join(sample_dir, vd, "camera_pose.npy")
+                poses.append(np.load(cp_path).astype(np.float64))  # (4, 4)
+
+            pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
+            rel_list = []
+            for i, j in pairs:
+                # T_{i→j}: transforms 3D point from camera-i to camera-j frame
+                # = inv(pose_j) @ pose_i   (pose = camera-to-world)
+                T = np.linalg.inv(poses[j]) @ poses[i]
+                rel_list.append(T)
+            gt_transforms = torch.tensor(
+                np.stack(rel_list, axis=0), dtype=torch.float32
+            )  # (N*(N-1), 4, 4)
+        else:
+            pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
+            gt_transforms = None
+
+        # ── build prompt ──────────────────────────────────────────────────────
+        content: list = [{"type": "image", "image": img} for img in images]
+
+        pose_sentences = []
+        if not self.no_pose:
+            pose_sentences = [
+                f"The camera pose of image {j + 1} relative to image {i + 1} is "
+                f"{POSE_TOKEN}."
+                for (i, j) in pairs
+            ]
+            content.append({"type": "text", "text": " ".join(pose_sentences)})
+
+        _question = entry.get("question", "")
+        _answer   = entry.get("gt_answer", "")
+
+        labels = None
+        if (self.plus or self.no_pose) and _question and _answer:
+            qa_content = list(content)
+            if self.no_pose:
+                qa_content.append({"type": "text", "text": _question})
+            else:
+                qa_content[-1] = {
+                    "type": "text",
+                    "text": " ".join(pose_sentences) + " " + _question,
+                }
+            text_full = self.processor.apply_chat_template(
+                [{"role": "user",      "content": qa_content},
+                 {"role": "assistant", "content": _answer}],
+                tokenize=False, add_generation_prompt=False,
+            )
+            proc_out = self.processor(
+                text=[text_full], images=images,
+                return_tensors="pt", padding=False,
+            )
+            suffix_ids = self.processor.tokenizer(
+                _answer + "<|im_end|>\n", add_special_tokens=False
+            )["input_ids"]
+            labels = proc_out["input_ids"].clone()
+            labels[0, :-len(suffix_ids)] = -100
+        else:
+            messages = [{"role": "user", "content": content}]
+            prompt_text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )
+            proc_out = self.processor(
+                text=[prompt_text], images=images,
+                return_tensors="pt", padding=False,
+            )
+
+        # ── 3D position maps (pts3d → patch-level xyz) ────────────────────────
+        image_xyz = None
+        try:
+            thw_all = proc_out["image_grid_thw"]  # (N, 3)
+            sms     = self.spatial_merge_size
+            xyz_list = []
+            for k in range(N):
+                xyz_raw  = xyz_raw_list[k]
+                mask_raw = mask_raw_list[k]
+                thw_k    = thw_all[k]
+                llm_h    = int(thw_k[1]) // sms
+                llm_w    = int(thw_k[2]) // sms
+                if xyz_raw is not None:
+                    xyz_list.append(resize_xyz(xyz_raw, llm_h, llm_w, valid=mask_raw))
+                else:
+                    xyz_list.append(torch.zeros(llm_h, llm_w, 3))
+            image_xyz = xyz_list
+        except Exception as exc:
+            self.log.debug(f"pts3d load failed for {sample_dir}: {exc}")
+            image_xyz = None
+
+        return {
+            **proc_out,
+            "gt_transforms": gt_transforms,
+            "image_xyz":     image_xyz,
+            "labels":        labels,
+        }

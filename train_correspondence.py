@@ -56,7 +56,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
 from src.models import AnswerOnlyModel, SpaCorrespondenceModel, CorrespondencePlusModel, PoseRegressionHead, SpaForConditionalGeneration
-from src.dataset import Train_Dataset, Eval_Dataset, load_testing_dataset
+from src.dataset import Train_Dataset, MindCube_Train_Dataset, Eval_Dataset, load_testing_dataset
 
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
@@ -278,20 +278,35 @@ def train(args: argparse.Namespace) -> None:
 
     # ── dataset / loader ──────────────────────────────────────────────────────
     _no_pose = args.ablation is not None
-    train_dataset = Train_Dataset(
-        json_path           = args.json_path,
-        spar_root           = SPAR_ROOT,
-        reconstruct_dir     = RECONSTRUCT_DIR,
-        processor           = processor,
-        pose_token_id       = pose_token_id,
-        log                 = log,
-        max_images          = args.max_images,
-        pos3d_dir           = args.pos3d_dir,
-        spatial_merge_size  = spatial_merge_size,
-        max_samples         = args.max_samples,
-        plus                = args.plus or _no_pose,
-        no_pose             = _no_pose,
-    )
+    if args.json_path.endswith(".jsonl"):
+        # MindCube JSONL format — pose regression training with 3d_results
+        train_dataset = MindCube_Train_Dataset(
+            jsonl_path         = args.json_path,
+            results_dir        = args.mindcube_results_dir,
+            processor          = processor,
+            pose_token_id      = pose_token_id,
+            log                = log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            max_samples        = args.max_samples,
+            plus               = args.plus or _no_pose,
+            no_pose            = _no_pose,
+        )
+    else:
+        train_dataset = Train_Dataset(
+            json_path           = args.json_path,
+            spar_root           = SPAR_ROOT,
+            reconstruct_dir     = RECONSTRUCT_DIR,
+            processor           = processor,
+            pose_token_id       = pose_token_id,
+            log                 = log,
+            max_images          = args.max_images,
+            pos3d_dir           = args.pos3d_dir,
+            spatial_merge_size  = spatial_merge_size,
+            max_samples         = args.max_samples,
+            plus                = args.plus or _no_pose,
+            no_pose             = _no_pose,
+        )
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
                            rank=local_rank, shuffle=True)
@@ -614,7 +629,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--json_path",
         default=os.path.join(SPAR_ROOT, "train_10k.json"),
-        help="Path to SPAR training JSON",
+        help="Path to training data: SPAR .json or MindCube .jsonl",
+    )
+    p.add_argument(
+        "--mindcube_results_dir",
+        default=os.path.join(_ROOT, "datasets/train/MindCube/3d_results"),
+        help="Directory containing per-sample 3d_results folders for MindCube training",
     )
     p.add_argument(
         "--output_dir",
