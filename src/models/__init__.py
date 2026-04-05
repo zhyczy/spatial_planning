@@ -8,4 +8,5 @@ from .spa_emb import SpaForConditionalGeneration
 from .coordinate_llm import (
     CoordinateRegressionHead,
     CoordinatePlusModel,
+    CoordinateModel,
 )

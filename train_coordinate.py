@@ -59,7 +59,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
-from src.models import CoordinateRegressionHead, CoordinatePlusModel, PoseRegressionHead, SpaForConditionalGeneration
+from src.models import CoordinateRegressionHead, CoordinatePlusModel, CoordinateModel, PoseRegressionHead, SpaForConditionalGeneration
 from src.dataset import MindCube_Train_Dataset_Coord, Eval_Dataset, load_testing_dataset
 
 logging.basicConfig(
@@ -109,11 +109,13 @@ def build_model(
     """
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
-    section_size  = sum(orig_section) // 4
-    config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
+    total = sum(orig_section)
+    xyz_size = (total - 2) // 3
+    new_section = [2, xyz_size, xyz_size, xyz_size]
+    config.text_config.rope_scaling["mrope_section"] = new_section
     log.info(
-        f"mrope_section: {orig_section} -> {[section_size]*4}  "
-        f"(4D M-RoPE for spatial tokens)"
+        f"mrope_section: {orig_section} -> {new_section}  "
+        f"(4D M-RoPE: 2 for t, {xyz_size} each for x/y/z)"
     )
 
     spa = SpaForConditionalGeneration.from_pretrained(
@@ -186,6 +188,89 @@ def build_model(
     )
 
 
+def build_coord_only_model(
+    model_path:         str,
+    coord_token_id:     int,
+    image_token_id:     int,
+    spatial_merge_size: int,
+    coord_upscale:      int = 4,
+    lora_rank:          int = 16,
+    freeze_vision:      bool = True,
+    answer_weight:      float = 1.0,
+    coord_weight:       float = 1.0,
+) -> CoordinateModel:
+    """
+    Ablation build: CoordinateModel (no pose head, no <pose> tokens needed).
+    Supervision: LM answer loss + per-patch coordinate loss only.
+    """
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
+    total = sum(orig_section)
+    xyz_size = (total - 2) // 3
+    new_section = [2, xyz_size, xyz_size, xyz_size]
+    config.text_config.rope_scaling["mrope_section"] = new_section
+    log.info(
+        f"mrope_section: {orig_section} -> {new_section}  "
+        f"(4D M-RoPE: 2 for t, {xyz_size} each for x/y/z)"
+    )
+
+    spa = SpaForConditionalGeneration.from_pretrained(
+        model_path,
+        config              = config,
+        torch_dtype         = torch.bfloat16,
+        attn_implementation = "sdpa",
+    )
+
+    old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
+    spa.resize_token_embeddings(old_vocab + 1)   # only <coord>
+    log.info(f"Embedding table: {old_vocab} -> {old_vocab + 1} (added <coord>)")
+
+    if freeze_vision:
+        for p in spa.model.visual.parameters():
+            p.requires_grad_(False)
+        log.info("Vision encoder frozen.")
+
+    lora_cfg = LoraConfig(
+        r              = lora_rank,
+        lora_alpha     = lora_rank * 2,
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_dropout = 0.05,
+        bias         = "none",
+        task_type    = TaskType.CAUSAL_LM,
+    )
+    spa = get_peft_model(spa, lora_cfg)
+    spa.print_trainable_parameters()
+
+    spa.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    lm = spa.model.model.language_model if hasattr(spa.model, 'model') else spa.model.language_model
+    gc_flag = getattr(lm, 'gradient_checkpointing', False)
+    log.info(f"Gradient checkpointing enabled. language_model.gradient_checkpointing={gc_flag}")
+    if not gc_flag:
+        lm.gradient_checkpointing = True
+        log.info("Manually set gradient_checkpointing=True on language_model")
+
+    hidden_dim = config.text_config.hidden_size
+    coord_head = CoordinateRegressionHead(
+        hidden_dim=hidden_dim, upscale_factor=coord_upscale,
+    ).to(torch.bfloat16)
+    log.info(f"CoordinateRegressionHead hidden_dim={hidden_dim} upscale={coord_upscale}")
+
+    return CoordinateModel(
+        spa_model          = spa,
+        coord_head         = coord_head,
+        coord_token_id     = coord_token_id,
+        image_token_id     = image_token_id,
+        spatial_merge_size = spatial_merge_size,
+        answer_weight      = answer_weight,
+        coord_weight       = coord_weight,
+    )
+
+
 # -- training loop -------------------------------------------------------------
 
 def train(args: argparse.Namespace) -> None:
@@ -211,13 +296,19 @@ def train(args: argparse.Namespace) -> None:
         args.model_path, trust_remote_code=True
     )
     tokenizer = processor.tokenizer
-    tokenizer.add_special_tokens(
-        {"additional_special_tokens": [POSE_TOKEN, COORD_TOKEN]}
-    )
-    pose_token_id  = tokenizer.convert_tokens_to_ids(POSE_TOKEN)
-    coord_token_id = tokenizer.convert_tokens_to_ids(COORD_TOKEN)
-    rank0_print(f"<pose>  token id = {pose_token_id}")
-    rank0_print(f"<coord> token id = {coord_token_id}")
+    if args.no_cam:
+        tokenizer.add_special_tokens({"additional_special_tokens": [COORD_TOKEN]})
+        pose_token_id  = None
+        coord_token_id = tokenizer.convert_tokens_to_ids(COORD_TOKEN)
+        rank0_print(f"[no_cam] <coord> token id = {coord_token_id}")
+    else:
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": [POSE_TOKEN, COORD_TOKEN]}
+        )
+        pose_token_id  = tokenizer.convert_tokens_to_ids(POSE_TOKEN)
+        coord_token_id = tokenizer.convert_tokens_to_ids(COORD_TOKEN)
+        rank0_print(f"<pose>  token id = {pose_token_id}")
+        rank0_print(f"<coord> token id = {coord_token_id}")
 
     # image_token_id: <|image_pad|> in Qwen-VL tokeniser
     image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
@@ -231,19 +322,33 @@ def train(args: argparse.Namespace) -> None:
     rank0_print(f"spatial_merge_size = {spatial_merge_size}")
 
     # -- model -----------------------------------------------------------------
-    model = build_model(
-        args.model_path,
-        pose_token_id      = pose_token_id,
-        coord_token_id     = coord_token_id,
-        image_token_id     = image_token_id,
-        spatial_merge_size = spatial_merge_size,
-        coord_upscale      = args.coord_upscale,
-        lora_rank          = args.lora_rank,
-        freeze_vision      = not args.train_vision,
-        skip_layers        = tuple(args.skip_layers),
-        answer_weight      = args.answer_weight,
-        coord_weight       = args.coord_weight,
-    )
+    if args.no_cam:
+        model = build_coord_only_model(
+            args.model_path,
+            coord_token_id     = coord_token_id,
+            image_token_id     = image_token_id,
+            spatial_merge_size = spatial_merge_size,
+            coord_upscale      = args.coord_upscale,
+            lora_rank          = args.lora_rank,
+            freeze_vision      = not args.train_vision,
+            answer_weight      = args.answer_weight,
+            coord_weight       = args.coord_weight,
+        )
+        log.info("Using CoordinateModel (ablation: no pose head)")
+    else:
+        model = build_model(
+            args.model_path,
+            pose_token_id      = pose_token_id,
+            coord_token_id     = coord_token_id,
+            image_token_id     = image_token_id,
+            spatial_merge_size = spatial_merge_size,
+            coord_upscale      = args.coord_upscale,
+            lora_rank          = args.lora_rank,
+            freeze_vision      = not args.train_vision,
+            skip_layers        = tuple(args.skip_layers),
+            answer_weight      = args.answer_weight,
+            coord_weight       = args.coord_weight,
+        )
     model = model.to(device)
     if local_rank == 0:
         mem_gb = torch.cuda.memory_allocated(device) / 1e9
@@ -289,7 +394,8 @@ def train(args: argparse.Namespace) -> None:
     test_loaders = {}
     test_samplers = {}
     for _ds_name, _ds_dir in [
-        ("mindcube", os.path.join(_eval_dir, "MindCube")),
+        ("mindcube",  os.path.join(_eval_dir, "MindCube")),
+        ("spinbench", os.path.join(_eval_dir, "spinbench_data")),
     ]:
         try:
             raw_samples = load_testing_dataset(data_dir=_ds_dir, dataset=_ds_name)
@@ -376,7 +482,10 @@ def train(args: argparse.Namespace) -> None:
             attention_mask = batch["attention_mask"].to(device)
             pixel_values   = batch.get("pixel_values")
             image_grid_thw = batch.get("image_grid_thw")
-            gt_transforms  = batch["gt_transforms"].to(device)
+            gt_transforms  = (
+                None if args.no_cam
+                else batch["gt_transforms"].to(device)
+            )
 
             if pixel_values is not None:
                 pixel_values = pixel_values.to(device, dtype=torch.bfloat16)
@@ -426,7 +535,7 @@ def train(args: argparse.Namespace) -> None:
                 continue
 
             if loss is None:
-                log.warning(f"[rank{local_rank}] Step {step}: no <pose> token found, skipping.")
+                log.warning(f"[rank{local_rank}] Step {step}: no supervision signal, skipping.")
                 continue
 
             (loss / args.grad_accum).backward()
@@ -493,6 +602,16 @@ def train(args: argparse.Namespace) -> None:
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
                     _spa = _model.spa_model if hasattr(_model, 'spa_model') else _model
+
+                    # Save and disable gradient checkpointing during eval to enable kv_cache
+                    _spa_gc_flag = getattr(_spa, 'gradient_checkpointing', False)
+                    _lm = _spa.language_model if hasattr(_spa, 'language_model') else None
+                    _lm_gc_flag = getattr(_lm, 'gradient_checkpointing', False) if _lm else False
+                    if _spa_gc_flag:
+                        _spa.gradient_checkpointing = False
+                    if _lm and _lm_gc_flag:
+                        _lm.gradient_checkpointing = False
+
                     for ds_name, loader in test_loaders.items():
                         if ds_name in test_samplers and test_samplers[ds_name] is not None:
                             test_samplers[ds_name].set_epoch(global_step)
@@ -516,6 +635,7 @@ def train(args: argparse.Namespace) -> None:
                                         input_ids=t_ids, attention_mask=t_mask,
                                         pixel_values=t_pv, image_grid_thw=t_thw,
                                         return_dict=True,
+                                        kv_cache=(ds_name == "spinbench"),
                                     )
                                     logits = out.logits
                                     shift_logits = logits[..., :-1, :].contiguous()
@@ -557,6 +677,13 @@ def train(args: argparse.Namespace) -> None:
                                     {f"eval/{ds_name}_lm_loss": avg},
                                     step=global_step,
                                 )
+
+                    # Restore gradient checkpointing
+                    if _spa_gc_flag:
+                        _spa.gradient_checkpointing = True
+                    if _lm and _lm_gc_flag:
+                        _lm.gradient_checkpointing = True
+
                     model.train()
 
     # Final checkpoint (rank 0 only)
@@ -571,7 +698,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 def _save_checkpoint(
-    model:      CoordinatePlusModel,
+    model:      CoordinatePlusModel | CoordinateModel,
     tokenizer,
     output_dir: str,
     step:       int,
@@ -583,10 +710,11 @@ def _save_checkpoint(
 
     model.spa_model.save_pretrained(ckpt)
     tokenizer.save_pretrained(ckpt)
-    torch.save(
-        model.pose_head.state_dict(),
-        os.path.join(ckpt, "pose_head.pt"),
-    )
+    if hasattr(model, "pose_head"):
+        torch.save(
+            model.pose_head.state_dict(),
+            os.path.join(ckpt, "pose_head.pt"),
+        )
     torch.save(
         model.coord_head.state_dict(),
         os.path.join(ckpt, "coord_head.pt"),
@@ -633,6 +761,12 @@ def parse_args() -> argparse.Namespace:
         "--train_vision",
         action="store_true",
         help="Unfreeze the vision encoder (ViT) for fine-tuning",
+    )
+    p.add_argument(
+        "--no_cam",
+        action="store_true",
+        help="Ablation: remove camera pose regression head. Uses CoordinateModel "
+             "(coord loss + LM loss only, no <pose> tokens needed).",
     )
     p.add_argument(
         "--skip_layers",

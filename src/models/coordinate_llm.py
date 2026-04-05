@@ -243,3 +243,130 @@ class CoordinatePlusModel(nn.Module):
 
         return preds_9d, loss, (_ldict if _ldict else None)
 
+
+class CoordinateModel(nn.Module):
+    """
+    Ablation of CoordinatePlusModel: pose regression removed entirely.
+
+    Only two supervision signals:
+      1. LM cross-entropy      → answer prediction loss  (at answer tokens)
+      2. CoordinateRegressionHead → xyz coordinate loss  (at <coord> tokens)
+
+    No <pose> tokens needed; no PoseRegressionHead; no gt_transforms.
+    """
+
+    def __init__(
+        self,
+        spa_model:          nn.Module,
+        coord_head:         CoordinateRegressionHead,
+        coord_token_id:     int,
+        image_token_id:     int,
+        spatial_merge_size: int,
+        answer_weight:      float = 1.0,
+        coord_weight:       float = 1.0,
+    ):
+        super().__init__()
+        self.spa_model          = spa_model
+        self.coord_head         = coord_head
+        self.coord_token_id     = coord_token_id
+        self.image_token_id     = image_token_id
+        self.spatial_merge_size = spatial_merge_size
+        self.answer_weight      = answer_weight
+        self.coord_weight       = coord_weight
+
+        # Pre-hook on lm_head to capture last hidden state without
+        # output_hidden_states=True (preserves gradient checkpointing savings).
+        self._lm_head_input: torch.Tensor | None = None
+        for name, mod in self.spa_model.named_modules():
+            if name.endswith("lm_head"):
+                mod.register_forward_pre_hook(self._capture_lm_input)
+                break
+
+    def _capture_lm_input(self, module, args):
+        self._lm_head_input = args[0]
+
+    def forward(
+        self,
+        input_ids:       torch.Tensor,           # (1, seq_len)
+        attention_mask:  torch.Tensor,           # (1, seq_len)
+        pixel_values:    torch.Tensor | None,    # (total_patches, C, H, W)
+        image_grid_thw:  torch.Tensor | None,    # (num_images, 3)
+        gt_transforms:   torch.Tensor | None = None,   # ignored (ablation)
+        image_xyz:       list | None = None,
+        image_xyz_hires: list | None = None,
+        coord_scale:     float = 100.0,
+        cycle_weight:    float = 0.0,            # ignored (ablation)
+        labels:          torch.Tensor | None = None,
+        **kwargs,
+    ):
+        # ── backbone ─────────────────────────────────────────────────────────
+        outputs = self.spa_model(
+            input_ids            = input_ids,
+            attention_mask       = attention_mask,
+            pixel_values         = pixel_values,
+            image_grid_thw       = image_grid_thw,
+            output_hidden_states = False,
+            return_dict          = True,
+            image_xyz            = image_xyz,
+            coord_scale          = coord_scale,
+            **kwargs,
+        )
+
+        hidden_coord = self._lm_head_input     # (1, seq_len, hidden_dim)
+        logits       = outputs.logits
+        del outputs
+
+        _ldict: dict = {}
+
+        # ── LM answer-prediction loss ────────────────────────────────────────
+        lm_loss = None
+        if labels is not None:
+            shift_logits = logits[:, :-1, :]
+            shift_labels = labels[:, 1:].to(logits.device)
+            mask         = shift_labels[0] != -100
+            lm_loss = F.cross_entropy(
+                shift_logits[0, mask], shift_labels[0, mask]
+            )
+
+        # ── per-patch 3D coordinate prediction ──────────────────────────────
+        coord_loss = None
+        coord_gt   = image_xyz_hires if image_xyz_hires is not None else image_xyz
+        if coord_gt is not None and image_grid_thw is not None:
+            coord_pos = (input_ids[0] == self.coord_token_id).nonzero(
+                as_tuple=True
+            )[0]
+
+            sms   = self.spatial_merge_size
+            start = 0
+            per_img_losses: list[torch.Tensor] = []
+
+            for k in range(min(len(coord_gt), len(image_grid_thw))):
+                thw_k = image_grid_thw[k]
+                llm_h = int(thw_k[1]) // sms
+                llm_w = int(thw_k[2]) // sms
+                n_tok = llm_h * llm_w
+
+                if start + n_tok > len(coord_pos):
+                    break
+
+                coord_h_k = hidden_coord[0, coord_pos[start : start + n_tok]]
+                pred_k    = self.coord_head(coord_h_k, llm_h, llm_w)
+
+                gt_k = coord_gt[k].to(pred_k.device, dtype=pred_k.dtype)
+                per_img_losses.append(F.l1_loss(pred_k, gt_k))
+                start += n_tok
+
+            if per_img_losses:
+                coord_loss = torch.stack(per_img_losses).mean()
+
+        # ── combine losses ────────────────────────────────────────────────────
+        loss = None
+        if lm_loss is not None:
+            _ldict["lm_loss"] = lm_loss.item()
+            loss = self.answer_weight * lm_loss
+        if coord_loss is not None:
+            _ldict["coord_loss"] = coord_loss.item()
+            loss = (loss + self.coord_weight * coord_loss) if loss is not None \
+                   else (self.coord_weight * coord_loss)
+
+        return None, loss, (_ldict if _ldict else None)

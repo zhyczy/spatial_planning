@@ -19,6 +19,7 @@
 #   bash scripts/train_correspondence.sh 2 100         # 2 GPUs, 100 samples
 #   bash scripts/train_correspondence.sh 1 6           # single GPU, 6 samples
 #   bash scripts/train_correspondence.sh 2 100 --plus  # plus mode
+#   bash scripts/train_correspondence.sh 2 100 --no_cycle          # disable cycle loss
 #   bash scripts/train_correspondence.sh 2 100 --ablation no_cam   # ablation: no cam pred
 # =============================================================================
 
@@ -38,11 +39,14 @@ NPROC=""
 MAX_SAMPLES=""
 PLUS_FLAG=""
 ABLATION_FLAG=""
+NO_CYCLE_FLAG=""
 _positional=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --plus|plus)
             PLUS_FLAG="--plus"; shift ;;
+        --no_cycle)
+            NO_CYCLE_FLAG="yes"; shift ;;
         --ablation)
             ABLATION_FLAG="--ablation $2"; shift 2 ;;
         *)
@@ -91,13 +95,13 @@ GRAD_ACCUM=8
 NUM_WORKERS=4
 
 SKIP_LAYERS="-1"
-CYCLE_WEIGHT=0.1
+CYCLE_WEIGHT=$([ -n "$NO_CYCLE_FLAG" ] && echo "0.0" || echo "0.1")
 SAVE_STEPS=500
 EVAL_STEPS=50
 
 WANDB_PROJECT="spc"
 WANDB_ENTITY="actmrv"
-WANDB_RUN_NAME="mindcube_lora_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}${PLUS_FLAG:+_plus}${_ablation_name}"
+WANDB_RUN_NAME="mindcube_lora_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}${PLUS_FLAG:+_plus}${NO_CYCLE_FLAG:+_nocycle}${_ablation_name}"
 
 # =============================================================================
 # Setup
@@ -111,6 +115,7 @@ echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] PLUS mode            = ${PLUS_FLAG:-disabled}"
+echo "[INFO] CYCLE_WEIGHT         = $CYCLE_WEIGHT"
 echo "[INFO] ABLATION             = ${ABLATION_FLAG:-disabled}"
 echo "[INFO] JSON_PATH            = $JSON_PATH"
 echo "[INFO] Output dir           : $OUTPUT_DIR"

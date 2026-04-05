@@ -78,7 +78,7 @@ THINKING=""
 MAX_NEW_TOKENS=512
 
 # All supported datasets (in evaluation order)
-ALL_DATASETS="mindcube mmsibench sparbench_multi_view sparbench_single_view sat_real spinbench"
+ALL_DATASETS="mindcube sat_real spinbench"
 
 # Dataset → data_dir mapping (relative to SPATIAL_DIR)
 declare -A DATASET_DIR

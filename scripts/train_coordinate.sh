@@ -2,21 +2,23 @@
 # =============================================================================
 # train_coordinate.sh
 #
-# LoRA fine-tuning of SpaForConditionalGeneration with three supervision
-# signals: pose regression, LM answer prediction, per-patch 3D coordinate.
-# Multi-GPU via torchrun (DDP).
+# LoRA fine-tuning of SpaForConditionalGeneration with supervision signals:
+#   - Full:     pose regression + LM answer + per-patch 3D coordinate
+#   - Ablation: LM answer + per-patch 3D coordinate only (--no_cam)
 #
 # Usage:
-#   bash scripts/train_coordinate.sh [num_gpus] [num_samples]
+#   bash scripts/train_coordinate.sh [num_gpus] [--no_cam] [--max_samples N]
 #
-#   num_gpus    — number of GPUs to use (default: all available)
-#   num_samples — truncate dataset to this many entries (default: all)
+#   num_gpus          — first positional arg, number of GPUs (default: all)
+#   --no_cam          — ablation: remove pose head, use CoordinateModel
+#   --max_samples N   — truncate dataset to N entries (default: all)
 #
 # Examples:
-#   bash scripts/train_coordinate.sh               # all GPUs, full dataset
-#   bash scripts/train_coordinate.sh 2             # 2 GPUs, full dataset
-#   bash scripts/train_coordinate.sh 2 100         # 2 GPUs, 100 samples
-#   bash scripts/train_coordinate.sh 1 6           # single GPU, 6 samples
+#   bash scripts/train_coordinate.sh                      # all GPUs, full model
+#   bash scripts/train_coordinate.sh 2                    # 2 GPUs, full model
+#   bash scripts/train_coordinate.sh 6 --no_cam           # 6 GPUs, ablation
+#   bash scripts/train_coordinate.sh 1 --max_samples 6    # single GPU, 6 samples
+#   bash scripts/train_coordinate.sh 1 --no_cam --max_samples 6
 # =============================================================================
 
 set -euo pipefail
@@ -30,9 +32,27 @@ cd "$SPATIAL_DIR"
 # Arguments
 # =============================================================================
 
-# num_gpus: positional arg 1 (default: auto-detect)
-if [ -n "${1:-}" ]; then
-    NPROC="$1"
+NPROC=""
+MAX_SAMPLES=""
+NO_CAM_ARG=""
+_positional=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no_cam)
+            NO_CAM_ARG="no_cam"; shift ;;
+        --max_samples)
+            MAX_SAMPLES="$2"; shift 2 ;;
+        *)
+            if [ $_positional -eq 0 ]; then
+                NPROC="$1"
+            fi
+            _positional=$((_positional + 1))
+            shift ;;
+    esac
+done
+
+if [ -n "$NPROC" ]; then
     CUDA_IDS=$(seq -s ',' 0 $((NPROC - 1)))
     export CUDA_VISIBLE_DEVICES="$CUDA_IDS"
 else
@@ -40,9 +60,6 @@ else
     NPROC="$N_AVAIL"
     export CUDA_VISIBLE_DEVICES=$(seq -s ',' 0 $((NPROC - 1)))
 fi
-
-# num_samples: positional arg 2 (default: empty = all)
-MAX_SAMPLES="${2:-}"
 
 # =============================================================================
 # Hyperparameters
@@ -52,9 +69,6 @@ MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
 JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
 MINDCUBE_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
 
-RUN_NAME="coordinate_mindcube"
-OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
-
 EPOCHS=9
 LR=2e-4
 LORA_RANK=16
@@ -62,8 +76,6 @@ MAX_IMAGES=4
 GRAD_ACCUM=8
 NUM_WORKERS=4
 
-SKIP_LAYERS="-1"
-CYCLE_WEIGHT=0.1
 ANSWER_WEIGHT=1.0
 COORD_WEIGHT=1.0
 COORD_UPSCALE=4
@@ -72,7 +84,26 @@ EVAL_STEPS=50
 
 WANDB_PROJECT="spc"
 WANDB_ENTITY="actmrv"
-WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}_coord${COORD_WEIGHT}"
+
+# =============================================================================
+# Mode-specific settings
+# =============================================================================
+
+if [ "$NO_CAM_ARG" = "no_cam" ]; then
+    RUN_NAME="coordinate_no_cam_mindcube"
+    WANDB_RUN_NAME="coord_no_cam_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}"
+    NO_CAM_FLAG="--no_cam"
+    POSE_FLAGS=""
+else
+    SKIP_LAYERS="-1"
+    CYCLE_WEIGHT=0.1
+    RUN_NAME="coordinate_mindcube"
+    WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}_coord${COORD_WEIGHT}"
+    NO_CAM_FLAG=""
+    POSE_FLAGS="--skip_layers $SKIP_LAYERS --cycle_weight $CYCLE_WEIGHT"
+fi
+
+OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 # =============================================================================
 # Setup
@@ -86,11 +117,12 @@ echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
+echo "[INFO] Mode                 = ${NO_CAM_ARG:-full (pose+coord+lm)}"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
 # =============================================================================
-# Build optional --max_samples flag
+# Build optional flags
 # =============================================================================
 
 MAX_SAMPLES_FLAG=""
@@ -118,8 +150,6 @@ $TORCHRUN \
     --max_images             "$MAX_IMAGES"             \
     --grad_accum             "$GRAD_ACCUM"             \
     --num_workers            "$NUM_WORKERS"            \
-    --skip_layers            $SKIP_LAYERS              \
-    --cycle_weight           "$CYCLE_WEIGHT"           \
     --answer_weight          "$ANSWER_WEIGHT"          \
     --coord_weight           "$COORD_WEIGHT"           \
     --coord_upscale          "$COORD_UPSCALE"          \
@@ -128,6 +158,8 @@ $TORCHRUN \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
+    $POSE_FLAGS                                        \
+    $NO_CAM_FLAG                                       \
     $MAX_SAMPLES_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

@@ -123,11 +123,13 @@ def build_model(
         )
     else:
         # ── 4D M-RoPE for normal / plus / no_cam ─────────────────────────────
-        section_size = sum(orig_section) // 4          # e.g. 32 // 4 = 8
-        config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
+        total = sum(orig_section)                       # e.g. 32
+        xyz_size = (total - 2) // 3                     # e.g. (32-2)//3 = 10
+        new_section = [2, xyz_size, xyz_size, xyz_size] # [2, 10, 10, 10]
+        config.text_config.rope_scaling["mrope_section"] = new_section
         log.info(
-            f"mrope_section: {orig_section} → {[section_size]*4}  "
-            f"(4D M-RoPE for spatial tokens)"
+            f"mrope_section: {orig_section} → {new_section}  "
+            f"(4D M-RoPE: 2 for t, {xyz_size} each for x/y/z)"
         )
         spa = SpaForConditionalGeneration.from_pretrained(
             model_path,
@@ -299,6 +301,7 @@ def train(args: argparse.Namespace) -> None:
     test_samplers = {}
     for _ds_name, _ds_dir in [
         ("mindcube",             os.path.join(_eval_dir, "MindCube")),
+        ("spinbench",            os.path.join(_eval_dir, "spinbench_data")),
         # ("sparbench_multi_view", os.path.join(_eval_dir, "SPARBench")),
     ]:
         try:
@@ -489,6 +492,16 @@ def train(args: argparse.Namespace) -> None:
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
                     _spa = _model.spa_model if hasattr(_model, 'spa_model') else _model
+
+                    # Save and disable gradient checkpointing during eval to enable kv_cache
+                    _spa_gc_flag = getattr(_spa, 'gradient_checkpointing', False)
+                    _lm = _spa.language_model if hasattr(_spa, 'language_model') else None
+                    _lm_gc_flag = getattr(_lm, 'gradient_checkpointing', False) if _lm else False
+                    if _spa_gc_flag:
+                        _spa.gradient_checkpointing = False
+                    if _lm and _lm_gc_flag:
+                        _lm.gradient_checkpointing = False
+
                     for ds_name, loader in test_loaders.items():
                         if ds_name in test_samplers and test_samplers[ds_name] is not None:
                             test_samplers[ds_name].set_epoch(global_step)
@@ -512,6 +525,7 @@ def train(args: argparse.Namespace) -> None:
                                         input_ids=t_ids, attention_mask=t_mask,
                                         pixel_values=t_pv, image_grid_thw=t_thw,
                                         return_dict=True,
+                                        kv_cache=(ds_name == "spinbench"),
                                     )
                                     logits = out.logits
                                     shift_logits = logits[..., :-1, :].contiguous()
@@ -552,6 +566,13 @@ def train(args: argparse.Namespace) -> None:
                                     {f"eval/{ds_name}_lm_loss": avg},
                                     step=global_step,
                                 )
+
+                    # Restore gradient checkpointing
+                    if _spa_gc_flag:
+                        _spa.gradient_checkpointing = True
+                    if _lm and _lm_gc_flag:
+                        _lm.gradient_checkpointing = True
+
                     model.train()
 
     # Final checkpoint (rank 0 only)

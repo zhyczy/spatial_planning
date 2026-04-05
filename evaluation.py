@@ -222,9 +222,11 @@ def load_spa_model(
         )
     else:
         # 4D M-RoPE for normal / plus / no_cam
-        section_size = sum(orig_section) // 4
-        config.text_config.rope_scaling["mrope_section"] = [section_size] * 4
-        logger.info(f"[correspondence] mrope_section: {orig_section} → {[section_size]*4}")
+        total = sum(orig_section)
+        xyz_size = (total - 2) // 3
+        new_section = [2, xyz_size, xyz_size, xyz_size]
+        config.text_config.rope_scaling["mrope_section"] = new_section
+        logger.info(f"[correspondence] mrope_section: {orig_section} → {new_section}")
         spa = SpaForConditionalGeneration.from_pretrained(
             base_model_path,
             config=config,

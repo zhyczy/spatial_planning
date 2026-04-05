@@ -233,21 +233,21 @@ class SpaVisionModel(Qwen3_5VisionModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Part 2a: 4D sequential M-RoPE (text model rotary embedding + language model)
+# Part 2a: 4D interleaved M-RoPE (text model rotary embedding + language model)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SpaTextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
     """
-    Extends Qwen3.5 M-RoPE from 3D to N-D using sequential (non-interleaved) frequency assignment.
+    Extends Qwen3.5 M-RoPE from 3D to N-D using interleaved frequency assignment.
 
     With mrope_section = [s0, s1, ..., s_{N-1}] (sum = head_dim // 2):
-        dimensions laid out sequentially: [dim_0_freqs | dim_1_freqs | ...]
+        freq index i → dimension (i % N)
 
     For [8, 8, 8, 8] with N=4 and head_dim=64 (32 freq components):
-        dim 0 (t):   indices 0-7    (8 freqs)
-        dim 1 (x3d): indices 8-15   (8 freqs)
-        dim 2 (y3d): indices 16-23  (8 freqs)
-        dim 3 (z3d): indices 24-31  (8 freqs)
+        dim 0 (t):   indices 0, 4, 8, 12, 16, 20, 24, 28  (8 freqs)
+        dim 1 (x3d): indices 1, 5, 9, 13, 17, 21, 25, 29  (8 freqs)
+        dim 2 (y3d): indices 2, 6,10, 14, 18, 22, 26, 30  (8 freqs)
+        dim 3 (z3d): indices 3, 7,11, 15, 19, 23, 27, 31  (8 freqs)
 
     Text tokens: all N dims = sequential pos → all 32 freqs encode the same pos
     → mathematically identical to original [11,11,10] 3D text RoPE.
@@ -279,8 +279,7 @@ class SpaTextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
         """
-        Sequential N-D M-RoPE (no interleaving).
-        Dims are laid out sequentially: t, x, y, z without interleaving.
+        Interleaved N-D M-RoPE.  Dim d uses freq indices d, d+N, d+2N, ... (stride N).
 
         Args:
             freqs:        (N, bs, seq_len, head_dim//2)
@@ -289,13 +288,11 @@ class SpaTextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
             (bs, seq_len, head_dim//2)
         """
         num_dims = len(mrope_section)
-        freqs_out_list = []
-        offset = 0
-        for dim in range(num_dims):
-            length = mrope_section[dim]
-            freqs_out_list.append(freqs[dim, ..., offset:offset + length])
-            offset += length
-        freqs_out = torch.cat(freqs_out_list, dim=-1)
+        freqs_out = freqs[0].clone()           # start: dim-0 fills all slots
+        for dim in range(1, num_dims):
+            length = mrope_section[dim] * num_dims
+            idx = slice(dim, length, num_dims)
+            freqs_out[..., idx] = freqs[dim, ..., idx]
         return freqs_out
 
 
@@ -306,7 +303,7 @@ class SpaTextModel(Qwen3_5TextModel):
     The only change from the parent is that the position_ids split condition
     accepts shape[0] >= 4 instead of exactly 4, allowing 5D input where:
         position_ids[0]  = sequential position  (→ causal mask)
-        position_ids[1:] = (t, x3d, y3d, z3d)  (→ 4D sequential RoPE)
+        position_ids[1:] = (t, x3d, y3d, z3d)  (→ 4D interleaved RoPE)
     """
 
     def __init__(self, config):
