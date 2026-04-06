@@ -1,2 +1,2 @@
 from .train_dataset import SPAR_Train_Dataset, SPAR_Train_Dataset_Coord, MindCube_Train_Dataset, MindCube_Train_Dataset_Coord
-from .eval_dataset import Eval_Dataset, load_testing_dataset, chunk_dataset
+from .eval_dataset import Eval_Dataset, Eval_Dataset_Coord, load_testing_dataset, chunk_dataset

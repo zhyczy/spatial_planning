@@ -60,7 +60,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
 from src.models import CoordinateRegressionHead, CoordinatePlusModel, CoordinateModel, PoseRegressionHead, SpaForConditionalGeneration
-from src.dataset import MindCube_Train_Dataset_Coord, Eval_Dataset, load_testing_dataset
+from src.dataset import MindCube_Train_Dataset_Coord, Eval_Dataset_Coord, Eval_Dataset, load_testing_dataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -389,17 +389,35 @@ def train(args: argparse.Namespace) -> None:
         sampler     = train_sampler,
     )
 
-    # -- test datasets (for periodic LM loss evaluation) -----------------------
+    # -- test datasets (full format: same prompt as training) ------------------
     _eval_dir = os.path.join(_ROOT, "datasets/evaluation")
     test_loaders = {}
     test_samplers = {}
-    for _ds_name, _ds_dir in [
-        ("mindcube",  os.path.join(_eval_dir, "MindCube")),
-        ("spinbench", os.path.join(_eval_dir, "spinbench_data")),
+    for _ds_name, _ds_jsonl, _ds_results, _q_key, _a_key in [
+        ("mindcube",
+         os.path.join(_eval_dir, "MindCube", "MindCube_tinybench.jsonl"),
+         os.path.join(_eval_dir, "MindCube", "3d_results"),
+         "question", "gt_answer"),
+        ("spinbench",
+         os.path.join(_eval_dir, "spinbench_data", "test.jsonl"),
+         os.path.join(_eval_dir, "spinbench_data", "3d_results"),
+         "problem", "answer"),
     ]:
         try:
-            raw_samples = load_testing_dataset(data_dir=_ds_dir, dataset=_ds_name)
-            ds = Eval_Dataset(raw_samples, processor)
+            ds = Eval_Dataset_Coord(
+                jsonl_path         = _ds_jsonl,
+                results_dir        = _ds_results,
+                processor          = processor,
+                pose_token_id      = pose_token_id,
+                coord_token_id     = coord_token_id,
+                log                = log,
+                max_images         = args.max_images,
+                spatial_merge_size = spatial_merge_size,
+                coord_upscale      = args.coord_upscale,
+                no_cam             = args.no_cam,
+                question_key       = _q_key,
+                answer_key         = _a_key,
+            )
             _eval_sampler = (
                 DistributedSampler(ds, num_replicas=world_size,
                                    rank=local_rank, shuffle=False)
@@ -408,7 +426,7 @@ def train(args: argparse.Namespace) -> None:
             test_loaders[_ds_name] = DataLoader(
                 ds, batch_size=1, shuffle=False,
                 num_workers=args.num_workers, collate_fn=collate_fn,
-                sampler=_eval_sampler,
+                sampler=_eval_sampler, pin_memory=True,
             )
             test_samplers[_ds_name] = _eval_sampler
             log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
@@ -603,7 +621,7 @@ def train(args: argparse.Namespace) -> None:
                     model.eval()
                     _spa = _model.spa_model if hasattr(_model, 'spa_model') else _model
 
-                    # Save and disable gradient checkpointing during eval to enable kv_cache
+                    # Disable gradient checkpointing during eval
                     _spa_gc_flag = getattr(_spa, 'gradient_checkpointing', False)
                     _lm = _spa.language_model if hasattr(_spa, 'language_model') else None
                     _lm_gc_flag = getattr(_lm, 'gradient_checkpointing', False) if _lm else False
@@ -615,66 +633,91 @@ def train(args: argparse.Namespace) -> None:
                     for ds_name, loader in test_loaders.items():
                         if ds_name in test_samplers and test_samplers[ds_name] is not None:
                             test_samplers[ds_name].set_epoch(global_step)
-                        local_loss_sum = 0.0
+
                         local_count = 0
+                        local_loss_sums: dict[str, float] = {}
+
                         for test_batch in loader:
                             t_ids   = test_batch["input_ids"].to(device)
                             t_mask  = test_batch["attention_mask"].to(device)
                             t_pv    = test_batch.get("pixel_values")
                             t_thw   = test_batch.get("image_grid_thw")
                             t_labels = test_batch.get("labels")
+                            t_gt    = test_batch.get("gt_transforms")
+                            t_xyz   = test_batch.get("image_xyz")
+                            t_xyz_h = test_batch.get("image_xyz_hires")
+
                             if t_pv is not None:
                                 t_pv = t_pv.to(device, dtype=torch.bfloat16)
                             if t_thw is not None:
                                 t_thw = t_thw.to(device)
                             if t_labels is not None:
                                 t_labels = t_labels.to(device)
+                            if t_gt is not None:
+                                t_gt = t_gt.to(device)
+                            if t_xyz is not None:
+                                t_xyz = [x.to(device) for x in t_xyz]
+                            if t_xyz_h is not None:
+                                t_xyz_h = [x.to(device) for x in t_xyz_h]
+
                             try:
-                                with torch.no_grad():
-                                    out = _spa(
-                                        input_ids=t_ids, attention_mask=t_mask,
-                                        pixel_values=t_pv, image_grid_thw=t_thw,
-                                        return_dict=True,
-                                        kv_cache=(ds_name == "spinbench"),
+                                with torch.inference_mode():
+                                    _, loss, loss_dict = model(
+                                        input_ids       = t_ids,
+                                        attention_mask  = t_mask,
+                                        pixel_values    = t_pv,
+                                        image_grid_thw  = t_thw,
+                                        gt_transforms   = t_gt,
+                                        image_xyz       = t_xyz,
+                                        image_xyz_hires = t_xyz_h,
+                                        cycle_weight    = args.cycle_weight if not args.no_cam else 0.0,
+                                        labels          = t_labels,
                                     )
-                                    logits = out.logits
-                                    shift_logits = logits[..., :-1, :].contiguous()
-                                    shift_labels = t_labels[..., 1:].contiguous()
-                                    lm_loss = F.cross_entropy(
-                                        shift_logits.view(-1, shift_logits.size(-1)),
-                                        shift_labels.view(-1),
-                                        ignore_index=-100,
-                                    )
-                                    local_loss_sum += lm_loss.item()
-                                    local_count += 1
+                                if loss is None:
+                                    continue
+                                local_count += 1
+                                if loss_dict:
+                                    for k, v in loss_dict.items():
+                                        local_loss_sums[k] = local_loss_sums.get(k, 0.0) + v
                             except Exception as exc:
                                 log.debug(f"Eval skip ({ds_name}): {exc}")
                                 continue
 
                         # Aggregate across all ranks
+                        _loss_keys = sorted(local_loss_sums.keys())
                         if world_size > 1:
-                            stats = torch.tensor(
-                                [local_loss_sum, local_count],
-                                dtype=torch.float64, device=device,
-                            )
+                            _vals = [float(local_count)] + [local_loss_sums.get(k, 0.0) for k in _loss_keys]
+                            stats = torch.tensor(_vals, dtype=torch.float64, device=device)
                             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                            total_loss = stats[0].item()
-                            total_count = int(stats[1].item())
+                            total_count = int(stats[0].item())
+                            agg_sums = {k: stats[i + 1].item() for i, k in enumerate(_loss_keys)}
                         else:
-                            total_loss = local_loss_sum
                             total_count = local_count
+                            agg_sums = dict(local_loss_sums)
 
                         if total_count > 0 and local_rank == 0:
-                            avg = total_loss / total_count
+                            detail = "  ".join(
+                                f"{k}={agg_sums[k] / total_count:.4f}"
+                                for k in _loss_keys
+                            )
                             log.info(
-                                f"[eval] global_step={global_step:05d}  "
-                                f"{ds_name}_lm_loss={avg:.4f}  "
-                                f"(n={total_count} samples, aggregated across "
-                                f"{world_size} GPU{'s' if world_size > 1 else ''})"
+                                f"[eval] global_step={global_step:05d}  {ds_name}  "
+                                + detail
+                                + f"  (n={total_count}, {world_size} GPU{'s' if world_size > 1 else ''})"
                             )
                             if use_wandb:
+                                _main_keys = {"pose_loss", "coord_loss", "lm_loss"}
                                 wandb.log(
-                                    {f"eval/{ds_name}_lm_loss": avg},
+                                    {
+                                        **(
+                                            {f"eval/{ds_name}_{k}": agg_sums[k] / total_count
+                                             for k in _loss_keys if k in _main_keys}
+                                        ),
+                                        **(
+                                            {f"eval_sub_loss/{ds_name}_{k}": agg_sums[k] / total_count
+                                             for k in _loss_keys if k not in _main_keys}
+                                        ),
+                                    },
                                     step=global_step,
                                 )
 
