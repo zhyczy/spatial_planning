@@ -7,18 +7,20 @@
 #   - Ablation: LM answer + per-patch 3D coordinate only (--no_cam)
 #
 # Usage:
-#   bash scripts/train_coordinate.sh [num_gpus] [--no_cam] [--max_samples N]
+#   bash scripts/train_coordinate.sh [num_gpus] [--no_cam] [--skip_layers LAYER] [--max_samples N]
 #
-#   num_gpus          — first positional arg, number of GPUs (default: all)
-#   --no_cam          — ablation: remove pose head, use CoordinateModel
-#   --max_samples N   — truncate dataset to N entries (default: all)
+#   num_gpus            — first positional arg, number of GPUs (default: all)
+#   --no_cam            — ablation: remove pose head, use CoordinateModel
+#   --skip_layers LAYER — layer for pose/coord heads (default: -1 = last layer)
+#                         -1 = Layer 32 (post-norm), -2 = Layer 31, etc.
+#   --max_samples N     — truncate dataset to N entries (default: all)
 #
 # Examples:
-#   bash scripts/train_coordinate.sh                      # all GPUs, full model
-#   bash scripts/train_coordinate.sh 2                    # 2 GPUs, full model
+#   bash scripts/train_coordinate.sh                      # all GPUs, full model, Layer 32
+#   bash scripts/train_coordinate.sh 2                    # 2 GPUs, full model, Layer 32
 #   bash scripts/train_coordinate.sh 6 --no_cam           # 6 GPUs, ablation
+#   bash scripts/train_coordinate.sh 1 --skip_layers -2   # single GPU, use Layer 31
 #   bash scripts/train_coordinate.sh 1 --max_samples 6    # single GPU, 6 samples
-#   bash scripts/train_coordinate.sh 1 --no_cam --max_samples 6
 # =============================================================================
 
 set -euo pipefail
@@ -35,12 +37,15 @@ cd "$SPATIAL_DIR"
 NPROC=""
 MAX_SAMPLES=""
 NO_CAM_ARG=""
+SKIP_LAYERS_ARG=""
 _positional=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no_cam)
             NO_CAM_ARG="no_cam"; shift ;;
+        --skip_layers)
+            SKIP_LAYERS_ARG="$2"; shift 2 ;;
         --max_samples)
             MAX_SAMPLES="$2"; shift 2 ;;
         *)
@@ -89,18 +94,33 @@ WANDB_ENTITY="actmrv"
 # Mode-specific settings
 # =============================================================================
 
+# Helper: convert skip_layers value to layer name
+layer_name() {
+    local skip_val="$1"
+    if [ "$skip_val" = "-1" ]; then
+        echo "Layer 32 (post-norm, last)"
+    elif [ "$skip_val" = "-2" ]; then
+        echo "Layer 31 (penultimate)"
+    else
+        echo "Layer $(( 32 + skip_val ))"
+    fi
+}
+
+SKIP_LAYERS="${SKIP_LAYERS_ARG:--1}"  # default to -1 if not specified
+SKIP_LAYERS_DISPLAY="$(layer_name "$SKIP_LAYERS")"
+SKIP_LAYERS_FLAG="--skip_layers ${SKIP_LAYERS}"
+
 if [ "$NO_CAM_ARG" = "no_cam" ]; then
     RUN_NAME="coordinate_no_cam_mindcube"
     WANDB_RUN_NAME="coord_no_cam_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}"
     NO_CAM_FLAG="--no_cam"
-    POSE_FLAGS=""
+    CYCLE_FLAG=""
 else
-    SKIP_LAYERS="-1"
     CYCLE_WEIGHT=0.1
     RUN_NAME="coordinate_mindcube"
     WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}_coord${COORD_WEIGHT}"
     NO_CAM_FLAG=""
-    POSE_FLAGS="--skip_layers $SKIP_LAYERS --cycle_weight $CYCLE_WEIGHT"
+    CYCLE_FLAG="--cycle_weight $CYCLE_WEIGHT"
 fi
 
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
@@ -118,6 +138,7 @@ echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] Mode                 = ${NO_CAM_ARG:-full (pose+coord+lm)}"
+echo "[INFO] Pose/Coord Heads at  = $SKIP_LAYERS_DISPLAY"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -158,7 +179,8 @@ $TORCHRUN \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
-    $POSE_FLAGS                                        \
+    $SKIP_LAYERS_FLAG                                  \
+    $CYCLE_FLAG                                        \
     $NO_CAM_FLAG                                       \
     $MAX_SAMPLES_FLAG
 

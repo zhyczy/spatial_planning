@@ -196,12 +196,14 @@ def build_coord_only_model(
     coord_upscale:      int = 4,
     lora_rank:          int = 16,
     freeze_vision:      bool = True,
+    skip_layers:        tuple[int, ...] = (-1,),
     answer_weight:      float = 1.0,
     coord_weight:       float = 1.0,
 ) -> CoordinateModel:
     """
     Ablation build: CoordinateModel (no pose head, no <pose> tokens needed).
     Supervision: LM answer loss + per-patch coordinate loss only.
+    Uses hidden states from skip_layers for coord head.
     """
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
@@ -266,6 +268,7 @@ def build_coord_only_model(
         coord_token_id     = coord_token_id,
         image_token_id     = image_token_id,
         spatial_merge_size = spatial_merge_size,
+        skip_layers        = skip_layers,
         answer_weight      = answer_weight,
         coord_weight       = coord_weight,
     )
@@ -331,6 +334,7 @@ def train(args: argparse.Namespace) -> None:
             coord_upscale      = args.coord_upscale,
             lora_rank          = args.lora_rank,
             freeze_vision      = not args.train_vision,
+            skip_layers        = tuple(args.skip_layers),
             answer_weight      = args.answer_weight,
             coord_weight       = args.coord_weight,
         )

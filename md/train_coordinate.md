@@ -117,3 +117,116 @@ N=2，H₁×W₁=38，H₂×W₂=34：
 [206..225] answer tokens   ← labels 不是 -100
 [226]      <|im_end|>
 [227]      \n
+
+
+
+输入序列：
+[<IMAGE>...<IMAGE> <pose> <pose>...<pose> <coord> <coord>...<coord> Question Answer <EOS>]
+ (4张图)          (12个)               (768个)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                            SpaForConditionalGeneration
+                                      ↓
+                         Vision Encoder (frozen ViT)
+                                      ↓
+                    image_tokens: (3072, 1536) → embedding
+                                      ↓
+                         SpaModel (LLM 32 layers + 4D M-RoPE)
+                                      ↓
+                    hidden_states: (1, seq_len, 2560)
+                                      ↓
+                    ┌──────────────────┼──────────────────┬──────────────────┐
+                    ↓                  ↓                  ↓                  ↓
+              [Layer 32]         [Layer 32]         [Layer 32]         [Layer 32]
+              hidden states      hidden states      hidden states      hidden states
+              at <pose>          at <coord>         at answer          all tokens
+              positions          positions          positions
+                  ↓                  ↓                  ↓                  ↓
+          ┌───────────────┐  ┌─────────────────┐  ┌─────────────┐  ┌──────────────┐
+          │ PoseRegHead   │  │ CoordRegHead    │  │   lm_head   │  │   (unused)   │
+          │    (MLP)      │  │ Linear+Pixel    │  │ (Linear)    │  │              │
+          │               │  │ Shuffle         │  │             │  │              │
+          └───────────────┘  └─────────────────┘  └─────────────┘  └──────────────┘
+                  ↓                  ↓                  ↓
+            preds_9d         pred_xyz_hires        logits (seq_len, V)
+           (12, 9)           (768, up_h, up_w, 3)  (1, seq_len, 32000)
+                ↓                  ↓                  ↓
+          ┌──────────────┐  ┌─────────────────┐  ┌────────────────┐
+          │ Geodesic +   │  │   L1 Loss       │  │ Shift + Mask   │
+          │ L1 + Cycle   │  │ vs gt_xyz_hires │  │ logits[:-1]    │
+          │ Loss         │  │                 │  │ labels[1:]     │
+          └──────────────┘  └─────────────────┘  │ only <answer>  │
+                ↓                  ↓              │ indices        │
+          pose_loss        coord_loss            └────────────────┘
+                                                         ↓
+                                                    lm_loss
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                        Total Loss Combination:
+
+                loss = pose_loss + answer_weight * lm_loss 
+                                 + coord_weight * coord_loss
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+监督信号汇总：
+
+  <pose> tokens (12)     → Pose Head → 9D (R6d+trans) → geodesic+L1+cycle loss
+  
+  <coord> tokens (768)   → Coord Head → (h*up, w*up, 3) → L1 loss vs image_xyz_hires
+  
+  Answer tokens (n_ans)  → lm_head → logits → cross-entropy loss (only answer part)
+三个分支独立：
+
+Pose Head 只看 <pose> 位置的 hidden state
+Coord Head 只看 <coord> 位置的 hidden state
+lm_head 处理全序列的 logits，但只监督 answer 部分（其他位置 label=-100）
+
+
+
+
+技术可行性
+当前代码（coordinate_llm.py L122-147）的逻辑是：
+
+
+only_last = (len(self.skip_layers) == 1 and self.skip_layers[0] == -1)
+outputs = self.spa_model(
+    output_hidden_states = not only_last,  # 只在非-1时才输出中间层
+    ...
+)
+
+if only_last:
+    hidden_pose  = self._lm_head_input      # Layer 32 post-norm
+    hidden_coord = self._lm_head_input
+else:
+    hidden_pose = outputs.hidden_states[self.skip_layers[0]]  # 任意层
+    hidden_coord = outputs.hidden_states[-1]  # Layer 32
+所以 skip_layers 参数已经支持任意层的选择。
+
+改动方法
+修改 train_coordinate.py 的 build_model() 调用：
+
+从：
+
+
+skip_layers = (-1,)  # Layer 32
+改为：
+
+
+skip_layers = (-2,)  # Layer 31
+或改动 argparse（如果有 --skip_layers 参数）：
+
+
+python train_coordinate.py --skip_layers -2
+利弊
+Layer 32（当前）	Layer 31（新）
+特征表达力	✓ 更强（经过全部 32 层）	✗ 较弱（少了一层 attention）
+梯度流	正常	正常（Layer 32 继续向后传导）
+推理速度	基准	基准（仍需完整 32 层）
+消融价值	—	✓ 可测试特征提取层的影响
+建议：这是一个合理的消融实验，可以试试看对 coord/pose 预测精度的影响。如果掉点不多，可以省掉 Layer 32 的部分计算，但实际效果需要实验验证。

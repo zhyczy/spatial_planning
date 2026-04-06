@@ -139,12 +139,13 @@ class CoordinatePlusModel(nn.Module):
             hidden_coord = self._lm_head_input
         else:
             if len(self.skip_layers) == 1:
-                hidden_pose = outputs.hidden_states[self.skip_layers[0]]
+                hidden_pose  = outputs.hidden_states[self.skip_layers[0]]
+                hidden_coord = outputs.hidden_states[self.skip_layers[0]]
             else:
                 hidden_pose = torch.cat(
                     [outputs.hidden_states[i] for i in self.skip_layers], dim=-1
                 )
-            hidden_coord = outputs.hidden_states[-1]
+                hidden_coord = outputs.hidden_states[self.skip_layers[-1]]
         logits = outputs.logits
         del outputs
 
@@ -262,6 +263,7 @@ class CoordinateModel(nn.Module):
         coord_token_id:     int,
         image_token_id:     int,
         spatial_merge_size: int,
+        skip_layers:        tuple[int, ...] = (-1,),
         answer_weight:      float = 1.0,
         coord_weight:       float = 1.0,
     ):
@@ -271,16 +273,20 @@ class CoordinateModel(nn.Module):
         self.coord_token_id     = coord_token_id
         self.image_token_id     = image_token_id
         self.spatial_merge_size = spatial_merge_size
+        self.skip_layers        = list(skip_layers)
         self.answer_weight      = answer_weight
         self.coord_weight       = coord_weight
 
         # Pre-hook on lm_head to capture last hidden state without
         # output_hidden_states=True (preserves gradient checkpointing savings).
+        # Only used when skip_layers == [-1].
         self._lm_head_input: torch.Tensor | None = None
-        for name, mod in self.spa_model.named_modules():
-            if name.endswith("lm_head"):
-                mod.register_forward_pre_hook(self._capture_lm_input)
-                break
+        only_last = (len(self.skip_layers) == 1 and self.skip_layers[0] == -1)
+        if only_last:
+            for name, mod in self.spa_model.named_modules():
+                if name.endswith("lm_head"):
+                    mod.register_forward_pre_hook(self._capture_lm_input)
+                    break
 
     def _capture_lm_input(self, module, args):
         self._lm_head_input = args[0]
@@ -300,20 +306,27 @@ class CoordinateModel(nn.Module):
         **kwargs,
     ):
         # ── backbone ─────────────────────────────────────────────────────────
+        only_last = (len(self.skip_layers) == 1 and self.skip_layers[0] == -1)
         outputs = self.spa_model(
             input_ids            = input_ids,
             attention_mask       = attention_mask,
             pixel_values         = pixel_values,
             image_grid_thw       = image_grid_thw,
-            output_hidden_states = False,
+            output_hidden_states = not only_last,
             return_dict          = True,
             image_xyz            = image_xyz,
             coord_scale          = coord_scale,
             **kwargs,
         )
 
-        hidden_coord = self._lm_head_input     # (1, seq_len, hidden_dim)
-        logits       = outputs.logits
+        # ── hidden states for coord head ───────────────────────────────────
+        if only_last:
+            # Captured by lm_head pre-hook (post-norm last hidden state)
+            hidden_coord = self._lm_head_input
+        else:
+            hidden_coord = outputs.hidden_states[self.skip_layers[0]]
+
+        logits = outputs.logits
         del outputs
 
         _ldict: dict = {}

@@ -6,19 +6,22 @@
 # prediction on MindCube data.  Multi-GPU via torchrun (DDP).
 #
 # Usage:
-#   bash scripts/train_correspondence.sh [num_gpus] [num_samples] [--plus] [--ablation MODE]
+#   bash scripts/train_correspondence.sh [num_gpus] [num_samples] [--plus] [--skip_layers LAYER] [--ablation MODE]
 #
-#   num_gpus    — number of GPUs to use (default: all available)
-#   num_samples — truncate dataset to this many entries (default: all)
-#   --plus      — enable plus mode (adds LM answer-prediction loss)
+#   num_gpus     — number of GPUs to use (default: all available)
+#   num_samples  — truncate dataset to this many entries (default: all)
+#   --plus       — enable plus mode (adds LM answer-prediction loss)
+#   --skip_layers LAYER — layer for pose head (default: -1 = last layer)
+#                         -1 = Layer 32 (post-norm), -2 = Layer 31, etc.
 #   --ablation MODE — ablation study: no_cam | vanilla
 #
 # Examples:
-#   bash scripts/train_correspondence.sh               # all GPUs, full dataset
-#   bash scripts/train_correspondence.sh 2             # 2 GPUs, full dataset
+#   bash scripts/train_correspondence.sh               # all GPUs, full dataset, Layer 32
+#   bash scripts/train_correspondence.sh 2             # 2 GPUs, full dataset, Layer 32
 #   bash scripts/train_correspondence.sh 2 100         # 2 GPUs, 100 samples
 #   bash scripts/train_correspondence.sh 1 6           # single GPU, 6 samples
 #   bash scripts/train_correspondence.sh 2 100 --plus  # plus mode
+#   bash scripts/train_correspondence.sh 1 --skip_layers -2   # use Layer 31
 #   bash scripts/train_correspondence.sh 2 100 --no_cycle          # disable cycle loss
 #   bash scripts/train_correspondence.sh 2 100 --ablation no_cam   # ablation: no cam pred
 # =============================================================================
@@ -40,6 +43,7 @@ MAX_SAMPLES=""
 PLUS_FLAG=""
 ABLATION_FLAG=""
 NO_CYCLE_FLAG=""
+SKIP_LAYERS_ARG=""
 _positional=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -47,6 +51,8 @@ while [ $# -gt 0 ]; do
             PLUS_FLAG="--plus"; shift ;;
         --no_cycle)
             NO_CYCLE_FLAG="yes"; shift ;;
+        --skip_layers)
+            SKIP_LAYERS_ARG="$2"; shift 2 ;;
         --ablation)
             ABLATION_FLAG="--ablation $2"; shift 2 ;;
         *)
@@ -78,6 +84,18 @@ MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
 JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
 MINDCUBE_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
 
+# Helper: convert skip_layers value to layer name
+layer_name() {
+    local skip_val="$1"
+    if [ "$skip_val" = "-1" ]; then
+        echo "Layer 32 (post-norm, last)"
+    elif [ "$skip_val" = "-2" ]; then
+        echo "Layer 31 (penultimate)"
+    else
+        echo "Layer $(( 32 + skip_val ))"
+    fi
+}
+
 # Derive run name from mode
 _ablation_name=""
 if [ -n "$ABLATION_FLAG" ]; then
@@ -94,8 +112,11 @@ MAX_IMAGES=4
 GRAD_ACCUM=8
 NUM_WORKERS=4
 
-SKIP_LAYERS="-1"
+SKIP_LAYERS="${SKIP_LAYERS_ARG:--1}"  # default to -1 if not specified
+SKIP_LAYERS_DISPLAY="$(layer_name "$SKIP_LAYERS")"
+SKIP_LAYERS_FLAG="--skip_layers ${SKIP_LAYERS}"
 CYCLE_WEIGHT=$([ -n "$NO_CYCLE_FLAG" ] && echo "0.0" || echo "0.1")
+CYCLE_FLAG="--cycle_weight $CYCLE_WEIGHT"
 SAVE_STEPS=500
 EVAL_STEPS=50
 
@@ -116,6 +137,7 @@ echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] PLUS mode            = ${PLUS_FLAG:-disabled}"
 echo "[INFO] CYCLE_WEIGHT         = $CYCLE_WEIGHT"
+echo "[INFO] Pose Head at         = $SKIP_LAYERS_DISPLAY"
 echo "[INFO] ABLATION             = ${ABLATION_FLAG:-disabled}"
 echo "[INFO] JSON_PATH            = $JSON_PATH"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
@@ -150,15 +172,15 @@ $TORCHRUN \
     --max_images             "$MAX_IMAGES"          \
     --grad_accum             "$GRAD_ACCUM"          \
     --num_workers            "$NUM_WORKERS"         \
-    --skip_layers            $SKIP_LAYERS           \
-    --cycle_weight           "$CYCLE_WEIGHT"        \
     --save_steps             "$SAVE_STEPS"          \
     --eval_steps             "$EVAL_STEPS"          \
     --wandb_project          "$WANDB_PROJECT"       \
     --wandb_entity           "$WANDB_ENTITY"        \
     --wandb_run_name         "$WANDB_RUN_NAME"      \
-    $MAX_SAMPLES_FLAG \
-    $PLUS_FLAG \
+    $SKIP_LAYERS_FLAG                                \
+    $CYCLE_FLAG                                      \
+    $MAX_SAMPLES_FLAG                                \
+    $PLUS_FLAG                                       \
     $ABLATION_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"
