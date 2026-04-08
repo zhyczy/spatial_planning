@@ -129,6 +129,7 @@ class CoordinatePlusModel(nn.Module):
             return_dict          = True,
             image_xyz            = image_xyz,
             coord_scale          = coord_scale,
+            coord_token_id       = self.coord_token_id,
             **kwargs,
         )
 
@@ -316,6 +317,7 @@ class CoordinateModel(nn.Module):
             return_dict          = True,
             image_xyz            = image_xyz,
             coord_scale          = coord_scale,
+            coord_token_id       = self.coord_token_id,
             **kwargs,
         )
 

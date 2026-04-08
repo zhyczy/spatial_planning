@@ -519,6 +519,39 @@ class SpaModel(Qwen3_5Model):
         pos_seq = pos_t.clone()  # placeholder; overwritten in get_rope_index
         return torch.stack([pos_seq, pos_t, pos_x, pos_y, pos_z], dim=0)  # (5, num_tokens)
 
+    def get_coord_position_ids(
+        self,
+        start_position: int,
+        xyz_int: torch.LongTensor,
+        device=None,
+    ) -> torch.LongTensor:
+        """
+        Compute 4D (T, X, Y, Z) position indices for <coord> tokens of one image.
+
+        X, Y, Z are copied directly from the corresponding image patch positions,
+        so each <coord> token is perfectly aligned with its image patch in RoPE space
+        (ΔX=0, ΔY=0, ΔZ=0). Only T differs (coord appears later in the sequence).
+
+        Args:
+            start_position: cur_text_pos when the coord run starts.
+            xyz_int: (n_coord, 3) — discretized xyz, identical to the values used
+                for the corresponding image patches (round(xyz * coord_scale).long()).
+            device: torch device.
+
+        Returns:
+            coord_position_ids: (4, n_coord)
+                [0] = T — cur_text_pos (shared across all coord tokens)
+                [1] = X — copied from image patch X
+                [2] = Y — copied from image patch Y
+                [3] = Z — copied from image patch Z
+        """
+        n_coord = xyz_int.shape[0]
+        T = torch.full((n_coord,), start_position, dtype=torch.long, device=device)
+        X = xyz_int[:, 0].to(device)
+        Y = xyz_int[:, 1].to(device)
+        Z = xyz_int[:, 2].to(device)
+        return torch.stack([T, X, Y, Z], dim=0)  # (4, n_coord)
+
     def get_rope_index(
         self,
         input_ids: torch.LongTensor,
@@ -528,6 +561,7 @@ class SpaModel(Qwen3_5Model):
         attention_mask: torch.Tensor | None = None,
         image_xyz: torch.Tensor | None = None,
         coord_scale: float = 100.0,
+        coord_token_id: int | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -606,16 +640,96 @@ class SpaModel(Qwen3_5Model):
             actual_seq  = 0      # true sequential position (for causal mask, dim 0)
             llm_pos_ids_list = []
 
+            # Track per-image (t_val, llm_h, llm_w) for coord token 3D-RoPE assignment
+            image_info: list[tuple[int, int, int]] = []
+            coord_img_ptr = 0   # which image's coord tokens we are assigning next
+
             for modality_type, start_idx, end_idx in input_type_group:
-                if modality_type == 0:  # text
+                if modality_type == 0:  # text (may contain <coord> tokens)
                     text_len = end_idx - start_idx
-                    # Text: seq=t=x=y=z = sequential position (5 identical rows)
-                    llm_pos_ids_list.append(
-                        torch.arange(text_len, device=input_ids.device)
-                        .view(1, -1).expand(5, -1) + current_pos
-                    )
-                    current_pos += text_len
-                    actual_seq  += text_len
+                    tokens_in_group = current_input_ids[start_idx:end_idx]
+
+                    if (coord_token_id is not None
+                            and image_info
+                            and (tokens_in_group == coord_token_id).any()):
+                        # Mixed text + coord tokens: assign 3D-RoPE to coord tokens,
+                        # sequential positions to regular text tokens.
+                        dev = input_ids.device
+                        group_pos = torch.empty(5, text_len, device=dev,
+                                                dtype=input_ids.dtype)
+                        # dim-0 (seq) is always sequential for causal mask
+                        group_pos[0] = torch.arange(actual_seq, actual_seq + text_len,
+                                                     device=dev)
+                        is_coord = (tokens_in_group == coord_token_id)
+                        cur_text_pos = current_pos
+                        i = 0
+                        while i < text_len:
+                            if not is_coord[i]:
+                                # Non-coord run: sequential on dims 1-4
+                                j = i
+                                while j < text_len and not is_coord[j]:
+                                    j += 1
+                                run = torch.arange(cur_text_pos,
+                                                   cur_text_pos + (j - i), device=dev)
+                                group_pos[1, i:j] = run
+                                group_pos[2, i:j] = run
+                                group_pos[3, i:j] = run
+                                group_pos[4, i:j] = run
+                                cur_text_pos += j - i
+                                i = j
+                            else:
+                                # Coord run: 3D (T, H, W) — via get_coord_position_ids()
+                                j = i
+                                while j < text_len and is_coord[j]:
+                                    j += 1
+                                n_coord = j - i
+                                if coord_img_ptr < len(image_info):
+                                    _, llm_h, llm_w, xyz_c = image_info[coord_img_ptr]
+                                    # Discretize xyz — same formula as get_vision_position_ids
+                                    xyz_int = (
+                                        xyz_c.reshape(-1, 3).to(dev) * coord_scale
+                                    ).round().long()               # (n_coord, 3)
+                                    coord_pos = self.get_coord_position_ids(
+                                        cur_text_pos, xyz_int, dev
+                                    )                              # (4, n_coord): T, X, Y, Z
+                                    group_pos[1, i:j] = coord_pos[0]  # T = cur_text_pos
+                                    group_pos[2, i:j] = coord_pos[1]  # X copied from image patch
+                                    group_pos[3, i:j] = coord_pos[2]  # Y copied from image patch
+                                    group_pos[4, i:j] = coord_pos[3]  # Z copied from image patch
+                                    cur_text_pos += max(llm_h, llm_w)  # advance like image tokens
+                                    coord_img_ptr += 1
+                                else:
+                                    # Fallback: treat as sequential text
+                                    run = torch.arange(cur_text_pos,
+                                                       cur_text_pos + n_coord, device=dev)
+                                    group_pos[1, i:j] = run
+                                    group_pos[2, i:j] = run
+                                    group_pos[3, i:j] = run
+                                    group_pos[4, i:j] = run
+                                    cur_text_pos += n_coord
+                                i = j
+
+                        llm_pos_ids_list.append(group_pos)
+                        current_pos = cur_text_pos
+                        actual_seq  += text_len
+
+                    else:
+                        # No coord tokens: original sequential text handling
+                        # dim-0 (seq) uses actual_seq for correct causal mask;
+                        # dims 1-4 (t,x,y,z) use current_pos (RoPE budget).
+                        seq_row = torch.arange(
+                            actual_seq, actual_seq + text_len,
+                            device=input_ids.device,
+                        )
+                        rope_row = torch.arange(
+                            current_pos, current_pos + text_len,
+                            device=input_ids.device,
+                        )
+                        plain_pos = torch.stack([seq_row, rope_row, rope_row,
+                                                 rope_row, rope_row], dim=0)  # (5, text_len)
+                        llm_pos_ids_list.append(plain_pos)
+                        current_pos += text_len
+                        actual_seq  += text_len
 
                 else:  # image (1) or video (2)
                     grid_thw = next(grid_iters[modality_type])
@@ -628,6 +742,9 @@ class SpaModel(Qwen3_5Model):
                             llm_h, llm_w, 3,
                             dtype=torch.float32, device=input_ids.device,
                         )
+
+                    # Record for coord token assignment: t_val, grid, and xyz for X/Y/Z copy
+                    image_info.append((current_pos, llm_h, llm_w, xyz_coords))
 
                     vision_position_ids = self.get_vision_position_ids(
                         start_position=current_pos,
@@ -705,16 +822,21 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self.model = SpaModel(config)
 
     def forward(self, *args, image_xyz: torch.Tensor | None = None,
-                coord_scale: float = 100.0, **kwargs):
+                coord_scale: float = 100.0,
+                coord_token_id: int | None = None, **kwargs):
         """
         Thin wrapper that injects image_xyz into get_rope_index() via kwargs.
 
         image_xyz: (num_images, 3) float tensor of 3D camera coordinates,
                    in the same order as images appear left-to-right in the batch.
         coord_scale: passed through to get_rope_index / get_vision_position_ids.
+        coord_token_id: if set, <coord> tokens in text segments get 3D-RoPE
+                        (t=image_t, x=row, y=col, z=0) matching their image/patch.
         """
         if image_xyz is not None:
             kwargs["image_xyz"] = image_xyz
         if coord_scale != 100.0:
             kwargs["coord_scale"] = coord_scale
+        if coord_token_id is not None:
+            kwargs["coord_token_id"] = coord_token_id
         return super().forward(*args, **kwargs)

@@ -1,24 +1,27 @@
 """
 evaluation.py
 
-Two-method QA evaluation:
+Multi-method QA evaluation:
 
-  Method A — baseline
-      Model : Qwen3.5-VL loaded as AutoModelForImageTextToText
-      Input : original dataset images + question (standard VLM inference)
+  baseline
+      Model : Qwen3.5-VL (AutoModelForImageTextToText)
+      Input : images + question  (standard VLM inference)
 
-  Method B — correspondence
-      Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA adapter from
-              --correspondence_ckpt, evaluated WITHOUT the PoseRegressionHead
-      Input : original dataset images + question
-      3D pos: CoordEstimator (MapAnything) estimates per-pixel XYZ for each
-              image, aligns all frames to the first-frame camera coordinate
-              system, and passes image_xyz to the 4D M-RoPE position embedding.
+  vanilla
+      Model : Qwen3.5-VL + LoRA, original 3D M-RoPE (ablation: LoRA only)
+      Input : images + pose_sentences + question  (no <coord> tokens)
 
-Run a single method or both:
-  --method baseline          → only Method A
-  --method correspondence    → only Method B
-  --method both              → both (default)
+  position_embedding
+      Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
+      Input : images + pose_sentences + question  (no <coord> tokens)
+      3D pos: precomputed XYZ → 4D M-RoPE on image patches
+
+  coordinate
+      Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
+      Input : images + pose_sentences + <coord>-token sentences + question
+      3D pos: precomputed XYZ → 4D M-RoPE on image patches AND <coord> tokens
+
+  both   → baseline + coordinate  (primary comparison)
 
 Usage
 -----
@@ -28,15 +31,22 @@ python evaluation.py \\
     --model_path checkpoints/Qwen3.5-4B \\
     --data_dir  datasets/evaluation/MMSIBench
 
-# correspondence only
+# coordinate (full SPA method)
 python evaluation.py \\
-    --method correspondence \\
+    --method coordinate \\
     --model_path            checkpoints/Qwen3.5-4B \\
     --correspondence_ckpt   train_records/correspondence/final \\
     --data_dir              datasets/evaluation/MMSIBench
 
-# both
+# both (baseline + coordinate)
 python evaluation.py \\
+    --model_path            checkpoints/Qwen3.5-4B \\
+    --correspondence_ckpt   train_records/correspondence/final \\
+    --data_dir              datasets/evaluation/MMSIBench
+
+# vanilla ablation
+python evaluation.py \\
+    --method vanilla \\
     --model_path            checkpoints/Qwen3.5-4B \\
     --correspondence_ckpt   train_records/correspondence/final \\
     --data_dir              datasets/evaluation/MMSIBench
@@ -55,6 +65,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -77,10 +88,18 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# ── sys.path: RoboSpatial-Eval mask-based evaluation ──────────────────────
+_ROBOSPATIAL_EVAL_ROOT = _ROOT.parent / "RoboSpatial-Eval"
+if _ROBOSPATIAL_EVAL_ROOT.exists() and str(_ROBOSPATIAL_EVAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROBOSPATIAL_EVAL_ROOT))
+
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
 QUESTION_TEMPLATE = "{Question}"
+
+# ── RoboSpatial: open-ended, no multiple-choice letter ───────────────────────
+ROBOSPATIAL_SYSTEM_PROMPT = "You are a spatial reasoning expert helping with robot navigation tasks."
 
 # ── Non-thinking mode: answer first, then reasoning ──────────────────────────
 ANSWER_INSTRUCTION = (
@@ -194,11 +213,11 @@ def load_spa_model(
     device: str = "cuda:0",
     vanilla: bool = False,
 ) -> Tuple[Any, Any]:
-    """Load SPA model with LoRA adapter for correspondence evaluation.
+    """Load SPA model with LoRA adapter.
 
     Steps:
       1. Load config and set mrope_section to 4 equal parts (4D M-RoPE).
-         For vanilla ablation: keep original 3D mrope_section and use stock
+         For vanilla: keep original 3D mrope_section and use stock
          Qwen3_5ForConditionalGeneration instead of SpaForConditionalGeneration.
       2. Load base model from base_model_path.
       3. Load processor/tokenizer from ckpt_path (has <pose> in vocab).
@@ -206,14 +225,14 @@ def load_spa_model(
       5. Load PEFT LoRA adapter from ckpt_path, then merge into base weights.
     """
     logger = logging.getLogger(__name__)
-    logger.info(f"[correspondence] Loading SPA model: base={base_model_path}  ckpt={ckpt_path}  vanilla={vanilla}")
+    logger.info(f"[spa] Loading SPA model: base={base_model_path}  ckpt={ckpt_path}  vanilla={vanilla}")
 
     config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
 
     if vanilla:
         # vanilla ablation: keep original 3D M-RoPE, use stock Qwen3.5 model
-        logger.info(f"[correspondence] mrope_section: {orig_section} (original 3D M-RoPE, vanilla)")
+        logger.info(f"[spa] mrope_section: {orig_section} (original 3D M-RoPE, vanilla)")
         spa = Qwen3_5ForConditionalGeneration.from_pretrained(
             base_model_path,
             config=config,
@@ -226,7 +245,7 @@ def load_spa_model(
         xyz_size = (total - 2) // 3
         new_section = [2, xyz_size, xyz_size, xyz_size]
         config.text_config.rope_scaling["mrope_section"] = new_section
-        logger.info(f"[correspondence] mrope_section: {orig_section} → {new_section}")
+        logger.info(f"[spa] mrope_section: {orig_section} → {new_section}")
         spa = SpaForConditionalGeneration.from_pretrained(
             base_model_path,
             config=config,
@@ -244,15 +263,15 @@ def load_spa_model(
     old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
     if new_vocab > old_vocab:
         spa.resize_token_embeddings(new_vocab)
-        logger.info(f"[correspondence] Embedding: {old_vocab} → {new_vocab}")
+        logger.info(f"[spa] Embedding: {old_vocab} → {new_vocab}")
 
     # 5. Load LoRA adapter and merge
     spa = PeftModel.from_pretrained(spa, ckpt_path, is_trainable=False)
     spa = spa.merge_and_unload()
-    logger.info("[correspondence] LoRA adapter merged.")
+    logger.info("[spa] LoRA adapter merged.")
 
     spa = spa.to(device).eval()
-    logger.info(f"[correspondence] Model ready on {next(spa.parameters()).device}")
+    logger.info(f"[spa] Model ready on {next(spa.parameters()).device}")
     return spa, processor
 
 
@@ -391,13 +410,17 @@ def build_image_xyz(
 # Inference helpers — baseline
 # ===========================================================================
 
-def _build_user_message(item: Dict[str, Any], thinking: bool = False) -> Dict:
+def _build_user_message(item: Dict[str, Any], thinking: bool = False,
+                        train_template: bool = False) -> Dict:
     image_contents = [{"type": "image", "image": p} for p in item["image"]]
-    instruction = ANSWER_INSTRUCTION_THINKING if thinking else ANSWER_INSTRUCTION
-    text = (
-        f"{QUESTION_TEMPLATE.format(Question=item['question'])}\n"
-        f"{instruction}"
-    )
+    if train_template or item.get("format_type") == "robospatial":
+        text = QUESTION_TEMPLATE.format(Question=item["question"])
+    else:
+        instruction = ANSWER_INSTRUCTION_THINKING if thinking else ANSWER_INSTRUCTION
+        text = (
+            f"{QUESTION_TEMPLATE.format(Question=item['question'])}\n"
+            f"{instruction}"
+        )
     return {"role": "user", "content": image_contents + [{"type": "text", "text": text}]}
 
 
@@ -409,31 +432,31 @@ def prepare_batch_baseline(
     """Tokenise a batch for the standard Qwen3.5-VL baseline."""
     from qwen_vl_utils import process_vision_info
 
-    system_prompt = EVAL_SYSTEM_PROMPT_THINKING if thinking else EVAL_SYSTEM_PROMPT
-    batch_messages = [
-        [{"role": "system", "content": system_prompt},
-         _build_user_message(item, thinking=thinking)]
-        for item in batch_data
-    ]
-
-    if thinking:
-        # enable_thinking=True lets the model emit <think>...</think> before answering.
-        # Do NOT append "<answer>" — that would suppress the thinking block.
-        prompts_text = [
-            processor.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True,
-                enable_thinking=True,
+    prompts_text = []
+    batch_messages = []
+    for item in batch_data:
+        is_robospatial = item.get("format_type") == "robospatial"
+        sys_prompt = ROBOSPATIAL_SYSTEM_PROMPT if is_robospatial else (
+            EVAL_SYSTEM_PROMPT_THINKING if thinking else EVAL_SYSTEM_PROMPT
+        )
+        msgs = [
+            {"role": "system", "content": sys_prompt},
+            _build_user_message(item, thinking=thinking),
+        ]
+        batch_messages.append(msgs)
+        if is_robospatial or thinking:
+            prompts_text.append(
+                processor.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                    **({"enable_thinking": True} if thinking and not is_robospatial else {}),
+                )
             )
-            for msgs in batch_messages
-        ]
-    else:
-        # Append "<answer>" to force the model to start its output with the answer.
-        prompts_text = [
-            processor.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True,
-            ) + "<answer>"
-            for msgs in batch_messages
-        ]
+        else:
+            prompts_text.append(
+                processor.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                ) + "<answer>"
+            )
 
     all_image_inputs, all_video_inputs = [], []
     for msgs in batch_messages:
@@ -492,6 +515,11 @@ def prepare_batch_spa(
 ) -> Tuple[Dict, str, List[torch.Tensor]]:
     """Tokenise one sample and build image_xyz for SPA model inference.
 
+    The prompt matches training format:
+      [images] + pose_sentences + (coord_sentences if use_coord) + question
+
+    No system prompt, no answer instruction — identical to train_dataset.py.
+
     Returns
     -------
     inputs     : processor output dict (input_ids, attention_mask, pixel_values, image_grid_thw)
@@ -500,22 +528,75 @@ def prepare_batch_spa(
     """
     from qwen_vl_utils import process_vision_info
 
-    system_prompt = EVAL_SYSTEM_PROMPT_THINKING if thinking else EVAL_SYSTEM_PROMPT
-    messages = [
-        {"role": "system", "content": system_prompt},
-        _build_user_message(item, thinking=thinking),
-    ]
-    if thinking:
-        prompt_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=True,
+    POSE_TOKEN = "<pose>"
+    COORD_TOKEN = "<coord>"
+
+    image_paths = item["image"]
+    N = len(image_paths)
+    question = item.get("question", "")
+
+    # ── image content ────────────────────────────────────────────────────────
+    content: list = [{"type": "image", "image": p} for p in image_paths]
+
+    # ── pose sentences (like training) ───────────────────────────────────────
+    pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
+    pose_sentences = [
+        f"The camera pose of image {j + 1} relative to image {i + 1} is "
+        f"{POSE_TOKEN}."
+        for (i, j) in pairs
+    ] if N >= 2 else []
+
+    if use_coord and N >= 2:
+        # ── probe step: get image_grid_thw to know patch counts per image ──
+        probe_content = list(content)
+        probe_text = " ".join(pose_sentences) + " " + question if pose_sentences else question
+        probe_content.append({"type": "text", "text": probe_text})
+        probe_messages = [{"role": "user", "content": probe_content}]
+        probe_prompt = processor.apply_chat_template(
+            probe_messages, tokenize=False, add_generation_prompt=False,
+        )
+        probe_images, _ = process_vision_info(probe_messages)
+        probe_out = processor(
+            text=[probe_prompt],
+            images=probe_images if probe_images else None,
+            return_tensors="pt", padding=False,
+        )
+        thw_all = probe_out["image_grid_thw"]  # (N, 3)
+        sms = spatial_merge_size
+
+        # ── coord sentences (one <coord> token per LLM patch) ──────────────
+        coord_sentences = []
+        for k in range(N):
+            llm_h = int(thw_all[k][1]) // sms
+            llm_w = int(thw_all[k][2]) // sms
+            n_tok = llm_h * llm_w
+            coord_tokens = " ".join([COORD_TOKEN] * n_tok)
+            coord_sentences.append(
+                f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
+            )
+
+        # ── final text: pose + coord + question ───────────────────────────
+        final_text = (
+            " ".join(pose_sentences)
+            + " "
+            + " ".join(coord_sentences)
+            + " "
+            + question
         )
     else:
-        prompt_text = (
-            processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            ) + "<answer>"
-        )
+        # ── final text: pose + question (no coord) ────────────────────────
+        if pose_sentences:
+            final_text = " ".join(pose_sentences) + " " + question
+        else:
+            final_text = question
+
+    content.append({"type": "text", "text": final_text})
+
+    # ── build messages (no system prompt — matches training) ─────────────────
+    messages = [{"role": "user", "content": content}]
+    prompt_text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
 
     image_inputs, video_inputs = process_vision_info(messages)
 
@@ -577,6 +658,12 @@ def run_inference_spa(
         for k, v in inputs.items()
     }
 
+    # Resolve <coord> token id for 3D-RoPE on coord tokens
+    coord_token_id = None
+    _coord_id = processor.tokenizer.convert_tokens_to_ids("<coord>")
+    if isinstance(_coord_id, int) and _coord_id != processor.tokenizer.unk_token_id:
+        coord_token_id = _coord_id
+
     if vanilla:
         # Stock Qwen3.5: let the model compute its own 3D position_ids
         gen_kwargs: Dict[str, Any] = dict(
@@ -606,6 +693,7 @@ def run_inference_spa(
                 attention_mask=inputs_dev.get("attention_mask"),
                 image_xyz=xyz_on_device,
                 coord_scale=coord_scale,
+                coord_token_id=coord_token_id,
             )
 
         gen_kwargs: Dict[str, Any] = dict(
@@ -622,6 +710,8 @@ def run_inference_spa(
         gen_kwargs.pop("mm_token_type_ids", None)
         if xyz_on_device is not None:
             gen_kwargs["image_xyz"] = xyz_on_device
+        if coord_token_id is not None:
+            gen_kwargs["coord_token_id"] = coord_token_id
 
     with torch.no_grad():
         generated_ids = model.generate(**gen_kwargs)
@@ -643,16 +733,21 @@ def _make_result(
     method: str,
     thinking: bool = False,
 ) -> Dict:
-    # Non-thinking: model output starts right after the "<answer>" prefix we
-    # injected into the prompt, so we prepend it back for a complete tag.
-    # Thinking: model generates the full response (including <think>...</think>
-    # and <answer>X</answer>) — no prefix needed.
-    full_output = output if thinking else "<answer>" + output
     fmt = item.get("format_type", "select")
-    if fmt == "fill":
-        prediction = extract_answer_number(full_output)
+    if fmt == "robospatial":
+        # Open-ended output: store raw for mask-based evaluation
+        full_output = output
+        prediction = output
     else:
-        prediction = extract_answer_letter(full_output)
+        # Non-thinking: model output starts right after the "<answer>" prefix we
+        # injected into the prompt, so we prepend it back for a complete tag.
+        # Thinking: model generates the full response (including <think>...</think>
+        # and <answer>X</answer>) — no prefix needed.
+        full_output = output if thinking else "<answer>" + output
+        if fmt == "fill":
+            prediction = extract_answer_number(full_output)
+        else:
+            prediction = extract_answer_letter(full_output)
     return {
         "method": method,
         "index": item.get("index", ""),
@@ -660,6 +755,8 @@ def _make_result(
         "format_type": fmt,
         "question": item.get("question", ""),
         "answer": item.get("answer", ""),
+        "mask": item.get("mask"),
+        "data_dir": item.get("data_dir"),
         "prediction": prediction,
         "output": full_output,
         "thought_gt": item.get("thought", ""),
@@ -702,11 +799,67 @@ def _mra_score(pred_str: str, gt_str: str) -> float:
         return 0.0
 
 
+def _failed_case(r: Dict) -> Dict:
+    return {
+        "index":      r.get("index", ""),
+        "question":   r.get("question", ""),
+        "answer":     r.get("answer", ""),
+        "prediction": r.get("prediction", ""),
+        "output":     r.get("output", ""),
+        "images":     r.get("image_paths", []),
+    }
+
+
+def _save_failure_cases(failures_dir: Path, failures: Dict[str, List[Dict]]) -> None:
+    """Save failure cases as a folder tree with images and qa.txt per case.
+
+    Structure:
+        failures_{mname}/
+            {category}/
+                case_{i}/
+                    image_0.jpg [image_1.jpg ...]
+                    qa.txt
+    """
+    failures_dir.mkdir(parents=True, exist_ok=True)
+    for cat, cases in failures.items():
+        cat_dir = failures_dir / cat
+        cat_dir.mkdir(exist_ok=True)
+        for i, case in enumerate(cases):
+            case_dir = cat_dir / f"case_{i:02d}"
+            case_dir.mkdir(exist_ok=True)
+
+            # Copy images
+            for j, img_path in enumerate(case.get("images", [])):
+                src = Path(img_path)
+                if src.exists():
+                    suffix = src.suffix or ".jpg"
+                    shutil.copy2(src, case_dir / f"image_{j}{suffix}")
+
+            # Write QA text
+            lines = [
+                f"Index     : {case.get('index', '')}",
+                f"Question  : {case.get('question', '')}",
+                f"Expected  : {case.get('answer', '')}",
+                f"Prediction: {case.get('prediction', '')}",
+            ]
+            if "parsed_prediction" in case:
+                lines.append(f"Parsed    : {case.get('parsed_prediction', '')}")
+            if "mask" in case:
+                lines.append(f"Mask      : {case.get('mask', '')}")
+            lines += [
+                "",
+                "--- Full output ---",
+                case.get("output", ""),
+            ]
+            (case_dir / "qa.txt").write_text("\n".join(lines), encoding="utf-8")
+
+
 def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
     total = len(results)
     correct = 0
     cat_correct: dict = defaultdict(float)
     cat_total: dict = defaultdict(int)
+    cat_failures: dict = defaultdict(list)
     for r in results:
         pred = r.get("prediction", "")
         gt   = r.get("answer", "")
@@ -717,10 +870,14 @@ def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
             score = _mra_score(pred, gt)
             correct += score
             cat_correct[cat] += score
+            if score < 1.0 and len(cat_failures[cat]) < 10:
+                cat_failures[cat].append(_failed_case(r))
         else:
             if pred.lower().strip() == gt.lower().strip():
                 correct += 1
                 cat_correct[cat] += 1
+            elif len(cat_failures[cat]) < 10:
+                cat_failures[cat].append(_failed_case(r))
     cat_accuracy = {cat: cat_correct[cat] / cat_total[cat] for cat in cat_total}
     return {
         "overall_accuracy": correct / total if total else 0.0,
@@ -728,6 +885,55 @@ def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
         "correct_samples": correct,
         "category_accuracy": cat_accuracy,
         "category_counts": dict(cat_total),
+        "category_failures": dict(cat_failures),
+    }
+
+
+def compute_metrics_robospatial(results: List[Dict]) -> Dict[str, Any]:
+    """Compute metrics for RoboSpatial using mask-based evaluation."""
+    from evaluation import evaluate_answer  # from RoboSpatial-Eval/evaluation.py
+
+    total = len(results)
+    correct = 0
+    illformed = 0
+    cat_correct: dict = defaultdict(float)
+    cat_total: dict = defaultdict(int)
+    cat_failures: dict = defaultdict(list)
+
+    for r in results:
+        gt = r.get("answer", "")
+        pred = r.get("prediction", "")
+        cat = r.get("category", "unknown")
+        mask_rel = r.get("mask")
+        data_dir = r.get("data_dir")
+        cat_total[cat] += 1
+
+        is_correct, _, parsed, is_parsable = evaluate_answer(
+            gt, pred,
+            mask_path=mask_rel,
+            data_dir=data_dir,
+            category=cat,
+        )
+        if not is_parsable:
+            illformed += 1
+        if is_correct:
+            correct += 1
+            cat_correct[cat] += 1
+        elif len(cat_failures[cat]) < 10:
+            case = _failed_case(r)
+            case["parsed_prediction"] = str(parsed) if parsed is not None else None
+            case["mask"] = mask_rel
+            cat_failures[cat].append(case)
+
+    cat_accuracy = {cat: cat_correct[cat] / cat_total[cat] for cat in cat_total}
+    return {
+        "overall_accuracy": correct / total if total else 0.0,
+        "total_samples": total,
+        "correct_samples": correct,
+        "illformed_responses": illformed,
+        "category_accuracy": cat_accuracy,
+        "category_counts": dict(cat_total),
+        "category_failures": dict(cat_failures),
     }
 
 
@@ -754,53 +960,75 @@ def evaluate(
     method: str,
     # baseline args
     baseline_model_path: str,
-    # correspondence args
+    # spa args
     spa_base_model_path: str,
     correspondence_ckpt: Optional[str],
-    use_coord: bool,
     coord_scale: float,
     # common
     max_new_tokens: int,
     output_dir: Path,
     device: str = "cuda:0",
     thinking: bool = False,
-    vanilla: bool = False,
 ) -> Dict[str, List[Dict]]:
     """Run evaluation for the requested method(s) on *data*.
+
+    method choices:
+      baseline           — stock Qwen3.5-VL
+      vanilla            — SPA LoRA + 3D M-RoPE (no <coord>)
+      position_embedding — SPA LoRA + 4D M-RoPE (no <coord>)
+      coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens
+      both               — baseline + coordinate
 
     Returns dict mapping method name → list of result dicts.
     """
     logger = logging.getLogger(__name__)
 
     run_baseline = method in ("baseline", "both")
-    run_correspondence = method in ("correspondence", "both")
+    run_vanilla = method == "vanilla"
+    run_position_embedding = method == "position_embedding"
+    run_coordinate = method in ("coordinate", "both")
+    run_spa = run_vanilla or run_position_embedding or run_coordinate
 
     # Lazy-load only what we need
     baseline_model = baseline_proc = None
     spa_model = spa_proc = None
+    spatial_merge_size = 2
 
     if run_baseline:
         baseline_model, baseline_proc = load_baseline_model(baseline_model_path, device)
 
-    if run_correspondence:
+    if run_spa:
         if correspondence_ckpt is None:
-            raise ValueError("--correspondence_ckpt is required for method='correspondence'/'both'")
-        spa_model, spa_proc = load_spa_model(spa_base_model_path, correspondence_ckpt, device, vanilla=vanilla)
+            raise ValueError(
+                f"--correspondence_ckpt is required for method='{method}'"
+            )
+        use_vanilla_arch = run_vanilla
+        spa_model, spa_proc = load_spa_model(
+            spa_base_model_path, correspondence_ckpt, device, vanilla=use_vanilla_arch
+        )
 
         # Resolve spatial_merge_size from base model config
         cfg_path = Path(spa_base_model_path) / "config.json"
         with open(cfg_path) as f:
             _vcfg = json.load(f).get("vision_config", {})
         spatial_merge_size = int(_vcfg.get("spatial_merge_size", 2))
-        logger.info(f"[correspondence] spatial_merge_size={spatial_merge_size}")
+        logger.info(f"[spa] spatial_merge_size={spatial_merge_size}")
 
-        if not use_coord:
-            logger.info("[correspondence] --no_coord set: using zero image_xyz")
+    # Determine which SPA variants to run and their use_coord setting
+    # (vanilla and position_embedding both skip <coord> tokens)
+    spa_variants: List[Tuple[str, bool]] = []   # (method_name, use_coord)
+    if run_vanilla:
+        spa_variants.append(("vanilla", False))
+    if run_position_embedding:
+        spa_variants.append(("position_embedding", False))
+    if run_coordinate:
+        spa_variants.append(("coordinate", True))
 
-    results_map: Dict[str, List[Dict]] = {
-        "baseline": [],
-        "correspondence": [],
-    }
+    active_methods = (
+        (["baseline"] if run_baseline else [])
+        + [name for name, _ in spa_variants]
+    )
+    results_map: Dict[str, List[Dict]] = {m: [] for m in active_methods}
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -821,8 +1049,8 @@ def evaluate(
                 logger.error(f"[baseline] idx={item.get('index')}: {exc}", exc_info=True)
                 results_map["baseline"].append(_error_result(item, exc, "baseline"))
 
-        # ---- Correspondence ----
-        if run_correspondence:
+        # ---- SPA variants ----
+        for spa_method_name, use_coord in spa_variants:
             try:
                 inputs, prompt, image_xyz = prepare_batch_spa(
                     item, spa_proc,
@@ -831,15 +1059,20 @@ def evaluate(
                 )
                 output = run_inference_spa(
                     inputs, image_xyz, spa_model, spa_proc,
-                    max_new_tokens, coord_scale, vanilla=vanilla,
+                    max_new_tokens, coord_scale, vanilla=use_vanilla_arch,
                 )
-                results_map["correspondence"].append(
-                    _make_result(item, output, prompt, "correspondence",
+                results_map[spa_method_name].append(
+                    _make_result(item, output, prompt, spa_method_name,
                                  thinking=thinking)
                 )
             except Exception as exc:
-                logger.error(f"[correspondence] idx={item.get('index')}: {exc}", exc_info=True)
-                results_map["correspondence"].append(_error_result(item, exc, "correspondence"))
+                logger.error(
+                    f"[{spa_method_name}] idx={item.get('index')}: {exc}",
+                    exc_info=True,
+                )
+                results_map[spa_method_name].append(
+                    _error_result(item, exc, spa_method_name)
+                )
 
     # Save per-worker partial results
     for mname, mresults in results_map.items():
@@ -863,13 +1096,11 @@ def _worker(
     baseline_model_path: str,
     spa_base_model_path: str,
     correspondence_ckpt: Optional[str],
-    use_coord: bool,
     coord_scale: float,
     max_new_tokens: int,
     output_dir: str,
     log_file: Optional[str],
     thinking: bool = False,
-    vanilla: bool = False,
 ) -> None:
     if log_file:
         logging.basicConfig(
@@ -889,13 +1120,11 @@ def _worker(
         baseline_model_path=baseline_model_path,
         spa_base_model_path=spa_base_model_path,
         correspondence_ckpt=correspondence_ckpt,
-        use_coord=use_coord,
         coord_scale=coord_scale,
         max_new_tokens=max_new_tokens,
         output_dir=Path(output_dir),
         device=device,
         thinking=thinking,
-        vanilla=vanilla,
     )
     logger.info(f"[Worker {gpu_id}] Done.")
 
@@ -905,44 +1134,46 @@ def _worker(
 # ===========================================================================
 
 def analyze_changes(
-    baseline_results: List[Dict],
-    correspondence_results: List[Dict],
+    method_a_results: List[Dict],
+    method_b_results: List[Dict],
     logger: logging.Logger,
+    method_a_name: str = "baseline",
+    method_b_name: str = "coordinate",
 ) -> Dict[str, Any]:
-    """Categorise per-sample changes between baseline and correspondence."""
-    corr_by_idx = {r["index"]: r for r in correspondence_results}
+    """Categorise per-sample changes between two methods (A vs B)."""
+    b_by_idx = {r["index"]: r for r in method_b_results}
 
     groups: Dict[str, List] = {
-        "improved":    [],   # baseline ✗, correspondence ✓
-        "degraded":    [],   # baseline ✓, correspondence ✗
+        "improved":    [],   # A ✗, B ✓
+        "degraded":    [],   # A ✓, B ✗
         "both_correct": [],  # both ✓
         "both_wrong":  [],   # both ✗
     }
 
-    for b in baseline_results:
-        idx = b["index"]
-        c = corr_by_idx.get(idx)
-        if c is None:
-            logger.warning(f"No correspondence result for index {idx}, skipping.")
+    for a in method_a_results:
+        idx = a["index"]
+        b = b_by_idx.get(idx)
+        if b is None:
+            logger.warning(f"No {method_b_name} result for index {idx}, skipping.")
             continue
 
+        a_ok = a.get("prediction", "").lower() == a.get("answer", "").lower()
         b_ok = b.get("prediction", "").lower() == b.get("answer", "").lower()
-        c_ok = c.get("prediction", "").lower() == c.get("answer", "").lower()
 
         entry = {
             "index": idx,
-            "category": b.get("category", ""),
-            "question": b.get("question", ""),
-            "answer": b.get("answer", ""),
-            "baseline_prediction": b.get("prediction", ""),
-            "correspondence_prediction": c.get("prediction", ""),
+            "category": a.get("category", ""),
+            "question": a.get("question", ""),
+            "answer": a.get("answer", ""),
+            f"{method_a_name}_prediction": a.get("prediction", ""),
+            f"{method_b_name}_prediction": b.get("prediction", ""),
         }
 
-        if not b_ok and c_ok:
+        if not a_ok and b_ok:
             groups["improved"].append(entry)
-        elif b_ok and not c_ok:
+        elif a_ok and not b_ok:
             groups["degraded"].append(entry)
-        elif b_ok and c_ok:
+        elif a_ok and b_ok:
             groups["both_correct"].append(entry)
         else:
             groups["both_wrong"].append(entry)
@@ -953,17 +1184,17 @@ def analyze_changes(
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("BASELINE vs CORRESPONDENCE — change analysis")
+    logger.info(f"{method_a_name.upper()} vs {method_b_name.upper()} — change analysis")
     logger.info("=" * 60)
     descs = {
-        "improved":     "Baseline ✗ → Correspondence ✓  (3D helps)",
-        "degraded":     "Baseline ✓ → Correspondence ✗  (3D hurts)",
+        "improved":     f"{method_a_name} ✗ → {method_b_name} ✓  (3D helps)",
+        "degraded":     f"{method_a_name} ✓ → {method_b_name} ✗  (3D hurts)",
         "both_correct": "Both correct",
         "both_wrong":   "Both wrong",
     }
     for k, desc in descs.items():
-        logger.info(f"  {desc:<50s}: {counts[k]:4d}  ({proportions[k]:.1%})")
-    logger.info(f"  {'Total':<50s}: {total:4d}")
+        logger.info(f"  {desc:<55s}: {counts[k]:4d}  ({proportions[k]:.1%})")
+    logger.info(f"  {'Total':<55s}: {total:4d}")
     logger.info("=" * 60)
 
     return {
@@ -986,8 +1217,15 @@ def main() -> None:
     # ── method ────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--method", type=str, default="both",
-        choices=["baseline", "correspondence", "both"],
-        help="Which method(s) to run.",
+        choices=["baseline", "vanilla", "position_embedding", "coordinate", "both"],
+        help=(
+            "Which method(s) to run. "
+            "baseline=stock Qwen3.5-VL; "
+            "vanilla=SPA LoRA + 3D M-RoPE (no <coord>); "
+            "position_embedding=SPA LoRA + 4D M-RoPE (no <coord>); "
+            "coordinate=SPA LoRA + 4D M-RoPE + <coord> tokens; "
+            "both=baseline + coordinate."
+        ),
     )
 
     # ── model paths ───────────────────────────────────────────────────────────
@@ -1005,17 +1243,6 @@ def main() -> None:
 
     # ── 3D coordinate estimation ──────────────────────────────────────────────
     parser.add_argument(
-        "--no_coord", action="store_true", default=False,
-        help="Skip CoordEstimator; pass zero image_xyz to the SPA model. "
-             "Useful for ablation or debugging without MapAnything.",
-    )
-    parser.add_argument(
-        "--abl_vanilla", action="store_true", default=False,
-        help="Vanilla ablation: load stock Qwen3_5ForConditionalGeneration with "
-             "original 3D M-RoPE instead of SpaForConditionalGeneration with 4D M-RoPE. "
-             "Must match the model trained with --ablation vanilla.",
-    )
-    parser.add_argument(
         "--coord_scale", type=float, default=100.0,
         help="Scale applied to XYZ values before discretisation in M-RoPE "
              "(must match the value used during training, default: 100.0).",
@@ -1028,7 +1255,7 @@ def main() -> None:
             "mmsibench", "mindcube",
             "sat", "sat_real",
             "sparbench_multi_view", "sparbench_single_view", "sparbench_mv",
-            "vsibench", "spinbench",
+            "vsibench", "spinbench", "robospatial",
         ],
     )
     parser.add_argument("--data_dir", type=str, default="datasets/evaluation/MMSIBench")
@@ -1095,8 +1322,6 @@ def main() -> None:
     logger.info(f"  thinking            : {args.thinking}")
     logger.info(f"  model_path          : {args.model_path}")
     logger.info(f"  correspondence_ckpt : {args.correspondence_ckpt}")
-    logger.info(f"  use_coord           : {not args.no_coord}")
-    logger.info(f"  abl_vanilla         : {args.abl_vanilla}")
     logger.info(f"  coord_scale         : {args.coord_scale}")
     logger.info(f"  dataset             : {args.dataset}  ({len(dataset)} samples)")
     logger.info(f"  max_new_tokens      : {args.max_new_tokens}")
@@ -1126,16 +1351,14 @@ def main() -> None:
             args=(
                 gpu_id, shard,
                 args.method,
-                args.model_path,     # baseline + spa base
-                args.model_path,     # spa_base_model_path (same base)
+                args.model_path,     # baseline model path
+                args.model_path,     # spa_base_model_path (same checkpoint)
                 args.correspondence_ckpt,
-                not args.no_coord,
                 args.coord_scale,
                 args.max_new_tokens,
                 str(output_dir),
                 str(log_file),
                 args.thinking,
-                args.abl_vanilla,
             ),
         )
         p.start()
@@ -1159,61 +1382,83 @@ def main() -> None:
         merged.sort(key=lambda r: r.get("index", 0))
         return merged
 
+    # Determine which method names were actually run by workers
+    _method_names = {
+        "baseline":           args.method in ("baseline", "both"),
+        "vanilla":            args.method == "vanilla",
+        "position_embedding": args.method == "position_embedding",
+        "coordinate":         args.method in ("coordinate", "both"),
+    }
     all_results: Dict[str, List[Dict]] = {}
-
-    run_baseline = args.method in ("baseline", "both")
-    run_correspondence = args.method in ("correspondence", "both")
-
-    if run_baseline:
-        all_results["baseline"] = merge("baseline")
-    if run_correspondence:
-        all_results["correspondence"] = merge("correspondence")
+    for mname, active in _method_names.items():
+        if active:
+            all_results[mname] = merge(mname)
 
     # ── metrics ───────────────────────────────────────────────────────────────
+    _METHOD_LABELS = {
+        "baseline":           "baseline          (Qwen3.5-VL)",
+        "vanilla":            "vanilla           (SPA LoRA + 3D M-RoPE)",
+        "position_embedding": "position_embedding (SPA LoRA + 4D M-RoPE)",
+        "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + <coord>)",
+    }
+    _metrics_fn = compute_metrics_robospatial if args.dataset == "robospatial" else compute_metrics
     for mname, mresults in all_results.items():
         if mresults:
-            m = compute_metrics(mresults)
-            label = "BASELINE  (Qwen3.5-VL)" if mname == "baseline" else "CORRESPONDENCE  (SPA + CoordEst)"
-            log_metrics(m, label, logger)
+            m = _metrics_fn(mresults)
+            log_metrics(m, _METHOD_LABELS.get(mname, mname), logger)
+            failures = m.pop("category_failures", {})
             with open(output_dir / f"metrics_{mname}.json", "w", encoding="utf-8") as f:
                 json.dump(m, f, ensure_ascii=False, indent=2)
             with open(output_dir / f"results_{mname}.json", "w", encoding="utf-8") as f:
                 json.dump(mresults, f, ensure_ascii=False, indent=2)
+            if failures:
+                _save_failure_cases(output_dir / f"failures_{mname}", failures)
 
     # ── side-by-side summary + change analysis ────────────────────────────────
-    if run_baseline and run_correspondence and all_results.get("baseline") and all_results.get("correspondence"):
-        mb = compute_metrics(all_results["baseline"])
-        mc = compute_metrics(all_results["correspondence"])
+    # Compare any two methods that are both present; primary comparison is
+    # baseline vs coordinate (the "both" mode).
+    _compare_pairs = [
+        ("baseline", "coordinate"),
+        ("baseline", "position_embedding"),
+        ("baseline", "vanilla"),
+    ]
+    for method_a, method_b in _compare_pairs:
+        if not (all_results.get(method_a) and all_results.get(method_b)):
+            continue
+        ma = _metrics_fn(all_results[method_a])
+        mb = _metrics_fn(all_results[method_b])
 
         logger.info("")
-        logger.info("=" * 60)
+        logger.info("=" * 65)
         logger.info("SUMMARY COMPARISON")
-        logger.info("=" * 60)
-        logger.info(f"  {'Method':<45} {'Accuracy':>8}  {'Correct':>8} / Total")
-        logger.info(f"  {'-'*45}  {'-'*8}  {'-'*14}")
-        logger.info(
-            f"  {'Baseline  (Qwen3.5-VL)':<45} "
-            f"{mb['overall_accuracy']:>8.2%}  "
-            f"{mb['correct_samples']:>8} / {mb['total_samples']}"
-        )
-        logger.info(
-            f"  {'Correspondence  (SPA + CoordEst)':<45} "
-            f"{mc['overall_accuracy']:>8.2%}  "
-            f"{mc['correct_samples']:>8} / {mc['total_samples']}"
-        )
-        logger.info(f"  {'Delta':<45} {mc['overall_accuracy'] - mb['overall_accuracy']:>+8.2%}")
-        logger.info("=" * 60)
+        logger.info("=" * 65)
+        logger.info(f"  {'Method':<50} {'Accuracy':>8}  {'Correct':>8} / Total")
+        logger.info(f"  {'-'*50}  {'-'*8}  {'-'*14}")
+        for mname, mx in [(method_a, ma), (method_b, mb)]:
+            label = _METHOD_LABELS.get(mname, mname)
+            logger.info(
+                f"  {label:<50} "
+                f"{mx['overall_accuracy']:>8.2%}  "
+                f"{mx['correct_samples']:>8} / {mx['total_samples']}"
+            )
+        delta = mb["overall_accuracy"] - ma["overall_accuracy"]
+        logger.info(f"  {'Delta':<50} {delta:>+8.2%}")
+        logger.info("=" * 65)
 
         comparison = {
-            "baseline": mb,
-            "correspondence": mc,
-            "delta_overall_accuracy": mc["overall_accuracy"] - mb["overall_accuracy"],
+            method_a: ma,
+            method_b: mb,
+            "delta_overall_accuracy": delta,
         }
-        with open(output_dir / "metrics_comparison.json", "w", encoding="utf-8") as f:
+        suffix = f"{method_a}_vs_{method_b}"
+        with open(output_dir / f"metrics_comparison_{suffix}.json", "w", encoding="utf-8") as f:
             json.dump(comparison, f, ensure_ascii=False, indent=2)
 
-        analysis = analyze_changes(all_results["baseline"], all_results["correspondence"], logger)
-        with open(output_dir / "analysis_changes.json", "w", encoding="utf-8") as f:
+        analysis = analyze_changes(
+            all_results[method_a], all_results[method_b], logger,
+            method_a_name=method_a, method_b_name=method_b,
+        )
+        with open(output_dir / f"analysis_changes_{suffix}.json", "w", encoding="utf-8") as f:
             json.dump(analysis, f, ensure_ascii=False, indent=2)
 
     logger.info(f"All results saved to: {output_dir}")

@@ -10,9 +10,10 @@
 #   bash scripts/evaluate.sh [options]
 #
 # Options:
-#   --method    baseline | correspondence | both   (default: both)
-#   --ckpt      path to correspondence LoRA checkpoint dir
-#               (required when method = correspondence | both)
+#   --method    baseline | vanilla | position_embedding | coordinate | both
+#               (default: both = baseline + coordinate)
+#   --ckpt      path to SPA LoRA checkpoint dir
+#               (required when method != baseline)
 #   --datasets  comma-separated list of dataset names to run, e.g.
 #                 "mindcube,mmsibench"
 #               Available: mindcube  mmsibench  sparbench_multi_view
@@ -24,9 +25,14 @@
 #   --limit     truncate each dataset to N samples (debug / smoke test)
 #   --output    base output directory (default: train_records/eval_results)
 #   --run_name  optional sub-folder name (default: auto timestamp per dataset)
-#   --no_coord  pass --no_coord to evaluation.py (zero XYZ, ablation mode)
-#   --abl_vanilla  vanilla ablation: use stock Qwen3.5 with original 3D M-RoPE
 #   --max_new_tokens  generation budget (default: 512)
+#
+# Method descriptions:
+#   baseline           — stock Qwen3.5-VL, no LoRA
+#   vanilla            — SPA LoRA + 3D M-RoPE, no <coord> tokens (LoRA-only ablation)
+#   position_embedding — SPA LoRA + 4D M-RoPE, no <coord> tokens
+#   coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens  (full method)
+#   both               — baseline + coordinate
 #
 # Examples:
 #   # Run all datasets, both methods, 4 GPUs:
@@ -39,13 +45,19 @@
 #       --method baseline \
 #       --datasets "mindcube,sat_real"
 #
-#   # Smoke test — 6 samples per dataset, correspondence only:
+#   # Smoke test — 6 samples, coordinate method only:
 #   bash scripts/evaluate.sh \
-#       --method correspondence \
+#       --method coordinate \
 #       --ckpt train_records/correspondence/final \
 #       --datasets "mmsibench" \
 #       --limit 6 \
 #       --gpus 0
+#
+#   # Vanilla ablation (LoRA only, no 4D M-RoPE):
+#   bash scripts/evaluate.sh \
+#       --method vanilla \
+#       --ckpt train_records/correspondence/final \
+#       --datasets "mindcube,mmsibench"
 #
 #   # With thinking mode (recommend --max_new_tokens 8192):
 #   bash scripts/evaluate.sh \
@@ -72,13 +84,11 @@ GPUS=""
 LIMIT=""
 OUTPUT_BASE="$SPATIAL_DIR/eval_results"
 RUN_NAME=""
-NO_COORD=""
-ABL_VANILLA=""
 THINKING=""
 MAX_NEW_TOKENS=512
 
 # All supported datasets (in evaluation order)
-ALL_DATASETS="mindcube sat_real spinbench"
+ALL_DATASETS="mindcube sat_real spinbench robospatial"
 
 # Dataset → data_dir mapping (relative to SPATIAL_DIR)
 declare -A DATASET_DIR
@@ -89,6 +99,7 @@ DATASET_DIR["sparbench_single_view"]="datasets/evaluation/SPARBench"
 DATASET_DIR["sparbench_mv"]="datasets/evaluation/SPARBench"
 DATASET_DIR["sat_real"]="datasets/evaluation/SAT"
 DATASET_DIR["spinbench"]="datasets/evaluation/spinbench_data"
+DATASET_DIR["robospatial"]="datasets/evaluation/RoboSpatial"
 
 # =============================================================================
 # Parse arguments
@@ -105,8 +116,6 @@ while [[ $# -gt 0 ]]; do
         --limit)         LIMIT="$2";           shift 2 ;;
         --output)        OUTPUT_BASE="$2";     shift 2 ;;
         --run_name)      RUN_NAME="$2";        shift 2 ;;
-        --no_coord)      NO_COORD="--no_coord";       shift  ;;
-        --abl_vanilla)   ABL_VANILLA="--abl_vanilla"; shift  ;;
         --thinking)      THINKING="--thinking";       shift  ;;
         --max_new_tokens) MAX_NEW_TOKENS="$2";    shift 2 ;;
         *)
@@ -120,12 +129,13 @@ done
 # Validate arguments
 # =============================================================================
 
-if [[ "$METHOD" != "baseline" && "$METHOD" != "correspondence" && "$METHOD" != "both" ]]; then
-    echo "[ERROR] --method must be one of: baseline  correspondence  both" >&2
+VALID_METHODS="baseline vanilla position_embedding coordinate both"
+if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
+    echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1
 fi
 
-if [[ "$METHOD" == "correspondence" || "$METHOD" == "both" ]]; then
+if [[ "$METHOD" != "baseline" ]]; then
     if [[ -z "$CKPT" ]]; then
         echo "[ERROR] --ckpt is required when --method is '$METHOD'" >&2
         exit 1
@@ -182,14 +192,6 @@ COMMON_FLAGS=(
 
 if [[ -n "$CKPT" ]]; then
     COMMON_FLAGS+=(--correspondence_ckpt "$CKPT")
-fi
-
-if [[ -n "$NO_COORD" ]]; then
-    COMMON_FLAGS+=($NO_COORD)
-fi
-
-if [[ -n "$ABL_VANILLA" ]]; then
-    COMMON_FLAGS+=($ABL_VANILLA)
 fi
 
 if [[ -n "$THINKING" ]]; then

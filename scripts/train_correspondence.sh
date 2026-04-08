@@ -105,7 +105,7 @@ RUN_NAME="correspondence_mindcube${PLUS_FLAG:+_plus}${_ablation_name}"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 # EPOCHS=3
-EPOCHS=9
+EPOCHS=6
 LR=2e-4
 LORA_RANK=16
 MAX_IMAGES=4
@@ -117,7 +117,7 @@ SKIP_LAYERS_DISPLAY="$(layer_name "$SKIP_LAYERS")"
 SKIP_LAYERS_FLAG="--skip_layers ${SKIP_LAYERS}"
 CYCLE_WEIGHT=$([ -n "$NO_CYCLE_FLAG" ] && echo "0.0" || echo "0.1")
 CYCLE_FLAG="--cycle_weight $CYCLE_WEIGHT"
-SAVE_STEPS=500
+SAVE_STEPS=50
 EVAL_STEPS=50
 
 WANDB_PROJECT="spc"

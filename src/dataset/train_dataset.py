@@ -766,6 +766,7 @@ class MindCube_Train_Dataset_Coord(Dataset):
         spatial_merge_size: int = 2,
         coord_upscale:      int = 4,
         max_samples:        int | None = None,
+        no_cam:             bool = False,
     ):
         import json
         raw = []
@@ -791,6 +792,7 @@ class MindCube_Train_Dataset_Coord(Dataset):
         self.max_images         = max_images
         self.spatial_merge_size = spatial_merge_size
         self.coord_upscale      = coord_upscale
+        self.no_cam             = no_cam
         self.log = log
         log.info(
             f"MindCube_Train_Dataset_Coord: {len(self.samples)} valid entries "
@@ -832,24 +834,26 @@ class MindCube_Train_Dataset_Coord(Dataset):
             )
 
         # ── load camera poses and compute relative transforms ─────────────────
-        poses = []
-        for vd in view_dirs[:N]:
-            cp_path = os.path.join(sample_dir, vd, "camera_pose.npy")
-            poses.append(np.load(cp_path).astype(np.float64))  # (4, 4)
-
         pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-        rel_list = []
-        for i, j in pairs:
-            T = np.linalg.inv(poses[j]) @ poses[i]
-            rel_list.append(T)
-        gt_transforms = torch.tensor(
-            np.stack(rel_list, axis=0), dtype=torch.float32
-        )  # (N*(N-1), 4, 4)
+        if not self.no_cam:
+            poses = []
+            for vd in view_dirs[:N]:
+                cp_path = os.path.join(sample_dir, vd, "camera_pose.npy")
+                poses.append(np.load(cp_path).astype(np.float64))  # (4, 4)
+            rel_list = []
+            for i, j in pairs:
+                T = np.linalg.inv(poses[j]) @ poses[i]
+                rel_list.append(T)
+            gt_transforms = torch.tensor(
+                np.stack(rel_list, axis=0), dtype=torch.float32
+            )  # (N*(N-1), 4, 4)
+        else:
+            gt_transforms = None
 
         # ── build prompt (pose + coord + QA) ──────────────────────────────────
         content: list = [{"type": "image", "image": img} for img in images]
 
-        pose_sentences = [
+        pose_sentences = [] if self.no_cam else [
             f"The camera pose of image {j + 1} relative to image {i + 1} is "
             f"{POSE_TOKEN}."
             for (i, j) in pairs
@@ -864,11 +868,11 @@ class MindCube_Train_Dataset_Coord(Dataset):
             )
 
         # ── Probe: process without coord tokens to get image_grid_thw ─────────
-        content_probe = list(content)
-        content_probe.append({
-            "type": "text",
-            "text": " ".join(pose_sentences) + " " + _question,
-        })
+        probe_text_part = (
+            (" ".join(pose_sentences) + " " if pose_sentences else "")
+            + _question
+        )
+        content_probe = list(content) + [{"type": "text", "text": probe_text_part}]
         text_probe = self.processor.apply_chat_template(
             [{"role": "user", "content": content_probe}],
             tokenize=False, add_generation_prompt=False,
@@ -891,17 +895,13 @@ class MindCube_Train_Dataset_Coord(Dataset):
                 f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
             )
 
-        # ── Build final prompt with pose + coord + QA ─────────────────────────
-        content.append({
-            "type": "text",
-            "text": (
-                " ".join(pose_sentences)
-                + " "
-                + " ".join(coord_sentences)
-                + " "
-                + _question
-            ),
-        })
+        # ── Build final prompt (pose if not no_cam) + coord + QA ─────────────
+        parts = []
+        if pose_sentences:
+            parts.append(" ".join(pose_sentences))
+        parts.append(" ".join(coord_sentences))
+        parts.append(_question)
+        content.append({"type": "text", "text": " ".join(parts)})
         text_full = self.processor.apply_chat_template(
             [{"role": "user",      "content": content},
              {"role": "assistant", "content": _answer}],

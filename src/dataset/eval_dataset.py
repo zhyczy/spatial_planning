@@ -443,11 +443,79 @@ def load_testing_dataset(
                 "data_dir": str(data_dir),
             })
 
+    elif dataset == "robospatial":
+        # RoboSpatial — robot spatial reasoning with embedded images.
+        # Parquet files under data/ with columns: category, question, answer,
+        # img (bytes dict), depth_image (bytes dict), mask (bytes dict or None).
+        # Images and masks are extracted to data_dir/images/ and data_dir/masks/ for caching.
+        # 3d_results/{category}_{idx}/ directories are used for precomputed XYZ maps.
+        import io
+        import pandas as pd
+
+        parquet_dir = data_dir / "data"
+        if not parquet_dir.exists():
+            raise FileNotFoundError(f"RoboSpatial data dir not found: {parquet_dir}")
+
+        images_cache_dir = data_dir / "images"
+        masks_cache_dir = data_dir / "masks"
+        images_cache_dir.mkdir(exist_ok=True)
+        masks_cache_dir.mkdir(exist_ok=True)
+
+        parquet_files = sorted(parquet_dir.glob("*.parquet"))
+        if not parquet_files:
+            raise FileNotFoundError(f"No parquet files found in {parquet_dir}")
+
+        all_rows = []
+        for pf in parquet_files:
+            df = pd.read_parquet(pf)
+            all_rows.extend(df.to_dict("records"))
+
+        if limit is not None:
+            all_rows = all_rows[:limit]
+
+        for idx, row in enumerate(all_rows):
+            category = row.get("category", "unknown")
+            sample_id = f"{category}_{idx}"
+
+            # Extract and cache image to disk
+            img_data = row.get("img")
+            if img_data is None:
+                continue
+            img_bytes = img_data.get("bytes") if isinstance(img_data, dict) else img_data
+            img_path = images_cache_dir / f"{sample_id}.jpg"
+            if not img_path.exists():
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                img.save(img_path, "JPEG")
+
+            # Extract and cache mask to disk (mask naming matches RoboSpatial-Eval convention)
+            mask_rel_path = None
+            mask_data = row.get("mask")
+            if mask_data is not None:
+                mask_bytes = mask_data.get("bytes") if isinstance(mask_data, dict) else mask_data
+                if mask_bytes is not None:
+                    mask_filename = f"mask_{category}_{idx}.png"
+                    mask_path = masks_cache_dir / mask_filename
+                    if not mask_path.exists():
+                        Image.open(io.BytesIO(mask_bytes)).save(mask_path, "PNG")
+                    mask_rel_path = f"masks/{mask_filename}"
+
+            samples.append({
+                "index": sample_id,
+                "image": [str(img_path)],
+                "question": row.get("question", ""),
+                "answer": row.get("answer", ""),
+                "category": category,
+                "thought": "",
+                "data_dir": str(data_dir),
+                "mask": mask_rel_path,
+                "format_type": "robospatial",
+            })
+
     else:
         raise ValueError(
             f"Unknown dataset '{dataset}'. "
             "Choose: mmsibench | mindcube | sat | sat_real | vsibench | "
-            "sparbench_multi_view | sparbench_single_view | sparbench_mv | spinbench"
+            "sparbench_multi_view | sparbench_single_view | sparbench_mv | spinbench | robospatial"
         )
 
     return samples
