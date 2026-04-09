@@ -158,12 +158,36 @@ def build_model(
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
+        modules_to_save = ["embed_tokens"] if ablation is None else [],
         lora_dropout   = 0.05,
         bias           = "none",
         task_type      = TaskType.CAUSAL_LM,
     )
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
+
+    # Freeze old token embeddings via gradient hook: only <pose> row gets gradients.
+    # modules_to_save wraps embed_tokens as a full trainable copy; the hook zeros out
+    # the gradient rows corresponding to the original vocabulary on every backward pass.
+    if ablation is None:
+        def _make_new_token_grad_hook(n_old: int):
+            def _hook(grad: torch.Tensor) -> torch.Tensor:
+                grad = grad.clone()
+                grad[:n_old] = 0
+                return grad
+            return _hook
+
+        # Navigate to the actual embed_tokens weight inside the PEFT wrapper
+        _embed = (
+            spa.model.model.language_model.embed_tokens
+            if hasattr(spa.model, "model")
+            else spa.model.language_model.embed_tokens
+        )
+        _embed.weight.register_hook(_make_new_token_grad_hook(old_vocab))
+        log.info(
+            f"Gradient hook registered on embed_tokens: rows 0..{old_vocab - 1} zeroed, "
+            f"row {old_vocab} (<pose>) trainable."
+        )
 
     # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
     spa.gradient_checkpointing_enable(

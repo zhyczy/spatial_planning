@@ -18,6 +18,11 @@ Multi-method QA evaluation:
 
   coordinate
       Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
+      Input : images + <coord>-token sentences + question  (no_cam variant)
+      3D pos: precomputed XYZ → 4D M-RoPE on image patches AND <coord> tokens
+
+  coordinate_pose
+      Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
       Input : images + pose_sentences + <coord>-token sentences + question
       3D pos: precomputed XYZ → 4D M-RoPE on image patches AND <coord> tokens
 
@@ -62,7 +67,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import os
 import re
 import shutil
@@ -74,13 +78,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.multiprocessing as mp
 from tqdm import tqdm
 
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 from peft import PeftModel
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
-from src.models import SpaForConditionalGeneration
+from src.models import SpaForConditionalGeneration, CoordinateRegressionHead
 from src.dataset import load_testing_dataset, chunk_dataset
 
 # ── sys.path: ensure spatial_planning/ root is importable ──────────────────
@@ -258,12 +263,37 @@ def load_spa_model(
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path, local_files_only=True)
     processor.tokenizer = tokenizer
 
-    # 4. Resize embedding table to match saved tokenizer vocab
-    new_vocab = len(tokenizer)
+    # 4. Resize embedding table to match the LoRA checkpoint's embed_tokens size.
+    #
+    # We read the target vocab size directly from the saved adapter weights because
+    # len(tokenizer) can differ from config.text_config.vocab_size (Qwen3.5-4B has
+    # vocab_size=248320 in config but the tokenizer only contains 248077 entries).
+    # During training, resize_token_embeddings uses embed_tokens.shape[0] (248320)
+    # as the base, producing a saved embed of 248321.  But here len(tokenizer)=248078
+    # < 248320, so the naive `if new_vocab > old_vocab` guard never fires.
+    # Reading the shape from safetensors is the only reliable way to stay in sync.
+    _adapter_path = Path(ckpt_path) / "adapter_model.safetensors"
+    _target_vocab: Optional[int] = None
+    if _adapter_path.exists():
+        try:
+            from safetensors import safe_open as _safe_open
+            with _safe_open(str(_adapter_path), framework="pt", device="cpu") as _f:
+                _embed_keys = [k for k in _f.keys() if "embed_tokens" in k and k.endswith(".weight")]
+                if _embed_keys:
+                    _target_vocab = _f.get_tensor(_embed_keys[0]).shape[0]
+        except Exception as _exc:
+            logger.warning(f"[spa] Could not read embed size from safetensors: {_exc}")
+
     old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
-    if new_vocab > old_vocab:
-        spa.resize_token_embeddings(new_vocab)
-        logger.info(f"[spa] Embedding: {old_vocab} → {new_vocab}")
+    if _target_vocab is not None and _target_vocab != old_vocab:
+        spa.resize_token_embeddings(_target_vocab)
+        logger.info(f"[spa] Embedding: {old_vocab} → {_target_vocab} (from adapter checkpoint)")
+    elif _target_vocab is None:
+        # Fallback: use tokenizer length (original logic)
+        new_vocab = len(tokenizer)
+        if new_vocab > old_vocab:
+            spa.resize_token_embeddings(new_vocab)
+            logger.info(f"[spa] Embedding: {old_vocab} → {new_vocab} (from tokenizer)")
 
     # 5. Load LoRA adapter and merge
     spa = PeftModel.from_pretrained(spa, ckpt_path, is_trainable=False)
@@ -273,6 +303,158 @@ def load_spa_model(
     spa = spa.to(device).eval()
     logger.info(f"[spa] Model ready on {next(spa.parameters()).device}")
     return spa, processor
+
+
+def _load_coord_head(
+    ckpt_path: str,
+    device: str,
+) -> Optional[CoordinateRegressionHead]:
+    """Load CoordinateRegressionHead from coord_head.pt in the checkpoint directory.
+
+    Infers hidden_dim and upscale_factor from the saved weight shape so no
+    extra config is needed.  Returns None if coord_head.pt is not present.
+    """
+    logger = logging.getLogger(__name__)
+    coord_head_path = Path(ckpt_path) / "coord_head.pt"
+    if not coord_head_path.exists():
+        logger.info(f"[coordinate] coord_head.pt not found in {ckpt_path} — skipping coord head.")
+        return None
+
+    state = torch.load(str(coord_head_path), map_location="cpu", weights_only=True)
+    # linear_proj.weight shape: (3 * upscale^2, hidden_dim)
+    proj_out, hidden_dim = state["linear_proj.weight"].shape
+    upscale_factor = int(round((proj_out / 3) ** 0.5))
+
+    coord_head = CoordinateRegressionHead(hidden_dim=hidden_dim, upscale_factor=upscale_factor)
+    coord_head.load_state_dict(state)
+    coord_head = coord_head.to(device).to(torch.bfloat16).eval()
+    logger.info(
+        f"[coordinate] CoordinateRegressionHead loaded from {coord_head_path} "
+        f"(hidden_dim={hidden_dim}, upscale={upscale_factor})"
+    )
+    return coord_head
+
+
+def _get_coord_predictions(
+    model: Any,
+    inputs: Dict[str, Any],
+    coord_token_id: int,
+    coord_head: CoordinateRegressionHead,
+    spatial_merge_size: int,
+    image_xyz: List[torch.Tensor],   # llm-resolution GT, used as xyz for 4D RoPE
+    coord_scale: float,
+) -> Optional[List[torch.Tensor]]:
+    """Single forward pass (no generation) → coord head predictions at <coord> tokens.
+
+    Uses an lm_head pre-hook to capture the post-norm last hidden state, matching
+    exactly what CoordinatePlusModel / CoordinateModel do during training.
+
+    Returns a list of (llm_H * upscale, llm_W * upscale, 3) float32 tensors on CPU,
+    one per image.  Returns None if no <coord> tokens are found or the hook fails.
+    """
+    device = next(model.parameters()).device
+    inputs_dev = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in inputs.items()
+    }
+    image_grid_thw = inputs_dev.get("image_grid_thw")
+    if image_grid_thw is None:
+        return None
+
+    xyz_on_device = [x.to(device) for x in image_xyz]
+
+    # Pre-compute 4D position_ids (same logic as run_inference_spa)
+    with torch.no_grad():
+        position_ids, _ = model.model.get_rope_index(
+            input_ids=inputs_dev["input_ids"],
+            mm_token_type_ids=inputs_dev["mm_token_type_ids"],
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=inputs_dev.get("video_grid_thw"),
+            attention_mask=inputs_dev.get("attention_mask"),
+            image_xyz=xyz_on_device,
+            coord_scale=coord_scale,
+            coord_token_id=coord_token_id,
+        )
+
+    # Register lm_head pre-hook to capture post-norm last hidden state
+    captured: Dict[str, Any] = {}
+
+    def _hook(_module, args):
+        captured["h"] = args[0].detach()
+
+    hook_handle = None
+    for name, mod in model.named_modules():
+        if name.endswith("lm_head"):
+            hook_handle = mod.register_forward_pre_hook(_hook)
+            break
+
+    try:
+        gen_inputs = {k: v for k, v in inputs_dev.items() if k != "mm_token_type_ids"}
+        with torch.no_grad():
+            model(
+                **gen_inputs,
+                position_ids=position_ids,
+                return_dict=True,
+                image_xyz=xyz_on_device,
+                coord_scale=coord_scale,
+            )
+    finally:
+        if hook_handle is not None:
+            hook_handle.remove()
+
+    if "h" not in captured:
+        return None
+
+    last_hidden = captured["h"][0]  # (seq_len, hidden_dim)
+    coord_positions = (
+        inputs_dev["input_ids"][0] == coord_token_id
+    ).nonzero(as_tuple=True)[0]
+    if len(coord_positions) == 0:
+        return None
+
+    sms = spatial_merge_size
+    N = image_grid_thw.shape[0]
+    preds: List[torch.Tensor] = []
+    start = 0
+    dtype = coord_head.linear_proj.weight.dtype
+
+    with torch.no_grad():
+        for k in range(N):
+            thw_k = image_grid_thw[k]
+            llm_h = int(thw_k[1]) // sms
+            llm_w = int(thw_k[2]) // sms
+            n_tok = llm_h * llm_w
+            if start + n_tok > len(coord_positions):
+                break
+            h_k = last_hidden[coord_positions[start: start + n_tok]].to(dtype)
+            pred_k = coord_head(h_k, llm_h, llm_w)    # (llm_h*up, llm_w*up, 3)
+            preds.append(pred_k.cpu().float())
+            start += n_tok
+
+    return preds if preds else None
+
+
+def _compute_coord_mae(
+    preds: List[torch.Tensor],    # (llm_h*up, llm_w*up, 3) per image
+    gt_list: List[torch.Tensor],  # (llm_h, llm_w, 3) per image (RoPE-resolution GT)
+) -> float:
+    """Mean L1 error between coord head predictions and GT xyz, averaged over images.
+
+    The prediction is at (llm_h * upscale, llm_w * upscale) resolution; GT is at
+    (llm_h, llm_w).  Predictions are average-pooled to GT resolution before comparison.
+    """
+    maes: List[float] = []
+    for pred, gt in zip(preds, gt_list):
+        gt_f = gt.float()
+        if pred.shape == gt_f.shape:
+            maes.append((pred - gt_f).abs().mean().item())
+        else:
+            # Pool pred to GT resolution: (llm_h*up, llm_w*up, 3) → (llm_h, llm_w, 3)
+            pred_t = pred.permute(2, 0, 1).unsqueeze(0)              # (1, 3, H*up, W*up)
+            pred_ds = F.adaptive_avg_pool2d(pred_t, gt_f.shape[:2])  # (1, 3, H, W)
+            gt_t = gt_f.permute(2, 0, 1).unsqueeze(0)                # (1, 3, H, W)
+            maes.append((pred_ds - gt_t).abs().mean().item())
+    return float(np.mean(maes)) if maes else 0.0
 
 
 # ===========================================================================
@@ -512,11 +694,17 @@ def prepare_batch_spa(
     use_coord: bool,
     coord_scale: float,
     thinking: bool = False,
+    use_pose: bool = True,
 ) -> Tuple[Dict, str, List[torch.Tensor]]:
     """Tokenise one sample and build image_xyz for SPA model inference.
 
     The prompt matches training format:
-      [images] + pose_sentences + (coord_sentences if use_coord) + question
+      [images] + (pose_sentences if use_pose) + (coord_sentences if use_coord) + question
+
+    use_pose=False corresponds to the --no_cam training variant (coordinate method):
+      no <pose> tokens, no pose sentences; only <coord> tokens + question.
+    use_pose=True corresponds to the full training variant (coordinate_pose method):
+      pose sentences with <pose> tokens + <coord> tokens + question.
 
     No system prompt, no answer instruction — identical to train_dataset.py.
 
@@ -538,13 +726,16 @@ def prepare_batch_spa(
     # ── image content ────────────────────────────────────────────────────────
     content: list = [{"type": "image", "image": p} for p in image_paths]
 
-    # ── pose sentences (like training) ───────────────────────────────────────
+    # ── pose sentences (like training; skipped when use_pose=False / no_cam) ─
     pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-    pose_sentences = [
-        f"The camera pose of image {j + 1} relative to image {i + 1} is "
-        f"{POSE_TOKEN}."
-        for (i, j) in pairs
-    ] if N >= 2 else []
+    pose_sentences = (
+        [
+            f"The camera pose of image {j + 1} relative to image {i + 1} is "
+            f"{POSE_TOKEN}."
+            for (i, j) in pairs
+        ]
+        if (use_pose and N >= 2) else []
+    )
 
     if use_coord and N >= 2:
         # ── probe step: get image_grid_thw to know patch counts per image ──
@@ -570,21 +761,20 @@ def prepare_batch_spa(
             llm_h = int(thw_all[k][1]) // sms
             llm_w = int(thw_all[k][2]) // sms
             n_tok = llm_h * llm_w
-            coord_tokens = " ".join([COORD_TOKEN] * n_tok)
+            coord_tokens = "".join([COORD_TOKEN] * n_tok)
             coord_sentences.append(
                 f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
             )
 
-        # ── final text: pose + coord + question ───────────────────────────
-        final_text = (
-            " ".join(pose_sentences)
-            + " "
-            + " ".join(coord_sentences)
-            + " "
-            + question
-        )
+        # ── final text: (pose +) coord + question ─────────────────────────
+        parts = []
+        if pose_sentences:
+            parts.append(" ".join(pose_sentences))
+        parts.append(" ".join(coord_sentences))
+        parts.append(question)
+        final_text = " ".join(parts)
     else:
-        # ── final text: pose + question (no coord) ────────────────────────
+        # ── final text: (pose +) question (no coord) ──────────────────────
         if pose_sentences:
             final_text = " ".join(pose_sentences) + " " + question
         else:
@@ -879,7 +1069,7 @@ def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
             elif len(cat_failures[cat]) < 10:
                 cat_failures[cat].append(_failed_case(r))
     cat_accuracy = {cat: cat_correct[cat] / cat_total[cat] for cat in cat_total}
-    return {
+    metrics: Dict[str, Any] = {
         "overall_accuracy": correct / total if total else 0.0,
         "total_samples": total,
         "correct_samples": correct,
@@ -887,6 +1077,13 @@ def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
         "category_counts": dict(cat_total),
         "category_failures": dict(cat_failures),
     }
+    # Aggregate coord_mae when present (coordinate method)
+    coord_maes = [r["coord_mae"] for r in results if r.get("coord_mae") is not None]
+    if coord_maes:
+        metrics["coord_mae_mean"] = float(np.mean(coord_maes))
+        metrics["coord_mae_std"]  = float(np.std(coord_maes))
+        metrics["coord_mae_n"]    = len(coord_maes)
+    return metrics
 
 
 def compute_metrics_robospatial(results: List[Dict]) -> Dict[str, Any]:
@@ -944,6 +1141,11 @@ def log_metrics(metrics: Dict, label: str, logger: logging.Logger) -> None:
     logger.info(f"  Total   : {metrics['total_samples']}")
     logger.info(f"  Correct : {metrics['correct_samples']}")
     logger.info(f"  Accuracy: {metrics['overall_accuracy']:.2%}")
+    if "coord_mae_mean" in metrics:
+        logger.info(
+            f"  Coord MAE: {metrics['coord_mae_mean']:.4f} ± {metrics['coord_mae_std']:.4f}"
+            f"  (n={metrics['coord_mae_n']})"
+        )
     logger.info("  Per-category accuracy:")
     for cat, acc in sorted(metrics["category_accuracy"].items()):
         n = metrics["category_counts"].get(cat, 0)
@@ -976,7 +1178,8 @@ def evaluate(
       baseline           — stock Qwen3.5-VL
       vanilla            — SPA LoRA + 3D M-RoPE (no <coord>)
       position_embedding — SPA LoRA + 4D M-RoPE (no <coord>)
-      coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens
+      coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens, no_cam variant (no pose)
+      coordinate_pose    — SPA LoRA + 4D M-RoPE + <coord> tokens, full variant (with pose)
       both               — baseline + coordinate
 
     Returns dict mapping method name → list of result dicts.
@@ -987,7 +1190,8 @@ def evaluate(
     run_vanilla = method == "vanilla"
     run_position_embedding = method == "position_embedding"
     run_coordinate = method in ("coordinate", "both")
-    run_spa = run_vanilla or run_position_embedding or run_coordinate
+    run_coordinate_pose = method == "coordinate_pose"
+    run_spa = run_vanilla or run_position_embedding or run_coordinate or run_coordinate_pose
 
     # Lazy-load only what we need
     baseline_model = baseline_proc = None
@@ -996,6 +1200,9 @@ def evaluate(
 
     if run_baseline:
         baseline_model, baseline_proc = load_baseline_model(baseline_model_path, device)
+
+    coord_token_id_val: Optional[int] = None
+    spa_coord_head: Optional[CoordinateRegressionHead] = None
 
     if run_spa:
         if correspondence_ckpt is None:
@@ -1014,19 +1221,33 @@ def evaluate(
         spatial_merge_size = int(_vcfg.get("spatial_merge_size", 2))
         logger.info(f"[spa] spatial_merge_size={spatial_merge_size}")
 
-    # Determine which SPA variants to run and their use_coord setting
-    # (vanilla and position_embedding both skip <coord> tokens)
-    spa_variants: List[Tuple[str, bool]] = []   # (method_name, use_coord)
+        # Resolve <coord> token id once
+        _cid = spa_proc.tokenizer.convert_tokens_to_ids("<coord>")
+        if isinstance(_cid, int) and _cid != spa_proc.tokenizer.unk_token_id:
+            coord_token_id_val = _cid
+
+        # Load CoordinateRegressionHead if this is a coordinate checkpoint
+        if run_coordinate or run_coordinate_pose:
+            spa_coord_head = _load_coord_head(correspondence_ckpt, device)
+
+    # Determine which SPA variants to run.
+    # Tuple: (method_name, use_coord, use_pose)
+    # vanilla / position_embedding: no <coord> tokens, but include pose sentences
+    # coordinate       (no_cam): <coord> tokens, NO pose sentences
+    # coordinate_pose  (full):   <coord> tokens, WITH pose sentences
+    spa_variants: List[Tuple[str, bool, bool]] = []
     if run_vanilla:
-        spa_variants.append(("vanilla", False))
+        spa_variants.append(("vanilla", False, True))
     if run_position_embedding:
-        spa_variants.append(("position_embedding", False))
+        spa_variants.append(("position_embedding", False, True))
     if run_coordinate:
-        spa_variants.append(("coordinate", True))
+        spa_variants.append(("coordinate", True, False))
+    if run_coordinate_pose:
+        spa_variants.append(("coordinate_pose", True, True))
 
     active_methods = (
         (["baseline"] if run_baseline else [])
-        + [name for name, _ in spa_variants]
+        + [name for name, _, __ in spa_variants]
     )
     results_map: Dict[str, List[Dict]] = {m: [] for m in active_methods}
 
@@ -1050,21 +1271,43 @@ def evaluate(
                 results_map["baseline"].append(_error_result(item, exc, "baseline"))
 
         # ---- SPA variants ----
-        for spa_method_name, use_coord in spa_variants:
+        for spa_method_name, use_coord, use_pose in spa_variants:
             try:
                 inputs, prompt, image_xyz = prepare_batch_spa(
                     item, spa_proc,
                     spatial_merge_size, use_coord, coord_scale,
                     thinking=thinking,
+                    use_pose=use_pose,
                 )
                 output = run_inference_spa(
                     inputs, image_xyz, spa_model, spa_proc,
                     max_new_tokens, coord_scale, vanilla=use_vanilla_arch,
                 )
-                results_map[spa_method_name].append(
-                    _make_result(item, output, prompt, spa_method_name,
-                                 thinking=thinking)
-                )
+                result = _make_result(item, output, prompt, spa_method_name,
+                                      thinking=thinking)
+
+                # ---- CoordinateRegressionHead evaluation (coordinate method only) ----
+                if (
+                    use_coord
+                    and spa_coord_head is not None
+                    and coord_token_id_val is not None
+                    and image_xyz is not None
+                ):
+                    try:
+                        preds = _get_coord_predictions(
+                            spa_model, inputs,
+                            coord_token_id_val, spa_coord_head,
+                            spatial_merge_size, image_xyz, coord_scale,
+                        )
+                        if preds is not None:
+                            result["coord_mae"] = _compute_coord_mae(preds, image_xyz)
+                    except Exception as ce:
+                        logger.warning(
+                            f"[coordinate] coord_head failed for idx="
+                            f"{item.get('index')}: {ce}"
+                        )
+
+                results_map[spa_method_name].append(result)
             except Exception as exc:
                 logger.error(
                     f"[{spa_method_name}] idx={item.get('index')}: {exc}",
@@ -1217,13 +1460,14 @@ def main() -> None:
     # ── method ────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--method", type=str, default="both",
-        choices=["baseline", "vanilla", "position_embedding", "coordinate", "both"],
+        choices=["baseline", "vanilla", "position_embedding", "coordinate", "coordinate_pose", "both"],
         help=(
             "Which method(s) to run. "
             "baseline=stock Qwen3.5-VL; "
             "vanilla=SPA LoRA + 3D M-RoPE (no <coord>); "
             "position_embedding=SPA LoRA + 4D M-RoPE (no <coord>); "
-            "coordinate=SPA LoRA + 4D M-RoPE + <coord> tokens; "
+            "coordinate=SPA LoRA + 4D M-RoPE + <coord> tokens (no_cam, no pose); "
+            "coordinate_pose=SPA LoRA + 4D M-RoPE + <coord> tokens (full, with pose); "
             "both=baseline + coordinate."
         ),
     )
@@ -1388,6 +1632,7 @@ def main() -> None:
         "vanilla":            args.method == "vanilla",
         "position_embedding": args.method == "position_embedding",
         "coordinate":         args.method in ("coordinate", "both"),
+        "coordinate_pose":    args.method == "coordinate_pose",
     }
     all_results: Dict[str, List[Dict]] = {}
     for mname, active in _method_names.items():
@@ -1396,10 +1641,11 @@ def main() -> None:
 
     # ── metrics ───────────────────────────────────────────────────────────────
     _METHOD_LABELS = {
-        "baseline":           "baseline          (Qwen3.5-VL)",
-        "vanilla":            "vanilla           (SPA LoRA + 3D M-RoPE)",
+        "baseline":           "baseline           (Qwen3.5-VL)",
+        "vanilla":            "vanilla            (SPA LoRA + 3D M-RoPE)",
         "position_embedding": "position_embedding (SPA LoRA + 4D M-RoPE)",
-        "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + <coord>)",
+        "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + <coord>, no_cam)",
+        "coordinate_pose":    "coordinate_pose    (SPA LoRA + 4D M-RoPE + <coord> + pose)",
     }
     _metrics_fn = compute_metrics_robospatial if args.dataset == "robospatial" else compute_metrics
     for mname, mresults in all_results.items():
@@ -1419,6 +1665,7 @@ def main() -> None:
     # baseline vs coordinate (the "both" mode).
     _compare_pairs = [
         ("baseline", "coordinate"),
+        ("baseline", "coordinate_pose"),
         ("baseline", "position_embedding"),
         ("baseline", "vanilla"),
     ]

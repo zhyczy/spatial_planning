@@ -207,7 +207,7 @@ class Eval_Dataset_Coord(Dataset):
             llm_h = int(thw_all[k][1]) // sms
             llm_w = int(thw_all[k][2]) // sms
             n_tok = llm_h * llm_w
-            coord_tokens = " ".join([COORD_TOKEN] * n_tok)
+            coord_tokens = "".join([COORD_TOKEN] * n_tok)
             coord_sentences.append(
                 f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
             )

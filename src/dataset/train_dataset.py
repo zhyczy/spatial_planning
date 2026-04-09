@@ -91,459 +91,28 @@ def resize_xyz(
     return torch.from_numpy(xyz_mean)                  # (target_h, target_w, 3)
 
 
-# ── SPAR training dataset ───────────────────────────────────────────────────────────────────
-
-class SPAR_Train_Dataset(Dataset):
+def xyz_to_polar(xyz: torch.Tensor) -> torch.Tensor:
     """
-    One sample = one SPAR scene entry.
+    Convert Cartesian (x, y, z) → spherical (r, θ, α).
 
-    For each entry with N images (capped at max_images):
-      - Builds a multi-image chat prompt with A(N,2) = N*(N-1) <pose> tokens,
-        one per ordered pair (i, j) with i≠j, enumerated as:
-            (0,1), (0,2), ..., (0,N-1),
-            (1,0), (1,2), ..., (1,N-1),
-            ...
-            (N-1,0), ..., (N-1,N-2)
-      - Returns processor tensors + GT relative transforms T_{i→j}.
+        r = sqrt(x²+y²+z²)          — radial distance  ∈ [0, ∞)
+        θ = atan2(y, x)              — azimuth          ∈ [-π, π]
+        α = atan2(sqrt(x²+y²), z)   — inclination      ∈ [0, π]
 
-    GT transforms come from reconstruct/{entry_id}.npz:
-        relative_transforms[i, j] = T_{i→j}
-        = inv(poses_ff[j]) @ poses_ff[i]
-        Transforms a 3-D point from camera-i frame to camera-j frame.
+    Works on tensors of any shape (..., 3); returns same shape with the
+    last dimension replaced by (r, θ, α).
+    Patches with zero xyz (no valid pixels) stay at (0, 0, 0).
     """
-
-    def __init__(
-        self,
-        json_path:           str,
-        spar_root:           str,
-        reconstruct_dir:     str,
-        processor,
-        pose_token_id:       int,
-        log,
-        max_images:          int = 4,
-        pos3d_dir:           str | None = None,
-        spatial_merge_size:  int = 2,
-        max_samples:         int | None = None,
-        plus:                bool = False,
-        no_pose:             bool = False,
-    ):
-        import json
-        with open(json_path) as fh:
-            entries = json.load(fh)
-
-        self.samples = []
-        for e in entries:
-            eid = e.get("id", "")
-            npz = os.path.join(reconstruct_dir, f"{eid}.npz")
-            if not (os.path.exists(npz) and e.get("image")):
-                continue
-            # also require 3D_pos file if a pos3d_dir is given
-            if pos3d_dir is not None:
-                p3d = os.path.join(pos3d_dir, f"{eid}.npz")
-                if not os.path.exists(p3d):
-                    continue
-            else:
-                p3d = None
-            self.samples.append((e, npz, p3d))
-
-        if max_samples is not None and max_samples > 0:
-            self.samples = self.samples[:max_samples]
-
-        self.spar_root           = spar_root
-        self.processor           = processor
-        self.pose_token_id       = pose_token_id
-        self.max_images          = max_images
-        self.pos3d_dir           = pos3d_dir
-        self.spatial_merge_size  = spatial_merge_size
-        self.plus                = plus
-        self.no_pose             = no_pose
-        self.log = log
-        log.info(f"SPARDataset: {len(self.samples)} valid entries "
-                 f"(out of {len(entries)} total)")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        entry, npz_path, p3d_path = self.samples[idx]
-
-        # ── load images ───────────────────────────────────────────────────────
-        # Paths in the JSON are relative to {dataset}/images/; resolve using
-        # detect_dataset() (scannet / scannetpp / structured3d).
-        images = []
-        for rel in entry["image"]:
-            scene_id = _scene_id_from_path(rel)
-            dataset  = detect_dataset(scene_id)
-            full = os.path.join(self.spar_root, dataset, "images", rel)
-            try:
-                images.append(Image.open(full).convert("RGB"))
-            except (FileNotFoundError, OSError):
-                break
-            if len(images) == self.max_images:
-                break
-
-        # ── validate against GT ───────────────────────────────────────────────
-        data     = np.load(npz_path)
-        n_stored = data["relative_transforms"].shape[0]
-        N        = min(len(images), n_stored)
-
-        if N < 2:
-            raise RuntimeError(
-                f"Sample {idx} (id={entry.get('id')}) has only {N} valid "
-                f"images after loading; skipping. Check image paths."
-            )
-
-        images = images[:N]
-
-        # ── GT transforms (skipped in no_pose ablation mode) ─────────────────
-        if self.no_pose:
-            gt_transforms = None
-        else:
-            rel_transforms = torch.tensor(
-                data["relative_transforms"][:N, :N], dtype=torch.float32
-            )  # (N, N, 4, 4)
-
-            # All ordered pairs (i, j) with i≠j — A(N,2) = N*(N-1) pairs
-            pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-
-            # GT: T_{i→j} for every ordered pair
-            gt_transforms = torch.stack(
-                [rel_transforms[i, j] for (i, j) in pairs], dim=0
-            )  # (N*(N-1), 4, 4)
-
-        # ── build multi-image prompt ──────────────────────────────────────────
-        content: list = []
-        for img in images:
-            content.append({"type": "image", "image": img})
-
-        pose_sentences = []
-        if not self.no_pose:
-            pose_sentences = [
-                f"The camera pose of image {j + 1} relative to image {i + 1} is "
-                f"{POSE_TOKEN}."
-                for (i, j) in pairs
-            ]
-            content.append({"type": "text", "text": " ".join(pose_sentences)})
-
-        # ── build prompt (plus / no_pose modes append QA for LM loss) ────────
-        # Extract question/answer from conversations list (ShareGPT format)
-        # or from flat "question"/"answer" fields.
-        _convs = entry.get("conversations", [])
-        _question = (
-            entry.get("question")
-            or next((c["value"] for c in _convs if c.get("from") == "human"), None)
-        )
-        _answer = (
-            entry.get("answer")
-            or next((c["value"] for c in _convs if c.get("from") == "gpt"), None)
-        )
-
-        labels = None
-        if (self.plus or self.no_pose) and _question and _answer:
-            question = _question
-            answer   = _answer
-            qa_content = list(content)
-            if self.no_pose:
-                # No pose sentences — just append the question
-                qa_content.append({"type": "text", "text": question})
-            else:
-                # Replace the last text element to include the question
-                qa_content[-1] = {
-                    "type": "text",
-                    "text": " ".join(pose_sentences) + " " + question,
-                }
-            # Full conversation with assistant answer
-            text_full = self.processor.apply_chat_template(
-                [{"role": "user", "content": qa_content},
-                 {"role": "assistant", "content": answer}],
-                tokenize=False, add_generation_prompt=False,
-            )
-            proc_out = self.processor(
-                text=[text_full], images=images,
-                return_tensors="pt", padding=False,
-            )
-            # Supervise only the answer tokens at the tail of the sequence.
-            # Mask everything before (including the <think> block) so the
-            # model's reasoning behaviour is not suppressed.
-            # <|im_end|> is a special token so suffix tokenisation is stable.
-            suffix_ids = self.processor.tokenizer(
-                answer + "<|im_end|>\n", add_special_tokens=False
-            )["input_ids"]
-            suffix_len = len(suffix_ids)
-            labels = proc_out["input_ids"].clone()
-            labels[0, :-suffix_len] = -100          # mask all except answer tokens
-        else:
-            messages = [{"role": "user", "content": content}]
-            prompt_text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
-            )
-            # ── tokenise + encode images ──────────────────────────────────────
-            proc_out = self.processor(
-                text   = [prompt_text],
-                images = images,
-                return_tensors = "pt",
-                padding        = False,
-            )
-
-        # ── 3D position maps ──────────────────────────────────────────────────
-        # Load per-pixel XYZ from 3D_pos file and downsample to the LLM patch
-        # grid resolution consumed by get_rope_index() as image_xyz.
-        # Each element: (llm_H_i, llm_W_i, 3) where
-        #   llm_H_i = grid_thw[i,1] // spatial_merge_size
-        #   llm_W_i = grid_thw[i,2] // spatial_merge_size
-        image_xyz = None
-        if p3d_path is not None:
-            try:
-                d3d   = np.load(p3d_path)
-                thw_all = proc_out["image_grid_thw"]          # (N, 3)
-                sms     = self.spatial_merge_size
-                xyz_list = []
-                n_3d = int(d3d["n_frames"])
-                for k in range(min(N, n_3d)):
-                    xyz_raw   = d3d[f"frame_{k}_xyz"]         # (H_img, W_img, 3)
-                    valid_raw = d3d.get(f"frame_{k}_valid")   # (H_img, W_img) bool | None
-                    thw_k     = thw_all[k]                    # (T, H, W) patch units
-                    llm_h     = int(thw_k[1]) // sms
-                    llm_w     = int(thw_k[2]) // sms
-                    xyz_list.append(resize_xyz(xyz_raw, llm_h, llm_w, valid=valid_raw))
-                # Pad missing frames with zeros if needed
-                for k in range(len(xyz_list), N):
-                    thw_k = thw_all[k]
-                    llm_h = int(thw_k[1]) // sms
-                    llm_w = int(thw_k[2]) // sms
-                    xyz_list.append(torch.zeros(llm_h, llm_w, 3))
-                image_xyz = xyz_list                          # list of N tensors
-            except Exception as exc:
-                log.debug(f"3D_pos load failed for {p3d_path}: {exc}")
-                image_xyz = None
-
-        return {
-            **proc_out,                      # input_ids, attention_mask,
-                                             # pixel_values, image_grid_thw …
-            "gt_transforms": gt_transforms,  # (N*(N-1), 4, 4)
-            "image_xyz":     image_xyz,      # list of (llm_H, llm_W, 3) or None
-            "labels":        labels,         # (1, seq_len) for plus mode, else None
-        }
-
-
-class SPAR_Train_Dataset_Coord(Dataset):
-    """
-    Dataset for coordinate training.  Every sample must have a QA pair and a
-    3D position map (pos3d_dir).  Samples missing either are skipped at init.
-    """
-
-    def __init__(
-        self,
-        json_path:           str,
-        spar_root:           str,
-        reconstruct_dir:     str,
-        processor,
-        pose_token_id:       int,
-        max_images:          int = 4,
-        pos3d_dir:           str | None = None,
-        spatial_merge_size:  int = 2,
-        coord_upscale:       int = 4,
-        max_samples:         int | None = None,
-    ):
-        import json
-        with open(json_path) as fh:
-            entries = json.load(fh)
-
-        self.samples = []
-        for e in entries:
-            eid = e.get("id", "")
-            npz = os.path.join(reconstruct_dir, f"{eid}.npz")
-            if not (os.path.exists(npz) and e.get("image")):
-                continue
-            if pos3d_dir is not None:
-                p3d = os.path.join(pos3d_dir, f"{eid}.npz")
-                if not os.path.exists(p3d):
-                    continue
-            else:
-                p3d = None
-            self.samples.append((e, npz, p3d))
-
-        if max_samples is not None and max_samples > 0:
-            self.samples = self.samples[:max_samples]
-
-        self.spar_root          = spar_root
-        self.processor          = processor
-        self.pose_token_id      = pose_token_id
-        self.max_images         = max_images
-        self.pos3d_dir          = pos3d_dir
-        self.spatial_merge_size = spatial_merge_size
-        self.coord_upscale      = coord_upscale
-        log.info(f"SPARDataset: {len(self.samples)} valid entries "
-                 f"(out of {len(entries)} total)")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        entry, npz_path, p3d_path = self.samples[idx]
-
-        # ── load images ───────────────────────────────────────────────────────
-        images = []
-        for rel in entry["image"]:
-            scene_id = _scene_id_from_path(rel)
-            dataset  = detect_dataset(scene_id)
-            full = os.path.join(self.spar_root, dataset, "images", rel)
-            try:
-                images.append(Image.open(full).convert("RGB"))
-            except (FileNotFoundError, OSError):
-                break
-            if len(images) == self.max_images:
-                break
-
-        # ── validate against GT ───────────────────────────────────────────────
-        data     = np.load(npz_path)
-        n_stored = data["relative_transforms"].shape[0]
-        N        = min(len(images), n_stored)
-
-        if N < 2:
-            raise RuntimeError(
-                f"Sample {idx} (id={entry.get('id')}) has only {N} valid "
-                f"images after loading; skipping."
-            )
-
-        images = images[:N]
-
-        rel_transforms = torch.tensor(
-            data["relative_transforms"][:N, :N], dtype=torch.float32
-        )  # (N, N, 4, 4)
-
-        pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-        gt_transforms = torch.stack(
-            [rel_transforms[i, j] for (i, j) in pairs], dim=0
-        )  # (N*(N-1), 4, 4)
-
-        # ── build multi-image prompt ──────────────────────────────────────────
-        content: list = []
-        for img in images:
-            content.append({"type": "image", "image": img})
-
-        pose_sentences = [
-            f"The camera pose of image {j + 1} relative to image {i + 1} is "
-            f"{POSE_TOKEN}."
-            for (i, j) in pairs
-        ]
-
-        # ── QA prompt ─────────────────────────────────────────────────────────
-        _convs    = entry.get("conversations", [])
-        _question = (
-            entry.get("question")
-            or next((c["value"] for c in _convs if c.get("from") == "human"), None)
-        )
-        _answer   = (
-            entry.get("answer")
-            or next((c["value"] for c in _convs if c.get("from") == "gpt"), None)
-        )
-
-        if not (_question and _answer):
-            raise RuntimeError(
-                f"Sample {idx} (id={entry.get('id')}) has no QA pair."
-            )
-
-        # ── Probe image_grid_thw first (to know patch counts per image) ────────
-        # Build a temporary prompt with pose but no coord, process to get thw
-        content_probe = list(content)
-        content_probe.append({
-            "type": "text",
-            "text": " ".join(pose_sentences) + " " + _question,
-        })
-        text_probe = self.processor.apply_chat_template(
-            [{"role": "user", "content": content_probe}],
-            tokenize=False, add_generation_prompt=False,
-        )
-        proc_probe = self.processor(
-            text=[text_probe], images=images,
-            return_tensors="pt", padding=False,
-        )
-        thw_all = proc_probe["image_grid_thw"]  # (N, 3)
-        sms = self.spatial_merge_size
-
-        # ── Build coord sentences (one token per LLM patch) ────────────────────
-        coord_sentences = []
-        for k in range(N):
-            llm_h = int(thw_all[k][1]) // sms
-            llm_w = int(thw_all[k][2]) // sms
-            n_tok = llm_h * llm_w
-            coord_tokens = " ".join([COORD_TOKEN] * n_tok)
-            coord_sentences.append(
-                f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
-            )
-
-        # ── Build final prompt with dense coord tokens ──────────────────────────
-        content.append({
-            "type": "text",
-            "text": (
-                " ".join(pose_sentences)
-                + " "
-                + " ".join(coord_sentences)
-                + " "
-                + _question
-            ),
-        })
-        text_full = self.processor.apply_chat_template(
-            [{"role": "user",      "content": content},
-             {"role": "assistant", "content": _answer}],
-            tokenize=False, add_generation_prompt=False,
-        )
-        proc_out = self.processor(
-            text=[text_full], images=images,
-            return_tensors="pt", padding=False,
-        )
-        # Supervise only the answer tokens (tail of sequence).
-        # Mask everything before — including <think> block — so the model's
-        # reasoning behaviour is not suppressed.
-        suffix_ids = self.processor.tokenizer(
-            _answer + "<|im_end|>\n", add_special_tokens=False
-        )["input_ids"]
-        labels = proc_out["input_ids"].clone()
-        labels[0, :-len(suffix_ids)] = -100
-
-        # ── 3D position maps ──────────────────────────────────────────────────
-        # image_xyz:       patch-level (llm_h, llm_w, 3) — used for 4D M-RoPE
-        # image_xyz_hires: sub-pixel   (llm_h*up, llm_w*up, 3) — used for coord loss
-        image_xyz = None
-        image_xyz_hires = None
-        if p3d_path is not None:
-            try:
-                d3d     = np.load(p3d_path)
-                thw_all = proc_out["image_grid_thw"]   # (N, 3)
-                sms     = self.spatial_merge_size
-                up      = self.coord_upscale
-                xyz_list = []
-                xyz_hires_list = []
-                n_3d = int(d3d["n_frames"])
-                for k in range(min(N, n_3d)):
-                    xyz_raw   = d3d[f"frame_{k}_xyz"]
-                    valid_raw = d3d.get(f"frame_{k}_valid")
-                    thw_k     = thw_all[k]
-                    llm_h     = int(thw_k[1]) // sms
-                    llm_w     = int(thw_k[2]) // sms
-                    xyz_list.append(resize_xyz(xyz_raw, llm_h, llm_w, valid=valid_raw))
-                    xyz_hires_list.append(resize_xyz(xyz_raw, llm_h * up, llm_w * up, valid=valid_raw))
-                for k in range(len(xyz_list), N):
-                    thw_k = thw_all[k]
-                    llm_h = int(thw_k[1]) // sms
-                    llm_w = int(thw_k[2]) // sms
-                    xyz_list.append(torch.zeros(llm_h, llm_w, 3))
-                    xyz_hires_list.append(torch.zeros(llm_h * up, llm_w * up, 3))
-                image_xyz = xyz_list
-                image_xyz_hires = xyz_hires_list
-            except Exception as exc:
-                log.debug(f"3D_pos load failed for {p3d_path}: {exc}")
-                image_xyz = None
-                image_xyz_hires = None
-
-        return {
-            **proc_out,
-            "gt_transforms": gt_transforms,
-            "image_xyz":     image_xyz,
-            "image_xyz_hires": image_xyz_hires,
-            "labels":        labels,
-        }
+    x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
+    r = torch.sqrt(x**2 + y**2 + z**2)
+    zero_mask = (r == 0)
+    r_safe = r.clamp(min=1e-8)
+    theta = torch.atan2(y, x)
+    alpha = torch.atan2(torch.sqrt(x**2 + y**2), z)
+    # restore exact zero for invalid patches
+    theta = torch.where(zero_mask, torch.zeros_like(theta), theta)
+    alpha = torch.where(zero_mask, torch.zeros_like(alpha), alpha)
+    return torch.stack([r, theta, alpha], dim=-1)
 
 
 # ── MindCube training dataset ─────────────────────────────────────────────────
@@ -890,7 +459,7 @@ class MindCube_Train_Dataset_Coord(Dataset):
             llm_h = int(thw_all[k][1]) // sms
             llm_w = int(thw_all[k][2]) // sms
             n_tok = llm_h * llm_w
-            coord_tokens = " ".join([COORD_TOKEN] * n_tok)
+            coord_tokens = "".join([COORD_TOKEN] * n_tok)
             coord_sentences.append(
                 f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
             )
@@ -952,3 +521,22 @@ class MindCube_Train_Dataset_Coord(Dataset):
             "image_xyz_hires": image_xyz_hires,
             "labels":         labels,
         }
+
+
+class MindCube_Train_Dataset_Coord_Polar(MindCube_Train_Dataset_Coord):
+    """
+    Variant of MindCube_Train_Dataset_Coord where image_xyz_hires is
+    converted from Cartesian (x, y, z) to spherical (r, θ, α) before
+    being returned.  image_xyz (patch-level, used for 4D M-RoPE) is
+    kept in Cartesian so that RoPE position encoding is unchanged.
+
+    Use with --polar flag in train_coordinate.py.
+    """
+
+    def __getitem__(self, idx):
+        batch = super().__getitem__(idx)
+        if batch.get("image_xyz_hires") is not None:
+            batch["image_xyz_hires"] = [
+                xyz_to_polar(xyz) for xyz in batch["image_xyz_hires"]
+            ]
+        return batch

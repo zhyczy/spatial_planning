@@ -7,10 +7,11 @@
 #   - Ablation: LM answer + per-patch 3D coordinate only (--no_cam)
 #
 # Usage:
-#   bash scripts/train_coordinate.sh [num_gpus] [--no_cam] [--skip_layers LAYER] [--max_samples N]
+#   bash scripts/train_coordinate.sh [num_gpus] [--no_cam] [--polar] [--skip_layers LAYER] [--max_samples N]
 #
 #   num_gpus            — first positional arg, number of GPUs (default: all)
 #   --no_cam            — ablation: remove pose head, use CoordinateModel
+#   --polar             — convert coord GT from (x,y,z) to spherical (r,θ,α)
 #   --skip_layers LAYER — layer for pose/coord heads (default: -1 = last layer)
 #                         -1 = Layer 32 (post-norm), -2 = Layer 31, etc.
 #   --max_samples N     — truncate dataset to N entries (default: all)
@@ -19,6 +20,7 @@
 #   bash scripts/train_coordinate.sh                      # all GPUs, full model, Layer 32
 #   bash scripts/train_coordinate.sh 2                    # 2 GPUs, full model, Layer 32
 #   bash scripts/train_coordinate.sh 6 --no_cam           # 6 GPUs, ablation
+#   bash scripts/train_coordinate.sh 6 --no_cam --polar   # no_cam + spherical coord GT
 #   bash scripts/train_coordinate.sh 1 --skip_layers -2   # single GPU, use Layer 31
 #   bash scripts/train_coordinate.sh 1 --max_samples 6    # single GPU, 6 samples
 # =============================================================================
@@ -37,6 +39,7 @@ cd "$SPATIAL_DIR"
 NPROC=""
 MAX_SAMPLES=""
 NO_CAM_ARG=""
+POLAR_FLAG=""
 SKIP_LAYERS_ARG=""
 _positional=0
 
@@ -44,6 +47,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --no_cam)
             NO_CAM_ARG="no_cam"; shift ;;
+        --polar)
+            POLAR_FLAG="--polar"; shift ;;
         --skip_layers)
             SKIP_LAYERS_ARG="$2"; shift 2 ;;
         --max_samples)
@@ -110,15 +115,17 @@ SKIP_LAYERS="${SKIP_LAYERS_ARG:--1}"  # default to -1 if not specified
 SKIP_LAYERS_DISPLAY="$(layer_name "$SKIP_LAYERS")"
 SKIP_LAYERS_FLAG="--skip_layers ${SKIP_LAYERS}"
 
+_polar_suffix="${POLAR_FLAG:+_polar}"
+
 if [ "$NO_CAM_ARG" = "no_cam" ]; then
-    RUN_NAME="coordinate_no_cam_mindcube"
-    WANDB_RUN_NAME="coord_no_cam_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}"
+    RUN_NAME="coordinate_no_cam_mindcube${_polar_suffix}"
+    WANDB_RUN_NAME="coord_no_cam_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}${_polar_suffix}"
     NO_CAM_FLAG="--no_cam"
     CYCLE_FLAG=""
 else
     CYCLE_WEIGHT=0.1
-    RUN_NAME="coordinate_mindcube"
-    WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}_coord${COORD_WEIGHT}"
+    RUN_NAME="coordinate_mindcube${_polar_suffix}"
+    WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}_coord${COORD_WEIGHT}${_polar_suffix}"
     NO_CAM_FLAG=""
     CYCLE_FLAG="--cycle_weight $CYCLE_WEIGHT"
 fi
@@ -138,6 +145,7 @@ echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] Mode                 = ${NO_CAM_ARG:-full (pose+coord+lm)}"
+echo "[INFO] Polar coord GT       = ${POLAR_FLAG:-disabled}"
 echo "[INFO] Pose/Coord Heads at  = $SKIP_LAYERS_DISPLAY"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
@@ -182,6 +190,7 @@ $TORCHRUN \
     $SKIP_LAYERS_FLAG                                  \
     $CYCLE_FLAG                                        \
     $NO_CAM_FLAG                                       \
+    $POLAR_FLAG                                        \
     $MAX_SAMPLES_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

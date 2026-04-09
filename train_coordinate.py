@@ -60,7 +60,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
 from src.models import CoordinateRegressionHead, CoordinatePlusModel, CoordinateModel, PoseRegressionHead, SpaForConditionalGeneration
-from src.dataset import MindCube_Train_Dataset_Coord, Eval_Dataset_Coord
+from src.dataset import MindCube_Train_Dataset_Coord, MindCube_Train_Dataset_Coord_Polar, Eval_Dataset_Coord, xyz_to_polar
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +102,7 @@ def build_model(
     skip_layers:        tuple[int, ...] = (-1,),
     answer_weight:      float = 1.0,
     coord_weight:       float = 1.0,
+    polar:              bool  = False,
 ) -> CoordinatePlusModel:
     """
     Load SpaForConditionalGeneration, patch 4D M-RoPE, apply LoRA,
@@ -161,9 +162,9 @@ def build_model(
 
     # Navigate to the actual embed_tokens weight inside the PEFT wrapper
     _embed = (
-        spa.model.model.language_model.model.embed_tokens
+        spa.model.model.language_model.embed_tokens
         if hasattr(spa.model, "model")
-        else spa.model.language_model.model.embed_tokens
+        else spa.model.language_model.embed_tokens
     )
     _embed.weight.register_hook(_make_new_token_grad_hook(old_vocab))
     log.info(
@@ -208,6 +209,7 @@ def build_model(
         skip_layers        = skip_layers,
         answer_weight      = answer_weight,
         coord_weight       = coord_weight,
+        polar              = polar,
     )
 
 
@@ -222,6 +224,7 @@ def build_coord_only_model(
     skip_layers:        tuple[int, ...] = (-1,),
     answer_weight:      float = 1.0,
     coord_weight:       float = 1.0,
+    polar:              bool  = False,
 ) -> CoordinateModel:
     """
     Ablation build: CoordinateModel (no pose head, no <pose> tokens needed).
@@ -282,9 +285,9 @@ def build_coord_only_model(
 
     # Navigate to the actual embed_tokens weight inside the PEFT wrapper
     _embed = (
-        spa.model.model.language_model.model.embed_tokens
+        spa.model.model.language_model.embed_tokens
         if hasattr(spa.model, "model")
-        else spa.model.language_model.model.embed_tokens
+        else spa.model.language_model.embed_tokens
     )
     _embed.weight.register_hook(_make_new_token_grad_hook(old_vocab))
     log.info(
@@ -318,6 +321,7 @@ def build_coord_only_model(
         skip_layers        = skip_layers,
         answer_weight      = answer_weight,
         coord_weight       = coord_weight,
+        polar              = polar,
     )
 
 
@@ -384,6 +388,7 @@ def train(args: argparse.Namespace) -> None:
             skip_layers        = tuple(args.skip_layers),
             answer_weight      = args.answer_weight,
             coord_weight       = args.coord_weight,
+            polar              = args.polar,
         )
         log.info("Using CoordinateModel (ablation: no pose head)")
     else:
@@ -399,6 +404,7 @@ def train(args: argparse.Namespace) -> None:
             skip_layers        = tuple(args.skip_layers),
             answer_weight      = args.answer_weight,
             coord_weight       = args.coord_weight,
+            polar              = args.polar,
         )
     model = model.to(device)
     if local_rank == 0:
@@ -414,7 +420,8 @@ def train(args: argparse.Namespace) -> None:
         _model = model
 
     # -- dataset / loader ------------------------------------------------------
-    train_dataset = MindCube_Train_Dataset_Coord(
+    _CoordDataset = MindCube_Train_Dataset_Coord_Polar if args.polar else MindCube_Train_Dataset_Coord
+    train_dataset = _CoordDataset(
         jsonl_path         = args.json_path,
         results_dir        = args.mindcube_results_dir,
         processor          = processor,
@@ -427,6 +434,8 @@ def train(args: argparse.Namespace) -> None:
         max_samples        = args.max_samples,
         no_cam             = args.no_cam,
     )
+    if args.polar:
+        log.info("Polar mode: image_xyz_hires GT converted to (r, θ, α)")
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
                            rank=local_rank, shuffle=True)
@@ -588,21 +597,18 @@ def train(args: argparse.Namespace) -> None:
                 )
 
             # -- forward + loss ------------------------------------------------
-            try:
-                _, loss, loss_dict = model(
-                    input_ids       = input_ids,
-                    attention_mask  = attention_mask,
-                    pixel_values    = pixel_values,
-                    image_grid_thw  = image_grid_thw,
-                    gt_transforms   = gt_transforms,
-                    image_xyz       = image_xyz,
-                    image_xyz_hires = image_xyz_hires,
-                    cycle_weight    = args.cycle_weight,
-                    labels          = labels,
-                )
-            except Exception as exc:
-                log.warning(f"[rank{local_rank}] Step {step} skipped: {exc}")
-                continue
+  
+            _, loss, loss_dict = model(
+                input_ids       = input_ids,
+                attention_mask  = attention_mask,
+                pixel_values    = pixel_values,
+                image_grid_thw  = image_grid_thw,
+                gt_transforms   = gt_transforms,
+                image_xyz       = image_xyz,
+                image_xyz_hires = image_xyz_hires,
+                cycle_weight    = args.cycle_weight,
+                labels          = labels,
+            )
 
             if loss is None:
                 log.warning(f"[rank{local_rank}] Step {step}: no supervision signal, skipping.")
@@ -711,29 +717,29 @@ def train(args: argparse.Namespace) -> None:
                                 t_xyz = [x.to(device) for x in t_xyz]
                             if t_xyz_h is not None:
                                 t_xyz_h = [x.to(device) for x in t_xyz_h]
+                                if args.polar:
+                                    t_xyz_h = [xyz_to_polar(x) for x in t_xyz_h]
 
-                            try:
-                                with torch.inference_mode():
-                                    _, loss, loss_dict = model(
-                                        input_ids       = t_ids,
-                                        attention_mask  = t_mask,
-                                        pixel_values    = t_pv,
-                                        image_grid_thw  = t_thw,
-                                        gt_transforms   = t_gt,
-                                        image_xyz       = t_xyz,
-                                        image_xyz_hires = t_xyz_h,
-                                        cycle_weight    = args.cycle_weight if not args.no_cam else 0.0,
-                                        labels          = t_labels,
-                                    )
-                                if loss is None:
-                                    continue
-                                local_count += 1
-                                if loss_dict:
-                                    for k, v in loss_dict.items():
-                                        local_loss_sums[k] = local_loss_sums.get(k, 0.0) + v
-                            except Exception as exc:
-                                log.debug(f"Eval skip ({ds_name}): {exc}")
+                        
+                            with torch.inference_mode():
+                                _, loss, loss_dict = model(
+                                    input_ids       = t_ids,
+                                    attention_mask  = t_mask,
+                                    pixel_values    = t_pv,
+                                    image_grid_thw  = t_thw,
+                                    gt_transforms   = t_gt,
+                                    image_xyz       = t_xyz,
+                                    image_xyz_hires = t_xyz_h,
+                                    cycle_weight    = args.cycle_weight if not args.no_cam else 0.0,
+                                    labels          = t_labels,
+                                )
+                            if loss is None:
                                 continue
+                            local_count += 1
+                            if loss_dict:
+                                for k, v in loss_dict.items():
+                                    local_loss_sums[k] = local_loss_sums.get(k, 0.0) + v
+                            
 
                         # Aggregate across all ranks
                         _loss_keys = sorted(local_loss_sums.keys())
@@ -862,6 +868,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ablation: remove camera pose regression head. Uses CoordinateModel "
              "(coord loss + LM loss only, no <pose> tokens needed).",
+    )
+    p.add_argument(
+        "--polar",
+        action="store_true",
+        help="Convert coordinate GT from Cartesian (x,y,z) to spherical (r,θ,α) "
+             "before computing coord loss. Uses MindCube_Train_Dataset_Coord_Polar.",
     )
     p.add_argument(
         "--skip_layers",

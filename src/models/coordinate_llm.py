@@ -76,6 +76,7 @@ class CoordinatePlusModel(nn.Module):
         skip_layers:        tuple[int, ...] = (-1,),
         answer_weight:      float = 1.0,
         coord_weight:       float = 1.0,
+        polar:              bool  = False,
     ):
         super().__init__()
         self.spa_model          = spa_model
@@ -88,6 +89,7 @@ class CoordinatePlusModel(nn.Module):
         self.skip_layers        = list(skip_layers)
         self.answer_weight      = answer_weight
         self.coord_weight       = coord_weight
+        self.polar              = polar
 
         # Hook on lm_head to capture last hidden state without
         # output_hidden_states=True (which defeats gradient checkpointing).
@@ -223,7 +225,13 @@ class CoordinatePlusModel(nn.Module):
                 pred_k = self.coord_head(coord_h_k, llm_h, llm_w)  # (llm_h*up, llm_w*up, 3)
 
                 gt_k = coord_gt[k].to(pred_k.device, dtype=pred_k.dtype)
-                per_img_losses.append(F.l1_loss(pred_k, gt_k))
+                if self.polar:
+                    # (r, θ, α): weight angles by 1/π so a π-radian error equals
+                    # a 1-unit r error in contribution.
+                    w = pred_k.new_tensor([1.0, 1.0 / math.pi, 1.0 / math.pi])
+                    per_img_losses.append((pred_k - gt_k).abs().mul(w).mean())
+                else:
+                    per_img_losses.append(F.l1_loss(pred_k, gt_k))
 
                 start += n_tok
 
@@ -267,6 +275,7 @@ class CoordinateModel(nn.Module):
         skip_layers:        tuple[int, ...] = (-1,),
         answer_weight:      float = 1.0,
         coord_weight:       float = 1.0,
+        polar:              bool  = False,
     ):
         super().__init__()
         self.spa_model          = spa_model
@@ -277,6 +286,7 @@ class CoordinateModel(nn.Module):
         self.skip_layers        = list(skip_layers)
         self.answer_weight      = answer_weight
         self.coord_weight       = coord_weight
+        self.polar              = polar
 
         # Pre-hook on lm_head to capture last hidden state without
         # output_hidden_states=True (preserves gradient checkpointing savings).
@@ -368,7 +378,11 @@ class CoordinateModel(nn.Module):
                 pred_k    = self.coord_head(coord_h_k, llm_h, llm_w)
 
                 gt_k = coord_gt[k].to(pred_k.device, dtype=pred_k.dtype)
-                per_img_losses.append(F.l1_loss(pred_k, gt_k))
+                if self.polar:
+                    w = pred_k.new_tensor([1.0, 1.0 / math.pi, 1.0 / math.pi])
+                    per_img_losses.append((pred_k - gt_k).abs().mul(w).mean())
+                else:
+                    per_img_losses.append(F.l1_loss(pred_k, gt_k))
                 start += n_tok
 
             if per_img_losses:
