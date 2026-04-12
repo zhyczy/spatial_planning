@@ -59,7 +59,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
-from src.models import CoordinateRegressionHead, CoordinatePlusModel, CoordinateModel, PoseRegressionHead, SpaForConditionalGeneration
+from src.models import DepthPredictionTransformer, CoordinatePlusModel, CoordinateModel, PoseRegressionHead, SpaForConditionalGeneration
 from src.dataset import MindCube_Train_Dataset_Coord, MindCube_Train_Dataset_Coord_Polar, Eval_Dataset_Coord, xyz_to_polar
 
 logging.basicConfig(
@@ -93,7 +93,6 @@ def collate_fn(batch):
 def build_model(
     model_path:         str,
     pose_token_id:      int,
-    coord_token_id:     int,
     image_token_id:     int,
     spatial_merge_size: int,
     coord_upscale:      int = 4,
@@ -127,8 +126,8 @@ def build_model(
     )
 
     old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
-    spa.resize_token_embeddings(old_vocab + 2)
-    log.info(f"Embedding table: {old_vocab} -> {old_vocab + 2} (added <pose>, <coord>)")
+    spa.resize_token_embeddings(old_vocab + 1)
+    log.info(f"Embedding table: {old_vocab} -> {old_vocab + 1} (added <pose>)")
 
     if freeze_vision:
         for p in spa.model.visual.parameters():
@@ -142,7 +141,7 @@ def build_model(
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        modules_to_save = ["embed_tokens"],  # Save new <pose>/<coord> token embeddings
+        modules_to_save = ["embed_tokens"],  # Save new <pose> token embeddings
         lora_dropout = 0.05,
         bias         = "none",
         task_type    = TaskType.CAUSAL_LM,
@@ -150,7 +149,7 @@ def build_model(
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
 
-    # Freeze old token embeddings via gradient hook: only <pose>/<coord> rows get gradients.
+    # Freeze old token embeddings via gradient hook: only <pose> row gets gradients.
     # modules_to_save wraps embed_tokens as a full trainable copy; the hook zeros out
     # the gradient rows corresponding to the original vocabulary on every backward pass.
     def _make_new_token_grad_hook(n_old: int):
@@ -169,7 +168,7 @@ def build_model(
     _embed.weight.register_hook(_make_new_token_grad_hook(old_vocab))
     log.info(
         f"Gradient hook registered on embed_tokens: rows 0..{old_vocab - 1} zeroed, "
-        f"rows {old_vocab}..{old_vocab + 1} (<pose>, <coord>) trainable."
+        f"row {old_vocab} (<pose>) trainable."
     )
 
     # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
@@ -192,18 +191,17 @@ def build_model(
     log.info(f"PoseRegressionHead input_dim={pose_input_dim} "
              f"(skip_layers={list(skip_layers)}, hidden={hidden_dim})")
 
-    # Coordinate regression head: Linear + PixelShuffle (ultra-shallow)
-    coord_head = CoordinateRegressionHead(
+    # Coordinate head: two-layer depth prediction transformer
+    coord_head = DepthPredictionTransformer(
         hidden_dim=hidden_dim, upscale_factor=coord_upscale,
     ).to(torch.bfloat16)
-    log.info(f"CoordinateRegressionHead hidden_dim={hidden_dim} upscale={coord_upscale}")
+    log.info(f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}")
 
     return CoordinatePlusModel(
         spa_model          = spa,
         pose_head          = pose_head,
         coord_head         = coord_head,
         pose_token_id      = pose_token_id,
-        coord_token_id     = coord_token_id,
         image_token_id     = image_token_id,
         spatial_merge_size = spatial_merge_size,
         skip_layers        = skip_layers,
@@ -215,7 +213,6 @@ def build_model(
 
 def build_coord_only_model(
     model_path:         str,
-    coord_token_id:     int,
     image_token_id:     int,
     spatial_merge_size: int,
     coord_upscale:      int = 4,
@@ -227,9 +224,9 @@ def build_coord_only_model(
     polar:              bool  = False,
 ) -> CoordinateModel:
     """
-    Ablation build: CoordinateModel (no pose head, no <pose> tokens needed).
+    Ablation build: CoordinateModel (no pose head, no special tokens needed).
     Supervision: LM answer loss + per-patch coordinate loss only.
-    Uses hidden states from skip_layers for coord head.
+    Coord head reads hidden states directly from vision token positions.
     """
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
@@ -249,10 +246,6 @@ def build_coord_only_model(
         attn_implementation = "sdpa",
     )
 
-    old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
-    spa.resize_token_embeddings(old_vocab + 1)   # only <coord>
-    log.info(f"Embedding table: {old_vocab} -> {old_vocab + 1} (added <coord>)")
-
     if freeze_vision:
         for p in spa.model.visual.parameters():
             p.requires_grad_(False)
@@ -265,35 +258,12 @@ def build_coord_only_model(
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        modules_to_save = ["embed_tokens"],  # Save new <coord> token embeddings
         lora_dropout = 0.05,
         bias         = "none",
         task_type    = TaskType.CAUSAL_LM,
     )
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
-   
-    # Freeze old token embeddings via gradient hook: only <pose>/<coord> rows get gradients.
-    # modules_to_save wraps embed_tokens as a full trainable copy; the hook zeros out
-    # the gradient rows corresponding to the original vocabulary on every backward pass.
-    def _make_new_token_grad_hook(n_old: int):
-        def _hook(grad: torch.Tensor) -> torch.Tensor:
-            grad = grad.clone()
-            grad[:n_old] = 0.0
-            return grad
-        return _hook
-
-    # Navigate to the actual embed_tokens weight inside the PEFT wrapper
-    _embed = (
-        spa.model.model.language_model.embed_tokens
-        if hasattr(spa.model, "model")
-        else spa.model.language_model.embed_tokens
-    )
-    _embed.weight.register_hook(_make_new_token_grad_hook(old_vocab))
-    log.info(
-        f"Gradient hook registered on embed_tokens: rows 0..{old_vocab - 1} zeroed, "
-        f"rows {old_vocab} (<coord>) trainable."
-    )
 
     # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
     spa.gradient_checkpointing_enable(
@@ -307,15 +277,14 @@ def build_coord_only_model(
         log.info("Manually set gradient_checkpointing=True on language_model")
 
     hidden_dim = config.text_config.hidden_size
-    coord_head = CoordinateRegressionHead(
+    coord_head = DepthPredictionTransformer(
         hidden_dim=hidden_dim, upscale_factor=coord_upscale,
     ).to(torch.bfloat16)
-    log.info(f"CoordinateRegressionHead hidden_dim={hidden_dim} upscale={coord_upscale}")
+    log.info(f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}")
 
     return CoordinateModel(
         spa_model          = spa,
         coord_head         = coord_head,
-        coord_token_id     = coord_token_id,
         image_token_id     = image_token_id,
         spatial_merge_size = spatial_merge_size,
         skip_layers        = skip_layers,
@@ -351,18 +320,11 @@ def train(args: argparse.Namespace) -> None:
     )
     tokenizer = processor.tokenizer
     if args.no_cam:
-        tokenizer.add_special_tokens({"additional_special_tokens": [COORD_TOKEN]})
-        pose_token_id  = None
-        coord_token_id = tokenizer.convert_tokens_to_ids(COORD_TOKEN)
-        rank0_print(f"[no_cam] <coord> token id = {coord_token_id}")
+        pose_token_id = None
     else:
-        tokenizer.add_special_tokens(
-            {"additional_special_tokens": [POSE_TOKEN, COORD_TOKEN]}
-        )
-        pose_token_id  = tokenizer.convert_tokens_to_ids(POSE_TOKEN)
-        coord_token_id = tokenizer.convert_tokens_to_ids(COORD_TOKEN)
-        rank0_print(f"<pose>  token id = {pose_token_id}")
-        rank0_print(f"<coord> token id = {coord_token_id}")
+        tokenizer.add_special_tokens({"additional_special_tokens": [POSE_TOKEN]})
+        pose_token_id = tokenizer.convert_tokens_to_ids(POSE_TOKEN)
+        rank0_print(f"<pose> token id = {pose_token_id}")
 
     # image_token_id: <|image_pad|> in Qwen-VL tokeniser
     image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
@@ -379,7 +341,6 @@ def train(args: argparse.Namespace) -> None:
     if args.no_cam:
         model = build_coord_only_model(
             args.model_path,
-            coord_token_id     = coord_token_id,
             image_token_id     = image_token_id,
             spatial_merge_size = spatial_merge_size,
             coord_upscale      = args.coord_upscale,
@@ -395,7 +356,6 @@ def train(args: argparse.Namespace) -> None:
         model = build_model(
             args.model_path,
             pose_token_id      = pose_token_id,
-            coord_token_id     = coord_token_id,
             image_token_id     = image_token_id,
             spatial_merge_size = spatial_merge_size,
             coord_upscale      = args.coord_upscale,
@@ -426,7 +386,6 @@ def train(args: argparse.Namespace) -> None:
         results_dir        = args.mindcube_results_dir,
         processor          = processor,
         pose_token_id      = pose_token_id,
-        coord_token_id     = coord_token_id,
         log                = log,
         max_images         = args.max_images,
         spatial_merge_size = spatial_merge_size,
@@ -470,7 +429,6 @@ def train(args: argparse.Namespace) -> None:
                 results_dir        = _ds_results,
                 processor          = processor,
                 pose_token_id      = pose_token_id,
-                coord_token_id     = coord_token_id,
                 log                = log,
                 max_images         = args.max_images,
                 spatial_merge_size = spatial_merge_size,
@@ -585,12 +543,11 @@ def train(args: argparse.Namespace) -> None:
 
             if step == 0 and local_rank == 0:
                 n_img_tok = (input_ids[0] == image_token_id).sum().item()
-                n_coord_tok = (input_ids[0] == coord_token_id).sum().item()
                 pv_shape = tuple(pixel_values.shape) if pixel_values is not None else None
                 mem_before = torch.cuda.memory_allocated(device) / 1e9
                 log.info(
                     f"[MEM] Step 0: seq_len={input_ids.shape[1]}, "
-                    f"img_tokens={n_img_tok}, coord_tokens={n_coord_tok}, "
+                    f"img_tokens={n_img_tok}, "
                     f"pixel_values={pv_shape}, "
                     f"image_grid_thw={image_grid_thw}, "
                     f"mem_before_fwd={mem_before:.2f} GiB"

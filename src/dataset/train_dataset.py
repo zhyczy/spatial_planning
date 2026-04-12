@@ -329,13 +329,13 @@ class MindCube_Train_Dataset_Coord(Dataset):
         results_dir:        str,
         processor,
         pose_token_id:      int,
-        coord_token_id:     int,
         log,
         max_images:         int = 4,
         spatial_merge_size: int = 2,
         coord_upscale:      int = 4,
         max_samples:        int | None = None,
         no_cam:             bool = False,
+        coord_token_id:     int | None = None,  # kept for backward compat, unused
     ):
         import json
         raw = []
@@ -357,7 +357,6 @@ class MindCube_Train_Dataset_Coord(Dataset):
 
         self.processor          = processor
         self.pose_token_id      = pose_token_id
-        self.coord_token_id     = coord_token_id
         self.max_images         = max_images
         self.spatial_merge_size = spatial_merge_size
         self.coord_upscale      = coord_upscale
@@ -436,39 +435,10 @@ class MindCube_Train_Dataset_Coord(Dataset):
                 f"MindCube sample {idx} (id={entry.get('id')}) has no QA pair."
             )
 
-        # ── Probe: process without coord tokens to get image_grid_thw ─────────
-        probe_text_part = (
-            (" ".join(pose_sentences) + " " if pose_sentences else "")
-            + _question
-        )
-        content_probe = list(content) + [{"type": "text", "text": probe_text_part}]
-        text_probe = self.processor.apply_chat_template(
-            [{"role": "user", "content": content_probe}],
-            tokenize=False, add_generation_prompt=False,
-        )
-        proc_probe = self.processor(
-            text=[text_probe], images=images,
-            return_tensors="pt", padding=False,
-        )
-        thw_all = proc_probe["image_grid_thw"]  # (N, 3)
-        sms = self.spatial_merge_size
-
-        # ── Build coord sentences (one <coord> token per LLM patch) ───────────
-        coord_sentences = []
-        for k in range(N):
-            llm_h = int(thw_all[k][1]) // sms
-            llm_w = int(thw_all[k][2]) // sms
-            n_tok = llm_h * llm_w
-            coord_tokens = "".join([COORD_TOKEN] * n_tok)
-            coord_sentences.append(
-                f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
-            )
-
-        # ── Build final prompt (pose if not no_cam) + coord + QA ─────────────
+        # ── Build prompt (pose if not no_cam) + QA ───────────────────────────
         parts = []
         if pose_sentences:
             parts.append(" ".join(pose_sentences))
-        parts.append(" ".join(coord_sentences))
         parts.append(_question)
         content.append({"type": "text", "text": " ".join(parts)})
         text_full = self.processor.apply_chat_template(
@@ -492,6 +462,7 @@ class MindCube_Train_Dataset_Coord(Dataset):
         image_xyz_hires = None
         try:
             thw_all = proc_out["image_grid_thw"]  # (N, 3)
+            sms     = self.spatial_merge_size
             up      = self.coord_upscale
             xyz_list = []
             xyz_hires_list = []

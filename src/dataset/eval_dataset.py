@@ -85,7 +85,6 @@ class Eval_Dataset_Coord(Dataset):
         results_dir:        str,
         processor,
         pose_token_id:      int | None,
-        coord_token_id:     int,
         log,
         max_images:         int = 4,
         spatial_merge_size: int = 2,
@@ -94,6 +93,7 @@ class Eval_Dataset_Coord(Dataset):
         max_samples:        int | None = None,
         question_key:       str = "question",
         answer_key:         str = "gt_answer",
+        coord_token_id:     int | None = None,  # kept for backward compat, unused
     ):
         raw = []
         with open(jsonl_path) as fh:
@@ -114,7 +114,6 @@ class Eval_Dataset_Coord(Dataset):
 
         self.processor          = processor
         self.pose_token_id      = pose_token_id
-        self.coord_token_id     = coord_token_id
         self.max_images         = max_images
         self.spatial_merge_size = spatial_merge_size
         self.coord_upscale      = coord_upscale
@@ -184,39 +183,10 @@ class Eval_Dataset_Coord(Dataset):
                 f"Eval_Dataset_Coord sample {idx} (id={entry.get('id')}) has no QA pair."
             )
 
-        # ── Probe pass: get image_grid_thw without coord tokens ───────────────
-        probe_text_part = (
-            (" ".join(pose_sentences) + " " if pose_sentences else "")
-            + _question
-        )
-        content_probe = list(content) + [{"type": "text", "text": probe_text_part}]
-        text_probe = self.processor.apply_chat_template(
-            [{"role": "user", "content": content_probe}],
-            tokenize=False, add_generation_prompt=False,
-        )
-        proc_probe = self.processor(
-            text=[text_probe], images=images,
-            return_tensors="pt", padding=False,
-        )
-        thw_all = proc_probe["image_grid_thw"]
-        sms = self.spatial_merge_size
-
-        # ── Build coord sentences ─────────────────────────────────────────────
-        coord_sentences = []
-        for k in range(N):
-            llm_h = int(thw_all[k][1]) // sms
-            llm_w = int(thw_all[k][2]) // sms
-            n_tok = llm_h * llm_w
-            coord_tokens = "".join([COORD_TOKEN] * n_tok)
-            coord_sentences.append(
-                f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
-            )
-
-        # ── Final prompt: pose + coord + QA ──────────────────────────────────
+        # ── Final prompt: pose (if applicable) + QA ──────────────────────────
         parts = []
         if pose_sentences:
             parts.append(" ".join(pose_sentences))
-        parts.append(" ".join(coord_sentences))
         parts.append(_question)
         content.append({"type": "text", "text": " ".join(parts)})
 
@@ -240,6 +210,7 @@ class Eval_Dataset_Coord(Dataset):
         image_xyz_hires = None
         try:
             thw_all = proc_out["image_grid_thw"]
+            sms = self.spatial_merge_size
             up = self.coord_upscale
             xyz_list, xyz_hires_list = [], []
             for k in range(N):

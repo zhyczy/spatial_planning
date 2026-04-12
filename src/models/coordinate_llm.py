@@ -6,39 +6,98 @@ from src.loss.cam_loss import geodesic_loss, cycle_consistency_loss
 from .correspondence_llm import rot6d_to_rotmat, PoseRegressionHead
 
 
-class CoordinateRegressionHead(nn.Module):
-    """Ultra-shallow upsampler: single Linear + PixelShuffle.
+class DepthPredictionTransformer(nn.Module):
+    """Two-layer transformer for per-patch 3D coordinate prediction.
 
-    Each <coord> token's hidden state is projected to 3 * upscale² channels,
-    then PixelShuffle rearranges into (upscale, upscale) sub-pixels per patch.
-    No activation, no conv, no deep MLP — capacity is deliberately minimal
-    so that spatial reasoning must happen in the backbone.
+    Architecture:
+      1. Linear projection:  hidden_dim → d_model
+      2. Add 2D sinusoidal positional encoding (variable grid size)
+      3. Two TransformerEncoderLayer (pre-norm, batch_first)
+      4. Linear projection:  d_model → 3 * upscale²
+      5. PixelShuffle(upscale) → (h*upscale, w*upscale, 3)
+
+    Sinusoidal 2D PE is regenerated on-the-fly for each (h, w), so the head
+    handles variable-resolution images without any learned position parameters.
     """
 
-    def __init__(self, hidden_dim: int = 2560, upscale_factor: int = 4):
+    def __init__(
+        self,
+        hidden_dim:      int   = 2560,
+        d_model:         int   = 512,
+        nhead:           int   = 8,
+        dim_feedforward: int   = 2048,
+        upscale_factor:  int   = 4,
+        dropout:         float = 0.0,
+    ):
         super().__init__()
         self.upscale_factor = upscale_factor
-        self.linear_proj = nn.Linear(hidden_dim, 3 * (upscale_factor ** 2))
+        self.d_model        = d_model
+
+        self.input_proj  = nn.Linear(hidden_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model        = d_model,
+            nhead          = nhead,
+            dim_feedforward= dim_feedforward,
+            dropout        = dropout,
+            batch_first    = True,
+            norm_first     = True,   # pre-norm for training stability
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.output_proj  = nn.Linear(d_model, 3 * (upscale_factor ** 2))
         self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
+
+    def _sinusoidal_2d_pe(
+        self,
+        h: int,
+        w: int,
+        device: torch.device,
+        dtype:  torch.dtype,
+    ) -> torch.Tensor:
+        """2D sinusoidal positional encoding.  Returns (h*w, d_model)."""
+        half = self.d_model // 2          # row enc and col enc each use half dims
+
+        # Shared frequency bands
+        dim_idx = torch.arange(half, device=device, dtype=torch.float32)
+        div     = torch.pow(10000.0, 2 * (dim_idx // 2) / half)  # (half,)
+
+        row_idx = torch.arange(h, device=device, dtype=torch.float32).unsqueeze(1)  # (h,1)
+        col_idx = torch.arange(w, device=device, dtype=torch.float32).unsqueeze(1)  # (w,1)
+
+        row_enc = torch.zeros(h, half, device=device)
+        row_enc[:, 0::2] = torch.sin(row_idx / div[0::2])
+        row_enc[:, 1::2] = torch.cos(row_idx / div[1::2])
+
+        col_enc = torch.zeros(w, half, device=device)
+        col_enc[:, 0::2] = torch.sin(col_idx / div[0::2])
+        col_enc[:, 1::2] = torch.cos(col_idx / div[1::2])
+
+        # Broadcast and concat: (h, w, d_model)
+        row_enc = row_enc.unsqueeze(1).expand(h, w, half)
+        col_enc = col_enc.unsqueeze(0).expand(h, w, half)
+        pe = torch.cat([row_enc, col_enc], dim=-1).reshape(h * w, self.d_model)
+        return pe.to(dtype)
 
     def forward(
         self,
-        hidden: torch.Tensor,
+        hidden: torch.Tensor,   # (h*w, hidden_dim)
         h: int,
         w: int,
     ) -> torch.Tensor:
         """
         Args:
-            hidden: (h*w, hidden_dim) — <coord> token hidden states
+            hidden: (h*w, hidden_dim) — vision token hidden states
             h:      LLM patch grid height
             w:      LLM patch grid width
         Returns:
             (h*upscale, w*upscale, 3) — predicted xyz at sub-pixel resolution
         """
-        x = self.linear_proj(hidden)                       # (h*w, 3*up²)
-        x = x.view(1, h, w, -1).permute(0, 3, 1, 2)       # (1, 3*up², h, w)
-        x = self.pixel_shuffle(x)                           # (1, 3, h*up, w*up)
-        return x[0].permute(1, 2, 0)                        # (h*up, w*up, 3)
+        x  = self.input_proj(hidden)                                    # (h*w, d_model)
+        x  = x + self._sinusoidal_2d_pe(h, w, x.device, x.dtype)       # add 2D PE
+        x  = self.transformer(x.unsqueeze(0)).squeeze(0)                # (h*w, d_model)
+        x  = self.output_proj(x)                                        # (h*w, 3*up²)
+        x  = x.view(1, h, w, -1).permute(0, 3, 1, 2)                   # (1, 3*up², h, w)
+        x  = self.pixel_shuffle(x)                                      # (1, 3, h*up, w*up)
+        return x[0].permute(1, 2, 0)                                    # (h*up, w*up, 3)
 
 
 class CoordinatePlusModel(nn.Module):
@@ -47,16 +106,15 @@ class CoordinatePlusModel(nn.Module):
 
       1. PoseRegressionHead    → rot + trans + cycle loss   (at <pose> tokens)
       2. LM cross-entropy      → answer prediction loss     (at answer tokens)
-      3. CoordinateRegressionHead → xyz coordinate loss
-           - one <coord> token per LLM patch per image
+      3. DepthPredictionTransformer → xyz coordinate loss
+           - vision tokens (<|image_pad|>) per LLM patch per image
            - each token's hidden state decoded directly to (x, y, z) via MLP
 
     Args:
         spa_model:          backbone (SpaForConditionalGeneration + LoRA)
         pose_head:          PoseRegressionHead
-        coord_head:         CoordinateRegressionHead
+        coord_head:         DepthPredictionTransformer
         pose_token_id:      token id of <pose>
-        coord_token_id:     token id of <coord>
         image_token_id:     token id of <|image_pad|>
         spatial_merge_size: spatial merge factor used by the vision encoder (2)
         skip_layers:        layer indices for skip-connection concat → pose head
@@ -68,9 +126,8 @@ class CoordinatePlusModel(nn.Module):
         self,
         spa_model:          nn.Module,
         pose_head:          PoseRegressionHead,
-        coord_head:         CoordinateRegressionHead,
+        coord_head:         DepthPredictionTransformer,
         pose_token_id:      int,
-        coord_token_id:     int,
         image_token_id:     int,
         spatial_merge_size: int,
         skip_layers:        tuple[int, ...] = (-1,),
@@ -83,7 +140,6 @@ class CoordinatePlusModel(nn.Module):
         self.pose_head          = pose_head
         self.coord_head         = coord_head
         self.pose_token_id      = pose_token_id
-        self.coord_token_id     = coord_token_id
         self.image_token_id     = image_token_id
         self.spatial_merge_size = spatial_merge_size
         self.skip_layers        = list(skip_layers)
@@ -131,7 +187,6 @@ class CoordinatePlusModel(nn.Module):
             return_dict          = True,
             image_xyz            = image_xyz,
             coord_scale          = coord_scale,
-            coord_token_id       = self.coord_token_id,
             **kwargs,
         )
 
@@ -204,7 +259,8 @@ class CoordinatePlusModel(nn.Module):
         coord_loss = None
         coord_gt = image_xyz_hires if image_xyz_hires is not None else image_xyz
         if coord_gt is not None and image_grid_thw is not None:
-            coord_pos = (input_ids[0] == self.coord_token_id).nonzero(
+            # Use vision token positions directly (no <coord> tokens needed)
+            vis_pos = (input_ids[0] == self.image_token_id).nonzero(
                 as_tuple=True
             )[0]
 
@@ -218,10 +274,10 @@ class CoordinatePlusModel(nn.Module):
                 llm_w = int(thw_k[2]) // sms
                 n_tok = llm_h * llm_w
 
-                if start + n_tok > len(coord_pos):
+                if start + n_tok > len(vis_pos):
                     break
 
-                coord_h_k = hidden_coord[0, coord_pos[start : start + n_tok]]
+                coord_h_k = hidden_coord[0, vis_pos[start : start + n_tok]]
                 pred_k = self.coord_head(coord_h_k, llm_h, llm_w)  # (llm_h*up, llm_w*up, 3)
 
                 gt_k = coord_gt[k].to(pred_k.device, dtype=pred_k.dtype)
@@ -259,8 +315,8 @@ class CoordinateModel(nn.Module):
     Ablation of CoordinatePlusModel: pose regression removed entirely.
 
     Only two supervision signals:
-      1. LM cross-entropy      → answer prediction loss  (at answer tokens)
-      2. CoordinateRegressionHead → xyz coordinate loss  (at <coord> tokens)
+      1. LM cross-entropy      → answer prediction loss    (at answer tokens)
+      2. DepthPredictionTransformer → xyz coordinate loss    (at vision tokens)
 
     No <pose> tokens needed; no PoseRegressionHead; no gt_transforms.
     """
@@ -268,8 +324,7 @@ class CoordinateModel(nn.Module):
     def __init__(
         self,
         spa_model:          nn.Module,
-        coord_head:         CoordinateRegressionHead,
-        coord_token_id:     int,
+        coord_head:         DepthPredictionTransformer,
         image_token_id:     int,
         spatial_merge_size: int,
         skip_layers:        tuple[int, ...] = (-1,),
@@ -280,7 +335,6 @@ class CoordinateModel(nn.Module):
         super().__init__()
         self.spa_model          = spa_model
         self.coord_head         = coord_head
-        self.coord_token_id     = coord_token_id
         self.image_token_id     = image_token_id
         self.spatial_merge_size = spatial_merge_size
         self.skip_layers        = list(skip_layers)
@@ -327,7 +381,6 @@ class CoordinateModel(nn.Module):
             return_dict          = True,
             image_xyz            = image_xyz,
             coord_scale          = coord_scale,
-            coord_token_id       = self.coord_token_id,
             **kwargs,
         )
 
@@ -357,7 +410,8 @@ class CoordinateModel(nn.Module):
         coord_loss = None
         coord_gt   = image_xyz_hires if image_xyz_hires is not None else image_xyz
         if coord_gt is not None and image_grid_thw is not None:
-            coord_pos = (input_ids[0] == self.coord_token_id).nonzero(
+            # Use vision token positions directly (no <coord> tokens needed)
+            vis_pos = (input_ids[0] == self.image_token_id).nonzero(
                 as_tuple=True
             )[0]
 
@@ -371,10 +425,10 @@ class CoordinateModel(nn.Module):
                 llm_w = int(thw_k[2]) // sms
                 n_tok = llm_h * llm_w
 
-                if start + n_tok > len(coord_pos):
+                if start + n_tok > len(vis_pos):
                     break
 
-                coord_h_k = hidden_coord[0, coord_pos[start : start + n_tok]]
+                coord_h_k = hidden_coord[0, vis_pos[start : start + n_tok]]
                 pred_k    = self.coord_head(coord_h_k, llm_h, llm_w)
 
                 gt_k = coord_gt[k].to(pred_k.device, dtype=pred_k.dtype)

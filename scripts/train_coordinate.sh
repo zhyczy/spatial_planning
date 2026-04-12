@@ -3,8 +3,11 @@
 # train_coordinate.sh
 #
 # LoRA fine-tuning of SpaForConditionalGeneration with supervision signals:
-#   - Full:     pose regression + LM answer + per-patch 3D coordinate
+#   - Full:     pose regression + LM answer + per-patch 3D coordinate (via vision tokens)
 #   - Ablation: LM answer + per-patch 3D coordinate only (--no_cam)
+#
+# Coordinate regression is applied directly to vision token (<|image_pad|>) hidden
+# states — no <coord> special tokens or prompt insertions are used.
 #
 # Usage:
 #   bash scripts/train_coordinate.sh [num_gpus] [--no_cam] [--polar] [--skip_layers LAYER] [--max_samples N]
