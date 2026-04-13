@@ -2,28 +2,29 @@
 # =============================================================================
 # train_correspondence.sh
 #
-# LoRA fine-tuning of SpaForConditionalGeneration for relative camera pose
-# prediction on MindCube data.  Multi-GPU via torchrun (DDP).
+# LoRA fine-tuning of SpaForConditionalGeneration (LM answer loss only)
+# on MindCube data.  Multi-GPU via torchrun (DDP).
+#
+# Uses AnswerOnlyModel with 4D M-RoPE (use_xyz=True) by default.
+# Pass --vanilla to use original Qwen 3D M-RoPE instead.
+# Pass --relative to enable per-query-frame coordinate transforms.
 #
 # Usage:
-#   bash scripts/train_correspondence.sh [num_gpus] [num_samples] [--plus] [--skip_layers LAYER] [--ablation MODE]
+#   bash scripts/train_correspondence.sh [num_gpus] [--polar] [--vanilla] [--relative] [--max_samples N]
 #
-#   num_gpus     — number of GPUs to use (default: all available)
-#   num_samples  — truncate dataset to this many entries (default: all)
-#   --plus       — enable plus mode (adds LM answer-prediction loss)
-#   --skip_layers LAYER — layer for pose head (default: -1 = last layer)
-#                         -1 = Layer 32 (post-norm), -2 = Layer 31, etc.
-#   --ablation MODE — ablation study: no_cam | vanilla
+#   num_gpus        — first positional arg, number of GPUs (default: all)
+#   --polar         — convert per-patch xyz → spherical (ρ,θ,α) for M-RoPE; default: off
+#   --vanilla       — use original Qwen 3D M-RoPE (no image_xyz); disables --polar/--relative
+#   --relative      — per-query-frame coord transform: Q from frame f sees all K in frame-f coords
+#   --max_samples N — truncate dataset to N entries (default: all)
 #
 # Examples:
-#   bash scripts/train_correspondence.sh               # all GPUs, full dataset, Layer 32
-#   bash scripts/train_correspondence.sh 2             # 2 GPUs, full dataset, Layer 32
-#   bash scripts/train_correspondence.sh 2 100         # 2 GPUs, 100 samples
-#   bash scripts/train_correspondence.sh 1 6           # single GPU, 6 samples
-#   bash scripts/train_correspondence.sh 2 100 --plus  # plus mode
-#   bash scripts/train_correspondence.sh 1 --skip_layers -2   # use Layer 31
-#   bash scripts/train_correspondence.sh 2 100 --no_cycle          # disable cycle loss
-#   bash scripts/train_correspondence.sh 2 100 --ablation no_cam   # ablation: no cam pred
+#   bash scripts/train_correspondence.sh                        # all GPUs, 4D M-RoPE
+#   bash scripts/train_correspondence.sh 2                      # 2 GPUs, 4D M-RoPE
+#   bash scripts/train_correspondence.sh 2 --polar              # 2 GPUs, spherical coords
+#   bash scripts/train_correspondence.sh 2 --vanilla            # vanilla 3D M-RoPE
+#   bash scripts/train_correspondence.sh 2 --relative           # relative per-frame coords
+#   bash scripts/train_correspondence.sh 1 --max_samples 6      # single GPU, 6 samples
 # =============================================================================
 
 set -euo pipefail
@@ -37,36 +38,32 @@ cd "$SPATIAL_DIR"
 # Arguments
 # =============================================================================
 
-# Parse positional args and flags from any position
 NPROC=""
 MAX_SAMPLES=""
-PLUS_FLAG=""
-ABLATION_FLAG=""
-NO_CYCLE_FLAG=""
-SKIP_LAYERS_ARG=""
+VANILLA_FLAG=""
+RELATIVE_FLAG=""
+POLAR_FLAG=""
 _positional=0
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --plus|plus)
-            PLUS_FLAG="--plus"; shift ;;
-        --no_cycle)
-            NO_CYCLE_FLAG="yes"; shift ;;
-        --skip_layers)
-            SKIP_LAYERS_ARG="$2"; shift 2 ;;
-        --ablation)
-            ABLATION_FLAG="--ablation $2"; shift 2 ;;
+        --vanilla)
+            VANILLA_FLAG="--vanilla"; shift ;;
+        --relative)
+            RELATIVE_FLAG="--relative"; shift ;;
+        --polar)
+            POLAR_FLAG="--polar"; shift ;;
+        --max_samples)
+            MAX_SAMPLES="$2"; shift 2 ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
-            elif [ $_positional -eq 1 ]; then
-                MAX_SAMPLES="$1"
             fi
             _positional=$((_positional + 1))
             shift ;;
     esac
 done
 
-# num_gpus: default auto-detect
 if [ -n "$NPROC" ]; then
     CUDA_IDS=$(seq -s ',' 0 $((NPROC - 1)))
     export CUDA_VISIBLE_DEVICES="$CUDA_IDS"
@@ -84,27 +81,6 @@ MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
 JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
 MINDCUBE_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
 
-# Helper: convert skip_layers value to layer name
-layer_name() {
-    local skip_val="$1"
-    if [ "$skip_val" = "-1" ]; then
-        echo "Layer 32 (post-norm, last)"
-    elif [ "$skip_val" = "-2" ]; then
-        echo "Layer 31 (penultimate)"
-    else
-        echo "Layer $(( 32 + skip_val ))"
-    fi
-}
-
-# Derive run name from mode
-_ablation_name=""
-if [ -n "$ABLATION_FLAG" ]; then
-    _ablation_name="_$(echo "$ABLATION_FLAG" | awk '{print $2}')"
-fi
-RUN_NAME="correspondence_mindcube${PLUS_FLAG:+_plus}${_ablation_name}"
-OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
-
-# EPOCHS=3
 EPOCHS=6
 LR=2e-4
 LORA_RANK=16
@@ -112,39 +88,45 @@ MAX_IMAGES=4
 GRAD_ACCUM=8
 NUM_WORKERS=4
 
-SKIP_LAYERS="${SKIP_LAYERS_ARG:--1}"  # default to -1 if not specified
-SKIP_LAYERS_DISPLAY="$(layer_name "$SKIP_LAYERS")"
-SKIP_LAYERS_FLAG="--skip_layers ${SKIP_LAYERS}"
-CYCLE_WEIGHT=$([ -n "$NO_CYCLE_FLAG" ] && echo "0.0" || echo "0.1")
-CYCLE_FLAG="--cycle_weight $CYCLE_WEIGHT"
 SAVE_STEPS=50
 EVAL_STEPS=50
 
 WANDB_PROJECT="spc"
 WANDB_ENTITY="actmrv"
-WANDB_RUN_NAME="mindcube_lora_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}${PLUS_FLAG:+_plus}${NO_CYCLE_FLAG:+_nocycle}${_ablation_name}"
+
+# =============================================================================
+# Mode-specific settings
+# =============================================================================
+
+_vanilla_suffix="${VANILLA_FLAG:+_vanilla}"
+_relative_suffix="${RELATIVE_FLAG:+_relative}"
+_polar_suffix="${POLAR_FLAG:+_polar}"
+
+RUN_NAME="correspondence_mindcube${_relative_suffix}${_polar_suffix}${_vanilla_suffix}"
+WANDB_RUN_NAME="corr_mindcube_r${LORA_RANK}_ep${EPOCHS}${_relative_suffix}${_polar_suffix}${_vanilla_suffix}"
+
+OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 # =============================================================================
 # Setup
 # =============================================================================
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 mkdir -p "$OUTPUT_DIR"
 
 echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
-echo "[INFO] PLUS mode            = ${PLUS_FLAG:-disabled}"
-echo "[INFO] CYCLE_WEIGHT         = $CYCLE_WEIGHT"
-echo "[INFO] Pose Head at         = $SKIP_LAYERS_DISPLAY"
-echo "[INFO] ABLATION             = ${ABLATION_FLAG:-disabled}"
-echo "[INFO] JSON_PATH            = $JSON_PATH"
+echo "[INFO] Mode                 = ${VANILLA_FLAG:+vanilla (3D M-RoPE)}${VANILLA_FLAG:-4D M-RoPE (image_xyz)}"
+echo "[INFO] Relative coords      = ${RELATIVE_FLAG:-disabled}"
+echo "[INFO] Polar coords (M-RoPE)= ${POLAR_FLAG:-disabled}"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
 # =============================================================================
-# Build optional --max_samples flag
+# Build optional flags
 # =============================================================================
 
 MAX_SAMPLES_FLAG=""
@@ -162,25 +144,24 @@ $TORCHRUN \
     --nproc_per_node "$NPROC" \
     --master_port    29500 \
     train_correspondence.py \
-    --model_path             "$MODEL_PATH"          \
-    --json_path              "$JSON_PATH"           \
-    --mindcube_results_dir   "$MINDCUBE_RESULTS_DIR" \
-    --output_dir             "$OUTPUT_DIR"          \
-    --epochs                 "$EPOCHS"              \
-    --lr                     "$LR"                  \
-    --lora_rank              "$LORA_RANK"           \
-    --max_images             "$MAX_IMAGES"          \
-    --grad_accum             "$GRAD_ACCUM"          \
-    --num_workers            "$NUM_WORKERS"         \
-    --save_steps             "$SAVE_STEPS"          \
-    --eval_steps             "$EVAL_STEPS"          \
-    --wandb_project          "$WANDB_PROJECT"       \
-    --wandb_entity           "$WANDB_ENTITY"        \
-    --wandb_run_name         "$WANDB_RUN_NAME"      \
-    $SKIP_LAYERS_FLAG                                \
-    $CYCLE_FLAG                                      \
-    $MAX_SAMPLES_FLAG                                \
-    $PLUS_FLAG                                       \
-    $ABLATION_FLAG
+    --model_path             "$MODEL_PATH"             \
+    --json_path              "$JSON_PATH"              \
+    --mindcube_results_dir   "$MINDCUBE_RESULTS_DIR"   \
+    --output_dir             "$OUTPUT_DIR"             \
+    --epochs                 "$EPOCHS"                 \
+    --lr                     "$LR"                     \
+    --lora_rank              "$LORA_RANK"              \
+    --max_images             "$MAX_IMAGES"             \
+    --grad_accum             "$GRAD_ACCUM"             \
+    --num_workers            "$NUM_WORKERS"            \
+    --save_steps             "$SAVE_STEPS"             \
+    --eval_steps             "$EVAL_STEPS"             \
+    --wandb_project          "$WANDB_PROJECT"          \
+    --wandb_entity           "$WANDB_ENTITY"           \
+    --wandb_run_name         "$WANDB_RUN_NAME"         \
+    $RELATIVE_FLAG                                     \
+    $POLAR_FLAG                                        \
+    $VANILLA_FLAG                                      \
+    $MAX_SAMPLES_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

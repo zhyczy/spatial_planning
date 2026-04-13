@@ -55,8 +55,19 @@ from peft import LoraConfig, TaskType, get_peft_model
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
-from src.models import AnswerOnlyModel, SpaCorrespondenceModel, CorrespondencePlusModel, PoseRegressionHead, SpaForConditionalGeneration
-from src.dataset import MindCube_Train_Dataset, Eval_Dataset, load_testing_dataset
+from src.models import (
+    AnswerOnlyModel,
+    AnswerRelativeModel,
+    SpaForConditionalGeneration,
+    SpaRelativeForConditionalGeneration,
+    patch_attention_layers,
+)
+from src.dataset import (
+    MindCube_Train_Dataset,
+    MindCube_Train_Dataset_Relative,
+    Eval_Dataset,
+    load_testing_dataset,
+)
 
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
@@ -78,9 +89,6 @@ def rank0_print(*args):
         print(*args)
 
 
-POSE_TOKEN = "<pose>"
-
-
 def collate_fn(batch):
     """
     Identity collation for batch_size=1.
@@ -94,25 +102,32 @@ def collate_fn(batch):
 # ── model building ────────────────────────────────────────────────────────────
 def build_model(
     model_path:    str,
-    pose_token_id: int,
     lora_rank:     int = 16,
     freeze_vision: bool = True,
-    skip_layers:   tuple[int, ...] = (-1,),
-    plus:          bool = False,
-    answer_weight: float = 1.0,
-    ablation:      str | None = None,
+    vanilla:       bool = False,
+    polar:         bool = False,
+    relative:      bool = False,
 ) -> nn.Module:
     """
-    Load backbone, patch M-RoPE, apply LoRA, and attach task head.
+    Load backbone, patch M-RoPE, apply LoRA, return an answer model.
 
-    ablation=None   → SpaCorrespondenceModel (or Plus variant)
-    ablation="no_cam"  → AnswerOnlyModel with 4D M-RoPE (keeps image_xyz)
-    ablation="vanilla" → AnswerOnlyModel with original 3D M-RoPE (no image_xyz)
+    vanilla=False  → 4D M-RoPE (t, x, y, z) with image_xyz spatial embedding
+    vanilla=True   → original 3D M-RoPE, no image_xyz
+    polar=True     → convert (x, y, z) → spherical (ρ, θ, α) for vision-token RoPE
+                     (only effective when vanilla=False)
+    relative=True  → per-query-frame coordinate transform (SpaRelativeForConditionalGeneration);
+                     dataset must return image_xyz_relative instead of image_xyz;
+                     incompatible with vanilla; defaults to polar coordinates
     """
+    if relative and vanilla:
+        raise ValueError("--relative and --vanilla are mutually exclusive.")
+
+    effective_polar = polar or relative
+
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
 
-    if ablation == "vanilla":
+    if vanilla:
         # ── vanilla: keep original 3D M-RoPE, use stock Qwen model ───────────
         log.info(f"mrope_section: {orig_section} (original 3D M-RoPE, vanilla ablation)")
         spa = Qwen3_5ForConditionalGeneration.from_pretrained(
@@ -122,7 +137,7 @@ def build_model(
             attn_implementation= "sdpa",
         )
     else:
-        # ── 4D M-RoPE for normal / plus / no_cam ─────────────────────────────
+        # ── 4D M-RoPE ────────────────────────────────────────────────────────
         total = sum(orig_section)                       # e.g. 32
         xyz_size = (total - 2) // 3                     # e.g. (32-2)//3 = 10
         new_section = [2, xyz_size, xyz_size, xyz_size] # [2, 10, 10, 10]
@@ -131,18 +146,13 @@ def build_model(
             f"mrope_section: {orig_section} → {new_section}  "
             f"(4D M-RoPE: 2 for t, {xyz_size} each for x/y/z)"
         )
-        spa = SpaForConditionalGeneration.from_pretrained(
+        spa_cls = SpaRelativeForConditionalGeneration if relative else SpaForConditionalGeneration
+        spa = spa_cls.from_pretrained(
             model_path,
             config             = config,
             torch_dtype        = torch.bfloat16,
             attn_implementation= "sdpa",
         )
-
-    # ── resize embedding table for <pose> (only when pose tokens are used) ───
-    if ablation is None:
-        old_vocab = spa.model.language_model.embed_tokens.weight.shape[0]
-        spa.resize_token_embeddings(old_vocab + 1)
-        log.info(f"Embedding table: {old_vocab} → {old_vocab + 1} (added <pose>)")
 
     # ── optionally freeze vision encoder ─────────────────────────────────────
     if freeze_vision:
@@ -158,7 +168,6 @@ def build_model(
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        modules_to_save = ["embed_tokens"] if ablation is None else [],
         lora_dropout   = 0.05,
         bias           = "none",
         task_type      = TaskType.CAUSAL_LM,
@@ -166,28 +175,10 @@ def build_model(
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
 
-    # Freeze old token embeddings via gradient hook: only <pose> row gets gradients.
-    # modules_to_save wraps embed_tokens as a full trainable copy; the hook zeros out
-    # the gradient rows corresponding to the original vocabulary on every backward pass.
-    if ablation is None:
-        def _make_new_token_grad_hook(n_old: int):
-            def _hook(grad: torch.Tensor) -> torch.Tensor:
-                grad = grad.clone()
-                grad[:n_old] = 0
-                return grad
-            return _hook
-
-        # Navigate to the actual embed_tokens weight inside the PEFT wrapper
-        _embed = (
-            spa.model.model.language_model.embed_tokens
-            if hasattr(spa.model, "model")
-            else spa.model.language_model.embed_tokens
-        )
-        _embed.weight.register_hook(_make_new_token_grad_hook(old_vocab))
-        log.info(
-            f"Gradient hook registered on embed_tokens: rows 0..{old_vocab - 1} zeroed, "
-            f"row {old_vocab} (<pose>) trainable."
-        )
+    # ── patch attention layers for relative mode (after LoRA) ────────────────
+    if relative:
+        n = patch_attention_layers(spa)
+        log.info(f"Wrapped {n} attention layers with SpaRelativeAttentionWrapper.")
 
     # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
     spa.gradient_checkpointing_enable(
@@ -201,25 +192,15 @@ def build_model(
         lm.gradient_checkpointing = True
         log.info("Manually set gradient_checkpointing=True on language_model")
 
-    # ── ablation: answer-only model (no pose head) ───────────────────────────
-    if ablation is not None:
-        use_xyz = (ablation != "vanilla")
-        log.info(f"Ablation '{ablation}': AnswerOnlyModel (use_xyz={use_xyz})")
-        return AnswerOnlyModel(spa, use_xyz=use_xyz)
+    if relative:
+        log.info(
+            f"AnswerRelativeModel (per-query-frame relative coords, polar={effective_polar})"
+        )
+        return AnswerRelativeModel(spa, polar=effective_polar)
 
-    # ── pose regression head ──────────────────────────────────────────────────
-    hidden_dim = config.text_config.hidden_size
-    input_dim  = hidden_dim * len(skip_layers)   # concat of skip_layers features
-    pose_head  = PoseRegressionHead(input_dim=input_dim).to(torch.bfloat16)
-    log.info(f"PoseRegressionHead input_dim={input_dim} "
-             f"(skip_layers={list(skip_layers)}, hidden={hidden_dim})")
-
-    if plus:
-        return CorrespondencePlusModel(spa, pose_head, pose_token_id,
-                                       skip_layers=skip_layers,
-                                       answer_weight=answer_weight)
-    return SpaCorrespondenceModel(spa, pose_head, pose_token_id,
-                                  skip_layers=skip_layers)
+    use_xyz = not vanilla
+    log.info(f"AnswerOnlyModel (use_xyz={use_xyz}, polar={effective_polar and use_xyz})")
+    return AnswerOnlyModel(spa, use_xyz=use_xyz, polar=effective_polar and use_xyz)
 
 
 # ── training loop ─────────────────────────────────────────────────────────────
@@ -247,25 +228,15 @@ def train(args: argparse.Namespace) -> None:
         args.model_path, trust_remote_code=True
     )
     tokenizer = processor.tokenizer
-    if args.ablation is None:
-        # Only add <pose> token when pose prediction is used (non-ablation modes)
-        tokenizer.add_special_tokens({"additional_special_tokens": [POSE_TOKEN]})
-        pose_token_id = tokenizer.convert_tokens_to_ids(POSE_TOKEN)
-        rank0_print(f"<pose> token id = {pose_token_id}")
-    else:
-        pose_token_id = -1  # unused in ablation modes
-        rank0_print(f"Ablation '{args.ablation}': <pose> token not added")
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = build_model(
         args.model_path,
-        pose_token_id  = pose_token_id,
         lora_rank      = args.lora_rank,
         freeze_vision  = not args.train_vision,
-        skip_layers    = tuple(args.skip_layers),
-        plus           = args.plus,
-        answer_weight  = args.answer_weight,
-        ablation       = args.ablation,
+        vanilla        = args.vanilla,
+        polar          = args.polar,
+        relative       = args.relative,
     )
     model = model.to(device)
 
@@ -278,9 +249,8 @@ def train(args: argparse.Namespace) -> None:
 
     # ── DDP wrapping ──────────────────────────────────────────────────────────
     # find_unused_parameters=False: DDP only tracks requires_grad=True params;
-    # frozen backbone weights are invisible to it. All trainable params (LoRA +
-    # PoseHead) participate in every forward pass, so the extra graph traversal
-    # from True is unnecessary.
+    # frozen backbone weights are invisible to it. All trainable LoRA params
+    # participate in every forward pass, so the extra graph traversal is unnecessary.
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank],
                     find_unused_parameters=False)
@@ -289,21 +259,26 @@ def train(args: argparse.Namespace) -> None:
         _model = model
 
     # ── dataset / loader ──────────────────────────────────────────────────────
-    _no_pose = args.ablation is not None
-
-    # MindCube JSONL format — pose regression training with 3d_results
-    train_dataset = MindCube_Train_Dataset(
-        jsonl_path         = args.json_path,
-        results_dir        = args.mindcube_results_dir,
-        processor          = processor,
-        pose_token_id      = pose_token_id,
-        log                = log,
-        max_images         = args.max_images,
-        spatial_merge_size = spatial_merge_size,
-        max_samples        = args.max_samples,
-        plus               = args.plus or _no_pose,
-        no_pose            = _no_pose,
-    )
+    if args.relative:
+        train_dataset = MindCube_Train_Dataset_Relative(
+            jsonl_path         = args.json_path,
+            results_dir        = args.mindcube_results_dir,
+            processor          = processor,
+            log                = log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            max_samples        = args.max_samples,
+        )
+    else:
+        train_dataset = MindCube_Train_Dataset(
+            jsonl_path         = args.json_path,
+            results_dir        = args.mindcube_results_dir,
+            processor          = processor,
+            log                = log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            max_samples        = args.max_samples,
+        )
     
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
@@ -414,9 +389,6 @@ def train(args: argparse.Namespace) -> None:
             attention_mask = batch["attention_mask"].to(device)
             pixel_values   = batch.get("pixel_values")
             image_grid_thw = batch.get("image_grid_thw")
-            gt_transforms  = batch.get("gt_transforms")
-            if gt_transforms is not None:
-                gt_transforms = gt_transforms.to(device)
 
             if pixel_values is not None:
                 pixel_values = pixel_values.to(device, dtype=torch.bfloat16)
@@ -428,28 +400,37 @@ def train(args: argparse.Namespace) -> None:
             if image_xyz is not None:
                 image_xyz = [xyz.to(device) for xyz in image_xyz]
 
+            # Relative mode: per-frame xyz (list of (N_frames, H, W, 3) tensors)
+            image_xyz_relative = batch.get("image_xyz_relative")
+            if image_xyz_relative is not None:
+                image_xyz_relative = [xyz.to(device) for xyz in image_xyz_relative]
+
             labels = batch.get("labels")
             if labels is not None:
                 labels = labels.to(device)
 
             # ── forward + loss ────────────────────────────────────────────────
-            try:
+            if args.relative:
+                _, loss, loss_dict = model(
+                    input_ids          = input_ids,
+                    attention_mask     = attention_mask,
+                    pixel_values       = pixel_values,
+                    image_grid_thw     = image_grid_thw,
+                    image_xyz_relative = image_xyz_relative,
+                    labels             = labels,
+                )
+            else:
                 _, loss, loss_dict = model(
                     input_ids      = input_ids,
                     attention_mask = attention_mask,
                     pixel_values   = pixel_values,
                     image_grid_thw = image_grid_thw,
-                    gt_transforms  = gt_transforms,
                     image_xyz      = image_xyz,
-                    cycle_weight   = args.cycle_weight,
                     labels         = labels,
                 )
-            except Exception as exc:
-                log.warning(f"[rank{local_rank}] Step {step} skipped: {exc}")
-                continue
-
+            
             if loss is None:
-                log.warning(f"[rank{local_rank}] Step {step}: no <pose> token found, skipping.")
+                log.warning(f"[rank{local_rank}] Step {step}: loss is None, skipping.")
                 continue
 
             (loss / args.grad_accum).backward()
@@ -623,11 +604,6 @@ def _save_checkpoint(
 
     model.spa_model.save_pretrained(ckpt)
     tokenizer.save_pretrained(ckpt)
-    if hasattr(model, "pose_head"):
-        torch.save(
-            model.pose_head.state_dict(),
-            os.path.join(ckpt, "pose_head.pt"),
-        )
     log.info(f"Checkpoint saved → {ckpt}")
 
 
@@ -676,38 +652,27 @@ def parse_args() -> argparse.Namespace:
         help="Also unfreeze the vision encoder (ViT) for fine-tuning",
     )
     p.add_argument(
-        "--skip_layers",
-        type=int, nargs="+", default=[-8, -4, -1],
-        help="LLM layer indices whose hidden states are concatenated before "
-             "PoseRegressionHead. e.g. --skip_layers -4 -1 (default: -8 -4 -1)",
-    )
-    p.add_argument(
-        "--cycle_weight",
-        type=float, default=0.1,
-        help="Weight for rotation cycle-consistency loss (0 to disable). "
-             "Active only when N >= 3 views.",
-    )
-    p.add_argument(
-        "--plus",
+        "--vanilla",
         action="store_true",
-        help="Enable correspondence_plus mode: the model also predicts the text "
-             "answer (from entry['answer']) and its cross-entropy loss is added "
-             "to the pose loss.",
-    )
-    p.add_argument(
-        "--answer_weight",
-        type=float, default=1.0,
-        help="Weight applied to the LM answer-prediction loss in plus mode.",
-    )
-    p.add_argument(
-        "--ablation",
-        choices=["no_cam", "vanilla"],
-        default=None,
-        help="Ablation study mode. "
-             "no_cam: keeps 4D M-RoPE position embedding, removes pose prediction, "
-             "only LM answer loss. "
-             "vanilla: uses original Qwen 3D M-RoPE, removes pose prediction, "
+        help="Use original Qwen 3D M-RoPE instead of 4D M-RoPE (no image_xyz). "
              "only LM answer loss.",
+    )
+    p.add_argument(
+        "--relative",
+        action="store_true",
+        help="Enable relative mode: per-query-frame coordinate transformation in "
+             "4D M-RoPE. Q from frame f sees ALL K tokens' xyz in frame-f camera "
+             "coordinates. Uses MindCube_Train_Dataset_Relative and "
+             "SpaRelativeForConditionalGeneration. Incompatible with --vanilla. "
+             "Polar coordinates are enabled by default in this mode.",
+    )
+    p.add_argument(
+        "--polar",
+        action="store_true",
+        help="Convert per-patch Cartesian (x, y, z) → spherical (ρ, θ, α) for the "
+             "4D M-RoPE vision-token position embedding. "
+             "ρ=||xyz||, θ∈[0,π] (polar), α∈[-π,π] (azimuthal). "
+             "No effect when --vanilla is set. In --relative mode, polar is on by default.",
     )
     # ── WandB ─────────────────────────────────────────────────────────────────
     p.add_argument(

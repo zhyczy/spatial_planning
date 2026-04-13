@@ -31,8 +31,9 @@
 #   baseline           — stock Qwen3.5-VL, no LoRA
 #   vanilla            — SPA LoRA + 3D M-RoPE, no <coord> tokens (LoRA-only ablation)
 #   position_embedding — SPA LoRA + 4D M-RoPE, no <coord> tokens
-#   coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens, no_cam variant (no pose)
+#   coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens, no_cam variant (Cartesian)
 #   coordinate_pose    — SPA LoRA + 4D M-RoPE + <coord> tokens, full variant (with pose)
+#   polar              — SPA LoRA + 4D M-RoPE + <coord> tokens, no_cam variant (polar r/θ/α)
 #   both               — baseline + coordinate
 #
 # Examples:
@@ -130,7 +131,7 @@ done
 # Validate arguments
 # =============================================================================
 
-VALID_METHODS="baseline vanilla position_embedding coordinate coordinate_pose both"
+VALID_METHODS="baseline vanilla position_embedding coordinate coordinate_pose polar both"
 if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
     echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1

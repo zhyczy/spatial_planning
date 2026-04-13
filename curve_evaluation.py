@@ -19,7 +19,7 @@ python curve_evaluation.py \\
     --start     500 \\
     --end       1000 \\
     --step_size 50 \\
-    --method    coordinate \\  # or coordinate_pose for full (with pose) variant
+    --method    coordinate \\  # or coordinate_pose / polar
     --datasets  mindcube,sat_real \\
     --gpus      0,1,2,3 \\
     --output_dir eval_results/curves/coordinate_no_cam_mindcube
@@ -274,7 +274,7 @@ def main() -> None:
                         help="Step stride (default: 50).")
     parser.add_argument(
         "--method", type=str, default="coordinate",
-        choices=["baseline", "vanilla", "position_embedding", "coordinate", "coordinate_pose"],
+        choices=["baseline", "vanilla", "position_embedding", "coordinate", "coordinate_pose", "polar"],
         help="Evaluation method (default: coordinate).",
     )
     parser.add_argument(

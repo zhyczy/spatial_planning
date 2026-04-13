@@ -456,6 +456,7 @@ class SpaModel(Qwen3_5Model):
         temp_merge_size: int = 1,
         spatial_merge_size: int = 1,
         coord_scale: float = 100.0,
+        polar: bool = False,
         device=None,
     ) -> torch.LongTensor:
         """
@@ -480,15 +481,18 @@ class SpaModel(Qwen3_5Model):
             spatial_merge_size: spatial downscale factor (from vision_config).
             coord_scale: multiplier applied to float xyz before rounding to int.
                 Default 100 maps ±10 m → ±1000, which is a reasonable RoPE range.
+            polar: if True, convert Cartesian (x, y, z) → spherical (ρ, θ, α) first.
+                ρ = ||xyz||,  θ ∈ [0, π] (polar angle),  α ∈ [-π, π] (azimuthal).
+                Discretized as: ρ*coord_scale, θ/π*coord_scale, (α+π)/(2π)*coord_scale.
             device: torch device.
 
         Returns:
             vision_position_ids: (5, llm_grid_t * llm_grid_h * llm_grid_w)
                 [0] = seq — sequential position in sequence (for causal mask)
                 [1] = t   — start_position (same for every token in this image)
-                [2] = x   — per-patch discretized x coordinate
-                [3] = y   — per-patch discretized y coordinate
-                [4] = z   — per-patch discretized z coordinate
+                [2] = x/ρ — per-patch discretized x (Cartesian) or ρ (spherical)
+                [3] = y/θ — per-patch discretized y (Cartesian) or θ (spherical)
+                [4] = z/α — per-patch discretized z (Cartesian) or α (spherical)
 
         ── MODIFY BELOW ──────────────────────────────────────────────────────
         Ideas:
@@ -507,8 +511,20 @@ class SpaModel(Qwen3_5Model):
         if llm_grid_t > 1:
             xyz_flat = xyz_flat.repeat(llm_grid_t, 1)            # (num_tokens, 3)
 
-        # Discretize float coordinates → integer position indices
-        xyz_int = (xyz_flat * coord_scale).round().long()        # (num_tokens, 3)
+        if polar:
+            # Cartesian → spherical: (x, y, z) → (ρ, θ, α)
+            rho   = torch.norm(xyz_flat, dim=-1).clamp(min=1e-6)              # (N,)
+            theta = torch.acos((xyz_flat[:, 2] / rho).clamp(-1.0, 1.0))      # (N,) ∈ [0, π]
+            alpha = torch.atan2(xyz_flat[:, 1], xyz_flat[:, 0])              # (N,) ∈ [-π, π]
+            # Discretize to [0, coord_scale] each
+            rho_int   = (rho   * coord_scale).round().long()                  # (N,)
+            theta_int = (theta / torch.pi * coord_scale).round().long()       # (N,)
+            alpha_int = ((alpha + torch.pi) / (2 * torch.pi) * coord_scale   # (N,)
+                         ).round().long()
+            xyz_int = torch.stack([rho_int, theta_int, alpha_int], dim=1)     # (N, 3)
+        else:
+            # Discretize float coordinates → integer position indices
+            xyz_int = (xyz_flat * coord_scale).round().long()                 # (num_tokens, 3)
 
         pos_t = torch.full((num_tokens,), start_position, dtype=torch.long, device=device)
         pos_x = xyz_int[:, 0]
@@ -562,6 +578,7 @@ class SpaModel(Qwen3_5Model):
         image_xyz: torch.Tensor | None = None,
         coord_scale: float = 100.0,
         coord_token_id: int | None = None,
+        polar: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -753,6 +770,7 @@ class SpaModel(Qwen3_5Model):
                         temp_merge_size=1,
                         spatial_merge_size=spatial_merge_size,
                         coord_scale=coord_scale,
+                        polar=polar,
                         device=input_ids.device,
                     )                                        # (5, num_tokens)
 
@@ -823,7 +841,8 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     def forward(self, *args, image_xyz: torch.Tensor | None = None,
                 coord_scale: float = 100.0,
-                coord_token_id: int | None = None, **kwargs):
+                coord_token_id: int | None = None,
+                polar: bool = False, **kwargs):
         """
         Thin wrapper that injects image_xyz into get_rope_index() via kwargs.
 
@@ -832,6 +851,8 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         coord_scale: passed through to get_rope_index / get_vision_position_ids.
         coord_token_id: if set, <coord> tokens in text segments get 3D-RoPE
                         (t=image_t, x=row, y=col, z=0) matching their image/patch.
+        polar: if True, convert Cartesian (x, y, z) → spherical (ρ, θ, α) for
+               the M-RoPE position embedding of vision tokens.
         """
         if image_xyz is not None:
             kwargs["image_xyz"] = image_xyz
@@ -839,4 +860,6 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             kwargs["coord_scale"] = coord_scale
         if coord_token_id is not None:
             kwargs["coord_token_id"] = coord_token_id
+        if polar:
+            kwargs["polar"] = polar
         return super().forward(*args, **kwargs)
