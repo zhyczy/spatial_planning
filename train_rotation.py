@@ -2,42 +2,35 @@
 train_rotation.py
 
 LoRA fine-tuning of SpaForConditionalGeneration (Qwen3.5-VL) with a
-two-pass rotation-aware coordinate prediction pipeline.
+single-pass rotation-aware coordinate prediction pipeline using
+differentiable M-RoPE.
 
 Architecture
 ~~~~~~~~~~~~
-RotationModel
+RotationRoPEModel
 +-- SpaForConditionalGeneration [backbone + LoRA]
-|    +-- SpaVisionModel (ViT, optional frozen)
-|    +-- SpaModel (LLM + 4D M-RoPE)
+|    +-- SpaVisionModel (ViT, frozen)
+|    +-- SpaModel (LLM + 4D M-RoPE, manual decoder loop)
 +-- CameraTokenRotationEncoder   [shallow transformer, predicts R]
 +-- DepthPredictionTransformer   [coordinate head]
 
 Pipeline
 ~~~~~~~~
-Pass 1  MLLM forward with original world-frame XYZ position embeddings
-        (runs under torch.no_grad(); last hidden states captured via
-        lm_head pre-hook).
-
-Rotation encoder
-        All MLLM token hidden states + learnable cam token are fed into
-        a 2-layer TransformerEncoder.  3-D sinusoidal PE is computed
-        from the XYZ coordinates centred at the first-frame camera
-        position.  The cam token output predicts a 3×3 rotation matrix R.
-
-Pass 2  MLLM forward with rotated XYZ = R @ (xyz_world - cam_pos_0).
-        This encodes a canonical coordinate frame aligned with the
-        first-frame camera orientation as new position embeddings.
+Single pass  Image token XYZ positions pass through the rotation
+             encoder to produce R, which rotates them in-place to a
+             canonical frame.  The rotated float position_ids are fed
+             into a DifferentiableMRoPE and the MLLM decoder runs
+             manually layer-by-layer so gradients from lm_loss and
+             coord_loss flow back through (cos, sin) into R and
+             rotation_enc end-to-end (no GT rotation supervision).
 
 Coordinate head
-        Decodes pass-2 hidden states → sub-pixel (x, y, z) predictions
-        in the rotated frame.
-        GT: R.detach() @ (xyz_hires - cam_pos_0).
+        Decodes hidden states → sub-pixel (x, y, z) predictions in the
+        rotated frame.  GT = R.detach() @ xyz_hires (prevents the
+        trivial R→0 collapse cheat).
 
 Total loss
-    loss = answer_weight * lm_loss
-         + rot_weight   * rot_loss    (geodesic, optional)
-         + coord_weight * coord_loss
+    loss = answer_weight * lm_loss + coord_weight * coord_loss
 
 Usage
 ~~~~~
@@ -73,7 +66,7 @@ sys.path.insert(0, _ROOT)
 from src.models import (
     DepthPredictionTransformer,
     CameraTokenRotationEncoder,
-    RotationModel,
+    RotationRoPEModel,
     SpaForConditionalGeneration,
 )
 from src.models.spa_emb import SpaTextRotaryEmbedding
@@ -114,15 +107,14 @@ def build_model(
     coord_upscale:      int   = 4,
     lora_rank:          int   = 16,
     freeze_vision:      bool  = True,
-    skip_layers:        tuple[int, ...] = (-1,),
     answer_weight:      float = 1.0,
     coord_weight:       float = 1.0,
-    rot_weight:         float = 1.0,
     rot_nhead:          int   = 4,
     rot_dim_feedforward: int  = 2048,
     rot_num_layers:     int   = 2,
-) -> RotationModel:
-    """Build RotationModel with LM + rotation + coordinate supervision."""
+) -> RotationRoPEModel:
+    """Build RotationRoPEModel with LM + coordinate supervision
+    (rotation learned end-to-end via differentiable M-RoPE)."""
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
     total    = sum(orig_section)
@@ -208,16 +200,14 @@ def build_model(
     ).to(torch.bfloat16)
     log.info(f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}")
 
-    return RotationModel(
+    return RotationRoPEModel(
         spa_model          = spa,
         rotation_enc       = rotation_enc,
         coord_head         = coord_head,
         image_token_id     = image_token_id,
         spatial_merge_size = spatial_merge_size,
-        skip_layers        = skip_layers,
         answer_weight      = answer_weight,
         coord_weight       = coord_weight,
-        rot_weight         = rot_weight,
     )
 
 
@@ -265,10 +255,8 @@ def train(args: argparse.Namespace) -> None:
         coord_upscale       = args.coord_upscale,
         lora_rank           = args.lora_rank,
         freeze_vision       = not args.train_vision,
-        skip_layers         = tuple(args.skip_layers),
         answer_weight       = args.answer_weight,
         coord_weight        = args.coord_weight,
-        rot_weight          = args.rot_weight,
         rot_nhead           = args.rot_nhead,
         rot_dim_feedforward = args.rot_dim_feedforward,
         rot_num_layers      = args.rot_num_layers,
@@ -433,14 +421,6 @@ def train(args: argparse.Namespace) -> None:
             if image_xyz_hires is not None:
                 image_xyz_hires = [xyz.to(device) for xyz in image_xyz_hires]
 
-            cam_pos_frame0 = batch.get("cam_pos_frame0")
-            if cam_pos_frame0 is not None:
-                cam_pos_frame0 = cam_pos_frame0.to(device)
-
-            gt_rotation = batch.get("gt_rotation")
-            if gt_rotation is not None:
-                gt_rotation = gt_rotation.to(device)
-
             labels = batch.get("labels")
             if labels is not None:
                 labels = labels.to(device)
@@ -465,8 +445,6 @@ def train(args: argparse.Namespace) -> None:
                 image_grid_thw  = image_grid_thw,
                 image_xyz       = image_xyz,
                 image_xyz_hires = image_xyz_hires,
-                cam_pos_frame0  = cam_pos_frame0,
-                gt_rotation     = gt_rotation,
                 labels          = labels,
                 coord_scale     = args.coord_scale,
             )
@@ -561,9 +539,6 @@ def train(args: argparse.Namespace) -> None:
                             t_labels = test_batch.get("labels")
                             t_xyz   = test_batch.get("image_xyz")
                             t_xyz_h = test_batch.get("image_xyz_hires")
-                            # Eval dataset (Eval_Dataset_Coord) does not
-                            # supply cam_pos_frame0 / gt_rotation, so we
-                            # pass None and use zero origin defaults.
 
                             if t_pv is not None:
                                 t_pv = t_pv.to(device, dtype=torch.bfloat16)
@@ -584,8 +559,6 @@ def train(args: argparse.Namespace) -> None:
                                     image_grid_thw  = t_thw,
                                     image_xyz       = t_xyz,
                                     image_xyz_hires = t_xyz_h,
-                                    cam_pos_frame0  = None,
-                                    gt_rotation     = None,
                                     labels          = t_labels,
                                     coord_scale     = args.coord_scale,
                                 )
@@ -620,7 +593,7 @@ def train(args: argparse.Namespace) -> None:
                                 f"{world_size} GPU{'s' if world_size > 1 else ''})"
                             )
                             if use_wandb:
-                                _main_keys = {"coord_loss", "lm_loss", "rot_loss"}
+                                _main_keys = {"coord_loss", "lm_loss"}
                                 wandb.log(
                                     {
                                         **{f"eval/{ds_name}_{k}": agg_sums[k] / total_count
@@ -649,7 +622,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 def _save_checkpoint(
-    model:      RotationModel,
+    model:      RotationRoPEModel,
     tokenizer,
     output_dir: str,
     step:       int,
@@ -676,7 +649,8 @@ def _save_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Two-pass rotation-aware coordinate prediction training "
+        description="Single-pass differentiable-RoPE rotation-aware "
+                    "coordinate prediction training "
                     "(LoRA fine-tuning of SpaForConditionalGeneration)."
     )
     p.add_argument(
@@ -710,17 +684,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Unfreeze the vision encoder (ViT) for fine-tuning.",
     )
-    p.add_argument(
-        "--skip_layers",
-        type=int, nargs="+", default=[-8, -4, -1],
-        help="LLM layer indices for CoordHead hidden states.",
-    )
     p.add_argument("--answer_weight", type=float, default=1.0)
     p.add_argument("--coord_weight",  type=float, default=1.0)
-    p.add_argument(
-        "--rot_weight", type=float, default=1.0,
-        help="Weight for rotation geodesic loss (0 to disable).",
-    )
     p.add_argument(
         "--coord_upscale", type=int, default=4,
         help="PixelShuffle upscale factor for the coordinate head.",

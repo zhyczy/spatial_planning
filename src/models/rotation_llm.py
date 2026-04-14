@@ -1,66 +1,50 @@
 """
 rotation_llm.py
 
-RotationModel: Two-pass approach for learning a canonical coordinate frame.
+RotationModel: single-pass rotation-aware coordinate prediction.
 
 Overview
 --------
-Pass 1   Run MLLM with the original world-frame XYZ position embeddings.
-         The merged text+visual input embeddings (i.e. the tensor fed into
-         transformer layer 0) are captured via a layer-0 pre-hook (detached /
-         under no_grad so no extra LLM backward is triggered).
+Step 1   Build merged input embeddings (text embed + vision encoder +
+         masked_scatter) WITHOUT running any transformer layer.
+         Vision encoder is wrapped in no_grad inside SpaModel.get_image_features.
+
+Step 2   Feed the merged input embeddings to CameraTokenRotationEncoder
+         → predicts canonical rotation R (3, 3).
+
+Step 3   Rotate xyz:  xyz_rot = R @ xyz_world.
+
+Step 4   Single MLLM transformer pass with:
+             - inputs_embeds = merged text + visual features (reused from Step 1)
+             - position_ids  = built via SpaModel.get_rope_index(image_xyz=xyz_rot)
+         → last_hidden_state → lm_head → logits
+                            → coord_head → per-patch xyz in rotated frame
 
 Rotation encoder (CameraTokenRotationEncoder)
-         Shallow TransformerEncoder that takes *all* MLLM input embeddings
-         (merged text tokens + projected visual tokens, before any transformer
-         layer) plus one learnable cam token as input.
-
-         Position encoding is IDENTICAL to the MLLM backbone, aligned on
-         four levels:
-           1. Mechanism  — 4D M-RoPE applied inside each attention layer
-                           on Q and K.  No additive absolute PE.
-           2. Parameters — same SpaTextRotaryEmbedding (rope_theta=1e7,
-                           mrope_section=[2,xyz,xyz,xyz]) initialised from
-                           the identical config.text_config as the MLLM.
-           3. Coordinates — mirrors MLLM get_rope_index:
-                           text tokens get sequential (pos,pos,pos,pos);
-                           image tokens get (t=start_pos, xyz=round(world*scale)).
-                           Cam token sits at (0,0,0,0); text starts at pos=1.
-           4. Dimensions  — head_dim = config.head_dim = 256 (MLLM's
-                           explicit head_dim); rotary_dim = 64 (first 64 of
-                           256 per head).  d_model = nhead × 256 so the
-                           RoPE frequency mapping is byte-for-byte identical.
-
-         The cam token output is projected to 6-D → rot6d_to_rotmat → R.
-
-Pass 2   MLLM forward with *rotated* XYZ:
-             xyz_rotated = R @ (xyz_world - cam_pos_0)
-         This expresses each 3-D position in a canonical coordinate frame
-         aligned with the first frame's camera orientation.
-
-Coordinate head
-         Decodes pass-2 hidden states → sub-pixel (x, y, z) predictions
-         in the rotated frame.
-         Ground truth is also rotated:
-             gt_rotated = R.detach() @ (xyz_hires - cam_pos_0)
+         Shallow TransformerEncoder over [cam_token | merged_inputs_embeds].
+         4D M-RoPE identical to MLLM:
+           1. Mechanism  — rotary PE applied inside each attention layer on Q and K.
+           2. Parameters — same SpaTextRotaryEmbedding (rope_theta, mrope_section).
+           3. Coordinates — mirrors MLLM get_rope_index: text sequential from 1,
+                           image t=start_pos shared, xyz=round(world*scale).
+                           Cam token at (0, 0, 0, 0).
+           4. Dimensions  — head_dim = mllm_head_dim = 256; rotary_dim = 64.
 
 Losses
 ------
-  lm_loss    Causal cross-entropy on answer tokens (pass-2 logits).
-  rot_loss   geodesic(R, R_gt)  where R_gt = world-to-camera rotation
-             of frame 0  (optional; requires gt_rotation in the batch).
+  lm_loss    Causal cross-entropy on answer tokens.
+  rot_loss   geodesic(R, R_gt)  (requires gt_rotation in batch).
   coord_loss L1 between coord head output and rotated GT.
 
 Training note
 -------------
-Pass 1 runs under torch.no_grad(), so the LLM weights are only
-trained through pass 2 (coord + LM losses).  The rotation encoder
-parameters receive gradients from:
-  * rot_loss  (direct)
-  * coord_loss → coord_head → h2 → spa_model(pass2) → rotated_xyz → R
+There is no separate no-grad pass any more. The merged inputs_embeds is
+used both for (a) the rotation encoder (detached, so rot_loss only updates
+CameraTokenRotationEncoder params) and (b) the single language_model pass
+(with grad, so LoRA + coord_head + lm_head get updated).
+Gradient does NOT flow from coord/lm losses back into R because
+get_rope_index discretises rotated_xyz with .round().long().
 """
-
-import re
 
 import torch
 import torch.nn as nn
@@ -160,19 +144,16 @@ def _build_token_txyz_int(
 def _apply_rotation_to_xyz(
     R:        torch.Tensor,   # (3, 3) float32
     xyz_list: list,           # list of (..., 3) tensors
-    origin:   torch.Tensor,   # (3,) subtract before rotating
 ) -> list:
-    """Return [R @ (xyz - origin) for xyz in xyz_list].
+    """Return [R @ xyz for xyz in xyz_list].
 
     Preserves original dtype of each tensor in the list.
     """
-    result   = []
-    origin_f = origin.float()
+    result = []
     for xyz in xyz_list:
         orig_dtype = xyz.dtype
         xyz_flat   = xyz.reshape(-1, 3).float()
-        centered   = xyz_flat - origin_f.to(xyz_flat.device)
-        rotated    = (R @ centered.T).T                    # (N, 3)
+        rotated    = (R @ xyz_flat.T).T                    # (N, 3)
         result.append(rotated.reshape(xyz.shape).to(orig_dtype))
     return result
 
@@ -296,7 +277,7 @@ class CameraTokenRotationEncoder(nn.Module):
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     Mechanism:   rotary PE applied inside attention on Q and K.
     Parameters:  same rope_theta (1e7) and mrope_section via rope_emb.
-    Coordinates: integer (t, x, y, z) = round((world_xyz - origin) * scale).
+    Coordinates: integer (t, x, y, z) = round(world_xyz * scale).
                  Cam token at (0, 0, 0, 0).
     Dimensions:  head_dim = mllm_head_dim (256); rotary_dim = 64 (first 64
                  of each 256-dim head, matching MLLM's partial_rotary_factor).
@@ -330,7 +311,7 @@ class CameraTokenRotationEncoder(nn.Module):
         self.nhead         = nhead
         self.mllm_head_dim = mllm_head_dim
 
-        # Learnable cam token (sits at world origin after centring)
+        # Learnable cam token
         self.cam_token = nn.Parameter(torch.empty(1, self.d_model))
         nn.init.normal_(self.cam_token, std=0.02)
 
@@ -399,21 +380,14 @@ class CameraTokenRotationEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RotationModel(nn.Module):
-    """Two-pass rotation-aware coordinate prediction model.
+    """Single-pass rotation-aware coordinate prediction model.
 
-    Pass 1  MLLM forward with original world-frame XYZ position embeddings.
-            Merged text+visual input embeddings captured via layer-0 pre-hook
-            (pass 1 runs under torch.no_grad() → no gradient through LLM).
-
-    Rotation encoder
-            CameraTokenRotationEncoder: all MLLM input embeddings + cam token,
-            4D M-RoPE identical to MLLM → R.
-
-    Pass 2  MLLM forward with rotated XYZ = R @ (xyz - cam_pos_0).
-
-    Coordinate head
-            Decodes pass-2 hidden states → xyz in rotated frame.
-            GT: R.detach() @ (xyz_hires - cam_pos_0).
+    Step 1  Build merged inputs_embeds (text embed + vision encoder + scatter)
+            without running any transformer layer.
+    Step 2  CameraTokenRotationEncoder(inputs_embeds.detach()) → R.
+    Step 3  rotated_xyz = R @ xyz_world.
+    Step 4  Single language_model forward with inputs_embeds + rotated_xyz RoPE
+            → hidden_states → lm_head / coord_head.
 
     Args:
         spa_model:           SpaForConditionalGeneration + LoRA
@@ -421,7 +395,6 @@ class RotationModel(nn.Module):
         coord_head:          DepthPredictionTransformer
         image_token_id:      token id of <|image_pad|>
         spatial_merge_size:  vision spatial merge factor
-        skip_layers:         layer indices for coord head hidden states
         answer_weight:       weight for LM loss
         coord_weight:        weight for coordinate loss
         rot_weight:          weight for rotation geodesic loss
@@ -434,7 +407,6 @@ class RotationModel(nn.Module):
         coord_head:         DepthPredictionTransformer,
         image_token_id:     int,
         spatial_merge_size: int,
-        skip_layers:        tuple[int, ...] = (-1,),
         answer_weight:      float = 1.0,
         coord_weight:       float = 1.0,
         rot_weight:         float = 1.0,
@@ -445,67 +417,20 @@ class RotationModel(nn.Module):
         self.coord_head         = coord_head
         self.image_token_id     = image_token_id
         self.spatial_merge_size = spatial_merge_size
-        self.skip_layers        = list(skip_layers)
         self.answer_weight      = answer_weight
         self.coord_weight       = coord_weight
         self.rot_weight         = rot_weight
 
-        # Counters / buffers used by forward hooks.
-        self._pass_counter      = 0
-        self._input_embeds_1:  torch.Tensor | None = None   # pass-1 layer-0 input
-        self._lm_head_input_2: torch.Tensor | None = None   # pass-2 lm_head input
-
-        # Hook 1: first transformer layer → merged text+visual input embeddings
-        # args[0] at layer-0 == inputs_embeds (shape: 1, seq_len, hidden_size)
-        for name, mod in self.spa_model.named_modules():
-            if re.search(r'\.layers\.0$', name):
-                mod.register_forward_pre_hook(self._capture_input_embeds)
-                break
-
-        # Hook 2: lm_head → last-layer hidden states (used by coord head, pass 2)
-        for name, mod in self.spa_model.named_modules():
-            if name.endswith("lm_head"):
-                mod.register_forward_pre_hook(self._capture_lm_input)
-                break
-
     # ------------------------------------------------------------------
 
-    def _capture_input_embeds(self, module, args):
-        """Layer-0 pre-hook: capture merged text+visual input embeddings (pass 1)."""
-        if self._pass_counter == 1:
-            self._input_embeds_1 = args[0]   # (1, seq_len, hidden_size), detached via no_grad
-
-    def _capture_lm_input(self, module, args):
-        """lm_head pre-hook: capture last-layer hidden states (pass 2 only)."""
-        if self._pass_counter == 2:
-            self._lm_head_input_2 = args[0]
-
-    def _get_hidden(self, outputs, pass_num: int) -> torch.Tensor:
-        if pass_num == 1:
-            return self._input_embeds_1      # text+visual embeddings → rotation encoder
-        # pass 2: coord head uses last-layer hidden states
-        only_last = (len(self.skip_layers) == 1 and self.skip_layers[0] == -1)
-        if only_last:
-            return self._lm_head_input_2
-        return outputs.hidden_states[self.skip_layers[0]]
-
-    def _spa_forward(
-        self,
-        input_ids, attention_mask, pixel_values, image_grid_thw,
-        image_xyz, coord_scale: float, pass_num: int,
-    ):
-        only_last = (len(self.skip_layers) == 1 and self.skip_layers[0] == -1)
-        self._pass_counter = pass_num
-        return self.spa_model(
-            input_ids            = input_ids,
-            attention_mask       = attention_mask,
-            pixel_values         = pixel_values,
-            image_grid_thw       = image_grid_thw,
-            output_hidden_states = not only_last,
-            return_dict          = True,
-            image_xyz            = image_xyz,
-            coord_scale          = coord_scale,
-        )
+    def _unwrap(self) -> nn.Module:
+        """Return the underlying SpaForConditionalGeneration (strip PEFT wrappers)."""
+        m = self.spa_model
+        while hasattr(m, "base_model") and hasattr(m.base_model, "model"):
+            m = m.base_model.model
+            if m is self.spa_model:
+                break
+        return m
 
     # ------------------------------------------------------------------
 
@@ -517,7 +442,6 @@ class RotationModel(nn.Module):
         image_grid_thw:   torch.Tensor | None,
         image_xyz:        list | None = None,        # list[k]: (llm_H, llm_W, 3)
         image_xyz_hires:  list | None = None,        # list[k]: (llm_H*up, llm_W*up, 3)
-        cam_pos_frame0:   torch.Tensor | None = None,  # (3,) first-frame cam pos
         gt_rotation:      torch.Tensor | None = None,  # (3, 3) world-to-cam R_gt
         labels:           torch.Tensor | None = None,
         coord_scale:      float = 100.0,
@@ -531,50 +455,68 @@ class RotationModel(nn.Module):
         """
         _ldict: dict = {}
 
-        origin = (cam_pos_frame0.float() if cam_pos_frame0 is not None
-                  else torch.zeros(3, device=input_ids.device))
+        inner     = self._unwrap()        # SpaForConditionalGeneration
+        spa_inner = inner.model           # SpaModel
+        lm_head   = inner.lm_head
 
-        # ── Pass 1: original XYZ position embedding (no gradient) ────────────
-        with torch.no_grad():
-            out1    = self._spa_forward(
-                input_ids, attention_mask, pixel_values, image_grid_thw,
-                image_xyz, coord_scale, pass_num=1,
+        # ── Step 1: merged inputs_embeds (text embed + vision encoder scatter) ──
+        inputs_embeds = spa_inner.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            image_outputs = spa_inner.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True
             )
-            hidden1 = self._get_hidden(out1, 1)   # (1, seq_len, hidden_dim)
-        del out1
+            image_embeds = image_outputs.pooler_output
+            if isinstance(image_embeds, (list, tuple)):
+                image_embeds = torch.cat(list(image_embeds), dim=0)
+            image_embeds = image_embeds.to(
+                inputs_embeds.device, inputs_embeds.dtype
+            )
+            image_mask = (input_ids == self.image_token_id).unsqueeze(-1) \
+                                                            .expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        # ── Rotation encoder: predict R from pass-1 hidden states ─────────────
+        # ── Step 2: Rotation encoder on merged inputs_embeds (detached) ──
         R = None
         if image_xyz is not None and image_grid_thw is not None:
-            # Build integer 4D positions matching MLLM get_rope_index convention.
-            # Text: t=x=y=z=sequential (starts at 1, 0 reserved for cam token).
-            # Image: t=current_pos, xyz=round(world*scale).
             token_txyz_int = _build_token_txyz_int(
                 input_ids, self.image_token_id,
                 image_xyz, image_grid_thw, self.spatial_merge_size,
                 coord_scale,
             )                                              # (seq_len, 4) long
-
             R = self.rotation_enc(
-                hidden1,           # already detached (from no_grad context)
+                inputs_embeds.detach(),
                 token_txyz_int,
             )                                              # (3, 3) float32
             _ldict["R_trace"] = R.trace().item()
 
-        # ── Build rotated XYZ for pass 2 ─────────────────────────────────────
+        # ── Step 3: rotated xyz ──
         if R is not None and image_xyz is not None:
-            rotated_xyz = _apply_rotation_to_xyz(R, image_xyz, origin)
+            rotated_xyz = _apply_rotation_to_xyz(R, image_xyz)
         else:
             rotated_xyz = image_xyz
 
-        # ── Pass 2: rotated XYZ position embedding (full gradient) ───────────
-        out2    = self._spa_forward(
-            input_ids, attention_mask, pixel_values, image_grid_thw,
-            rotated_xyz, coord_scale, pass_num=2,
+        # ── Step 4: position_ids from rotated xyz via SpaModel.get_rope_index ──
+        mm_token_type_ids = (input_ids == self.image_token_id).to(torch.int32)
+        position_ids, _deltas = spa_inner.get_rope_index(
+            input_ids,
+            mm_token_type_ids=mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+            image_xyz=rotated_xyz,
+            coord_scale=coord_scale,
+        )                                                  # (5, batch, seq_len)
+
+        # ── Step 5: single transformer pass via language_model ──
+        lm_out = spa_inner.language_model(
+            input_ids      = None,
+            inputs_embeds  = inputs_embeds,
+            position_ids   = position_ids,
+            attention_mask = attention_mask,
+            return_dict    = True,
         )
-        hidden2 = self._get_hidden(out2, 2)
-        logits2 = out2.logits
-        del out2
+        hidden2 = lm_out.last_hidden_state                 # (1, seq_len, hidden_dim)
+        logits2 = lm_head(hidden2)                         # (1, seq_len, vocab)
 
         # ── LM loss (pass-2 logits) ───────────────────────────────────────────
         lm_loss = None
@@ -601,7 +543,7 @@ class RotationModel(nn.Module):
 
         if coord_gt_src is not None and image_grid_thw is not None:
             if R is not None:
-                coord_gt = _apply_rotation_to_xyz(R.detach(), coord_gt_src, origin)
+                coord_gt = _apply_rotation_to_xyz(R.detach(), coord_gt_src)
             else:
                 coord_gt = coord_gt_src
 

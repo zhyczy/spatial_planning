@@ -2,20 +2,21 @@
 # =============================================================================
 # train_rotation.sh
 #
-# Two-pass rotation-aware coordinate prediction training.
+# Single-pass rotation-aware coordinate prediction training with
+# differentiable M-RoPE.
 # LoRA fine-tuning of SpaForConditionalGeneration (Qwen3.5-VL) with:
 #   - CameraTokenRotationEncoder  → predicts canonical rotation R
+#     (trained end-to-end via lm_loss + coord_loss; no GT rotation)
 #   - DepthPredictionTransformer  → coordinate head in rotated frame
 #
 # Multi-GPU via torchrun (DDP).
 #
 # Usage:
 #   bash scripts/train_rotation.sh [num_gpus] [--max_samples N] \
-#       [--rot_weight W] [--coord_weight W] [--coord_scale S]
+#       [--coord_weight W] [--coord_scale S]
 #
 #   num_gpus        — first positional arg, number of GPUs (default: all)
 #   --max_samples N — truncate dataset to N entries (default: all)
-#   --rot_weight  W — weight for geodesic rotation loss (default: 1.0)
 #   --coord_weight W— weight for coordinate L1 loss (default: 1.0)
 #   --coord_scale S — XYZ discretization multiplier, must match MLLM (default: 100.0)
 #
@@ -23,7 +24,7 @@
 #   bash scripts/train_rotation.sh                        # all GPUs
 #   bash scripts/train_rotation.sh 2                      # 2 GPUs
 #   bash scripts/train_rotation.sh 1 --max_samples 64    # debug run
-#   bash scripts/train_rotation.sh 4 --rot_weight 0.5    # lower rot loss weight
+#   bash scripts/train_rotation.sh 4 --coord_weight 0.5  # lower coord loss weight
 # =============================================================================
 
 set -euo pipefail
@@ -39,7 +40,6 @@ cd "$SPATIAL_DIR"
 
 NPROC=""
 MAX_SAMPLES=""
-ROT_WEIGHT=""
 COORD_WEIGHT=""
 COORD_SCALE=""
 _positional=0
@@ -48,8 +48,6 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --max_samples)
             MAX_SAMPLES="$2"; shift 2 ;;
-        --rot_weight)
-            ROT_WEIGHT="$2"; shift 2 ;;
         --coord_weight)
             COORD_WEIGHT="$2"; shift 2 ;;
         --coord_scale)
@@ -97,7 +95,6 @@ ROT_DIM_FEEDFORWARD=2048
 ROT_NUM_LAYERS=2
 
 # Default loss weights (can be overridden via CLI)
-_ROT_WEIGHT="${ROT_WEIGHT:-1.0}"
 _COORD_WEIGHT="${COORD_WEIGHT:-1.0}"
 _COORD_SCALE="${COORD_SCALE:-100.0}"
 
@@ -109,7 +106,7 @@ WANDB_ENTITY="actmrv"
 # =============================================================================
 
 RUN_NAME="rotation_mindcube"
-WANDB_RUN_NAME="rot_mindcube_r${LORA_RANK}_ep${EPOCHS}_rw${_ROT_WEIGHT}_cw${_COORD_WEIGHT}"
+WANDB_RUN_NAME="rot_mindcube_r${LORA_RANK}_ep${EPOCHS}_cw${_COORD_WEIGHT}"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 # =============================================================================
@@ -123,7 +120,6 @@ mkdir -p "$OUTPUT_DIR"
 echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
-echo "[INFO] rot_weight           = $_ROT_WEIGHT"
 echo "[INFO] coord_weight         = $_COORD_WEIGHT"
 echo "[INFO] coord_scale          = $_COORD_SCALE"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
@@ -160,7 +156,6 @@ $TORCHRUN \
     --num_workers            "$NUM_WORKERS"            \
     --save_steps             "$SAVE_STEPS"             \
     --eval_steps             "$EVAL_STEPS"             \
-    --rot_weight             "$_ROT_WEIGHT"            \
     --coord_weight           "$_COORD_WEIGHT"          \
     --coord_scale            "$_COORD_SCALE"           \
     --rot_nhead              "$ROT_NHEAD"              \

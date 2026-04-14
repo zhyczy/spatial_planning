@@ -19,3 +19,4 @@ from .rotation_llm import (
     CameraTokenRotationEncoder,
     RotationModel,
 )
+from .rotation_rope_llm import RotationRoPEModel
