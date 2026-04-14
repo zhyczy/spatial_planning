@@ -79,7 +79,10 @@ JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
 MINDCUBE_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
 
 EPOCHS=6
-LR=2e-4
+LR=2e-4                 # LoRA + coord_head learning rate
+ROTATION_ENC_LR=2e-4    # rotation_enc (train-from-scratch) learning rate
+LORA_CLIP=1.0           # grad-norm clip for LoRA + coord_head group
+ROTATION_ENC_CLIP=0.3   # strict clip for rotation_enc (RoPE high-freq amplification)
 LORA_RANK=16
 MAX_IMAGES=4
 GRAD_ACCUM=8
@@ -150,6 +153,9 @@ $TORCHRUN \
     --output_dir             "$OUTPUT_DIR"             \
     --epochs                 "$EPOCHS"                 \
     --lr                     "$LR"                     \
+    --rotation_enc_lr        "$ROTATION_ENC_LR"        \
+    --lora_clip              "$LORA_CLIP"              \
+    --rotation_enc_clip      "$ROTATION_ENC_CLIP"      \
     --lora_rank              "$LORA_RANK"              \
     --max_images             "$MAX_IMAGES"             \
     --grad_accum             "$GRAD_ACCUM"             \

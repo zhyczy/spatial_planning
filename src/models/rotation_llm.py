@@ -331,7 +331,13 @@ class CameraTokenRotationEncoder(nn.Module):
         ])
 
         # 6-D rotation head (Gram-Schmidt → SO(3))
+        # Init so that step-0 output r6d = [1,0,0, 0,1,0] → R = I.
         self.rot_head = nn.Linear(self.d_model, 6)
+        nn.init.zeros_(self.rot_head.weight)
+        with torch.no_grad():
+            self.rot_head.bias.copy_(
+                torch.tensor([1., 0., 0., 0., 1., 0.])
+            )
 
     # ------------------------------------------------------------------
 
@@ -368,9 +374,12 @@ class CameraTokenRotationEncoder(nn.Module):
         for layer in self.layers:
             x = layer(x, position_ids)
 
-        # Predict rotation from cam token output (index 0)
-        cam_feat = x[0, 0].float()                               # (d_model,)
-        r6d      = self.rot_head(cam_feat)                       # (6,)
+        # Predict rotation from cam token output (index 0).
+        # Keep cam_feat in the encoder's dtype (bf16) so it matches rot_head
+        # weights; cast to float32 only for the Gram-Schmidt step, which
+        # needs higher precision to stay on SO(3).
+        cam_feat = x[0, 0]                                       # (d_model,) bf16
+        r6d      = self.rot_head(cam_feat).float()               # (6,) float32
         R        = rot6d_to_rotmat(r6d.unsqueeze(0)).squeeze(0)  # (3, 3)
         return R
 

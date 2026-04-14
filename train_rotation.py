@@ -344,8 +344,30 @@ def train(args: argparse.Namespace) -> None:
             log.warning(f"Failed to load eval dataset '{_ds_name}': {exc}")
 
     # -- optimiser -------------------------------------------------------------
-    trainable   = [p for p in model.parameters() if p.requires_grad]
-    optimizer   = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
+    # Split into two mutually-exclusive groups:
+    #   (a) rotation_enc — train-from-scratch, strict RoPE-aware clip
+    #   (b) rest (LoRA + coord_head) — standard fine-tune regime
+    rotation_enc_params = [
+        p for n, p in model.named_parameters()
+        if p.requires_grad and "rotation_enc" in n
+    ]
+    other_params = [
+        p for n, p in model.named_parameters()
+        if p.requires_grad and "rotation_enc" not in n
+    ]
+    trainable = rotation_enc_params + other_params
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": other_params,        "lr": args.lr,              "name": "lora"},
+            {"params": rotation_enc_params, "lr": args.rotation_enc_lr, "name": "rotation_enc"},
+        ],
+        weight_decay=0.01,
+    )
+    log.info(
+        f"Optimizer groups: lora/coord_head={len(other_params)} params "
+        f"@ lr={args.lr}, rotation_enc={len(rotation_enc_params)} params "
+        f"@ lr={args.rotation_enc_lr}"
+    )
     total_steps = args.epochs * len(train_loader) // args.grad_accum
     scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1)
@@ -461,7 +483,16 @@ def train(args: argparse.Namespace) -> None:
 
             # -- gradient accumulation -----------------------------------------
             if (step + 1) % args.grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+                # Independent grad-norm clipping: rotation_enc is strict
+                # (RoPE high-frequency gradient amplification), LoRA/coord_head
+                # uses standard fine-tune clip.
+                if rotation_enc_params:
+                    torch.nn.utils.clip_grad_norm_(
+                        rotation_enc_params, max_norm=args.rotation_enc_clip
+                    )
+                torch.nn.utils.clip_grad_norm_(
+                    other_params, max_norm=args.lora_clip
+                )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -671,7 +702,15 @@ def parse_args() -> argparse.Namespace:
         default=os.path.join(_ROOT, "checkpoints/spa_rotation"),
     )
     p.add_argument("--epochs",      type=int,   default=3)
-    p.add_argument("--lr",          type=float, default=2e-4)
+    p.add_argument("--lr",              type=float, default=2e-4,
+                   help="learning rate for LoRA + coord_head group")
+    p.add_argument("--rotation_enc_lr", type=float, default=2e-4,
+                   help="learning rate for rotation_enc (train-from-scratch)")
+    p.add_argument("--lora_clip",           type=float, default=1.0,
+                   help="grad-norm clip for LoRA + coord_head group")
+    p.add_argument("--rotation_enc_clip",   type=float, default=0.3,
+                   help="grad-norm clip for rotation_enc "
+                        "(strict, due to RoPE high-freq gradient amplification)")
     p.add_argument("--lora_rank",   type=int,   default=16)
     p.add_argument("--max_images",  type=int,   default=4)
     p.add_argument("--grad_accum",  type=int,   default=8)
