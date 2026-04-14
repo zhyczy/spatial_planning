@@ -22,11 +22,6 @@ Multi-method QA evaluation:
       3D pos: precomputed XYZ → 4D M-RoPE on image patches AND <coord> tokens
       Coord : predicted in Cartesian (x, y, z)
 
-  coordinate_pose
-      Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
-      Input : images + pose_sentences + <coord>-token sentences + question
-      3D pos: precomputed XYZ → 4D M-RoPE on image patches AND <coord> tokens
-
   polar
       Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA  (trained with --polar)
       Input : images + question 
@@ -46,13 +41,13 @@ python evaluation.py \\
 python evaluation.py \\
     --method coordinate \\
     --model_path            checkpoints/Qwen3.5-4B \\
-    --correspondence_ckpt   train_records/correspondence/final \\
+    --correspondence_ckpt   train_records/coordinate_no_cam_mindcube/step_1248_final \\
     --data_dir              datasets/evaluation/MMSIBench
 
 # both (baseline + coordinate)
 python evaluation.py \\
     --model_path            checkpoints/Qwen3.5-4B \\
-    --correspondence_ckpt   train_records/correspondence/final \\
+    --correspondence_ckpt   train_records/coordinate_no_cam_mindcube/step_1248_final \\
     --data_dir              datasets/evaluation/MMSIBench
 
 # vanilla ablation
@@ -218,6 +213,71 @@ def load_baseline_model(
     return model, processor
 
 
+def _resolve_spa_ckpt_dir(
+    ckpt_path: str,
+    require_coord_head: bool = False,
+) -> Path:
+    """Resolve a SPA checkpoint directory.
+
+    Supports both:
+      - direct step directory: .../step_900
+      - run root directory containing many step_* subdirs
+
+    If *require_coord_head* is True, the resolved directory must contain either
+    coord_head.pt or dpt_head.pt.
+    """
+    logger = logging.getLogger(__name__)
+
+    p = Path(ckpt_path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Checkpoint path does not exist: {p}")
+
+    def _has_adapter(d: Path) -> bool:
+        return (d / "adapter_model.safetensors").exists()
+
+    def _has_coord_head(d: Path) -> bool:
+        return (d / "coord_head.pt").exists() or (d / "dpt_head.pt").exists()
+
+    def _usable(d: Path) -> bool:
+        if not d.is_dir() or not _has_adapter(d):
+            return False
+        if require_coord_head and not _has_coord_head(d):
+            return False
+        return True
+
+    if _usable(p):
+        return p
+
+    # Try to resolve from run root: pick largest step number; prefer _final when tied.
+    step_pat = re.compile(r"^step_(\d+)(?:_final)?$")
+    candidates: List[Tuple[int, int, Path]] = []
+    if p.is_dir():
+        for d in p.iterdir():
+            if not d.is_dir():
+                continue
+            m = step_pat.match(d.name)
+            if m is None:
+                continue
+            if not _usable(d):
+                continue
+            step = int(m.group(1))
+            is_final = 1 if d.name.endswith("_final") else 0
+            candidates.append((step, is_final, d))
+
+    if candidates:
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        resolved = candidates[-1][2]
+        logger.info(f"[spa] Resolved checkpoint dir: {p} -> {resolved}")
+        return resolved
+
+    need = "adapter_model.safetensors"
+    if require_coord_head:
+        need += " + (coord_head.pt or dpt_head.pt)"
+    raise FileNotFoundError(
+        f"Could not resolve a valid checkpoint from {p}. Expected {need}."
+    )
+
+
 def load_spa_model(
     base_model_path: str,
     ckpt_path: str,
@@ -231,12 +291,13 @@ def load_spa_model(
          For vanilla: keep original 3D mrope_section and use stock
          Qwen3_5ForConditionalGeneration instead of SpaForConditionalGeneration.
       2. Load base model from base_model_path.
-      3. Load processor/tokenizer from ckpt_path (has <pose> in vocab).
+        3. Load processor/tokenizer from ckpt_path.
       4. Resize embedding table to match the saved tokenizer.
       5. Load PEFT LoRA adapter from ckpt_path, then merge into base weights.
     """
     logger = logging.getLogger(__name__)
-    logger.info(f"[spa] Loading SPA model: base={base_model_path}  ckpt={ckpt_path}  vanilla={vanilla}")
+    ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=False)
+    logger.info(f"[spa] Loading SPA model: base={base_model_path}  ckpt={ckpt_dir}  vanilla={vanilla}")
 
     config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
@@ -266,7 +327,7 @@ def load_spa_model(
 
     # 3. Processor from base model; swap in the checkpoint tokenizer
     processor = AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_path, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dir), local_files_only=True)
     processor.tokenizer = tokenizer
 
     # 4. Resize embedding table to match the LoRA checkpoint's embed_tokens size.
@@ -278,7 +339,7 @@ def load_spa_model(
     # as the base, producing a saved embed of 248321.  But here len(tokenizer)=248078
     # < 248320, so the naive `if new_vocab > old_vocab` guard never fires.
     # Reading the shape from safetensors is the only reliable way to stay in sync.
-    _adapter_path = Path(ckpt_path) / "adapter_model.safetensors"
+    _adapter_path = ckpt_dir / "adapter_model.safetensors"
     _target_vocab: Optional[int] = None
     if _adapter_path.exists():
         try:
@@ -302,7 +363,7 @@ def load_spa_model(
             logger.info(f"[spa] Embedding: {old_vocab} → {new_vocab} (from tokenizer)")
 
     # 5. Load LoRA adapter and merge
-    spa = PeftModel.from_pretrained(spa, ckpt_path, is_trainable=False)
+    spa = PeftModel.from_pretrained(spa, str(ckpt_dir), is_trainable=False)
     spa = spa.merge_and_unload()
     logger.info("[spa] LoRA adapter merged.")
 
@@ -315,15 +376,26 @@ def _load_coord_head(
     ckpt_path: str,
     device: str,
 ) -> Optional[DepthPredictionTransformer]:
-    """Load DepthPredictionTransformer from coord_head.pt in the checkpoint directory.
+    """Load DepthPredictionTransformer from checkpoint directory.
 
     Infers hidden_dim, d_model, and upscale_factor from the saved weight shapes so
-    no extra config is needed.  Returns None if coord_head.pt is not present.
+    no extra config is needed. Accepts either coord_head.pt or dpt_head.pt.
+    Returns None when no coordinate head checkpoint is available.
     """
     logger = logging.getLogger(__name__)
-    coord_head_path = Path(ckpt_path) / "coord_head.pt"
-    if not coord_head_path.exists():
-        logger.info(f"[coordinate] coord_head.pt not found in {ckpt_path} — skipping coord head.")
+    ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=True)
+
+    coord_head_path = None
+    for _name in ("coord_head.pt", "dpt_head.pt"):
+        p = ckpt_dir / _name
+        if p.exists():
+            coord_head_path = p
+            break
+    if coord_head_path is None:
+        logger.info(
+            f"[coordinate] coord_head.pt / dpt_head.pt not found in {ckpt_dir} "
+            "— skipping coord head."
+        )
         return None
 
     state = torch.load(str(coord_head_path), map_location="cpu", weights_only=True)
@@ -706,15 +778,13 @@ def prepare_batch_spa(
     use_coord: bool,
     coord_scale: float,
     thinking: bool = False,
-    use_pose: bool = True,
     load_xyz: bool = False,
 ) -> Tuple[Dict, str, List[torch.Tensor]]:
     """Tokenise one sample and build image_xyz for SPA model inference.
 
     The prompt matches training format:
-      [images] + (pose_sentences if use_pose) + (coord_sentences if use_coord) + question
+            [images] + (coord_sentences if use_coord) + question
 
-    use_pose=False : no pose sentences (--no_cam variant or polar variant).
     use_coord=True : adds <coord>-token sentences and loads image_xyz.
     load_xyz=True  : loads image_xyz without adding <coord>-token sentences.
                      Used for the polar method which needs xyz for the RoPE but
@@ -730,7 +800,6 @@ def prepare_batch_spa(
     """
     from qwen_vl_utils import process_vision_info
 
-    POSE_TOKEN = "<pose>"
     COORD_TOKEN = "<coord>"
 
     image_paths = item["image"]
@@ -740,21 +809,10 @@ def prepare_batch_spa(
     # ── image content ────────────────────────────────────────────────────────
     content: list = [{"type": "image", "image": p} for p in image_paths]
 
-    # ── pose sentences (like training; skipped when use_pose=False / no_cam) ─
-    pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-    pose_sentences = (
-        [
-            f"The camera pose of image {j + 1} relative to image {i + 1} is "
-            f"{POSE_TOKEN}."
-            for (i, j) in pairs
-        ]
-        if (use_pose and N >= 2) else []
-    )
-
     if use_coord and N >= 2:
         # ── probe step: get image_grid_thw to know patch counts per image ──
         probe_content = list(content)
-        probe_text = " ".join(pose_sentences) + " " + question if pose_sentences else question
+        probe_text = question
         probe_content.append({"type": "text", "text": probe_text})
         probe_messages = [{"role": "user", "content": probe_content}]
         probe_prompt = processor.apply_chat_template(
@@ -780,19 +838,11 @@ def prepare_batch_spa(
                 f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
             )
 
-        # ── final text: (pose +) coord + question ─────────────────────────
-        parts = []
-        if pose_sentences:
-            parts.append(" ".join(pose_sentences))
-        parts.append(" ".join(coord_sentences))
-        parts.append(question)
-        final_text = " ".join(parts)
+        # ── final text: coord + question ───────────────────────────────────
+        final_text = (" ".join(coord_sentences) + " " + question).strip()
     else:
-        # ── final text: (pose +) question (no coord) ──────────────────────
-        if pose_sentences:
-            final_text = " ".join(pose_sentences) + " " + question
-        else:
-            final_text = question
+        # ── final text: question (no coord) ────────────────────────────────
+        final_text = question
 
     content.append({"type": "text", "text": final_text})
 
@@ -852,7 +902,6 @@ def run_inference_spa(
 
     image_xyz (if provided) is passed as a kwarg to model.generate() which
     forwards it to forward() → get_rope_index() for 4D M-RoPE.
-    The PoseRegressionHead is NOT used; we only call generate() for QA.
 
     When vanilla=True, the model is a stock Qwen3_5ForConditionalGeneration
     with original 3D M-RoPE — no custom get_rope_index or image_xyz needed.
@@ -1194,12 +1243,11 @@ def evaluate(
 
     method choices:
       baseline           — stock Qwen3.5-VL
-      vanilla            — SPA LoRA + 3D M-RoPE (no pose, no <coord>)
-      position_embedding — SPA LoRA + 4D M-RoPE (no pose, no <coord>)
+        vanilla            — SPA LoRA + 3D M-RoPE (prompt has no <coord> tokens)
+        position_embedding — SPA LoRA + 4D M-RoPE (prompt has no <coord> tokens)
       coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens, no_cam variant (Cartesian)
-      coordinate_pose    — SPA LoRA + 4D M-RoPE + <coord> tokens, full variant (with pose)
       polar              — SPA LoRA + 4D M-RoPE, XYZ → spherical (ρ,θ,α) for RoPE;
-                           no pose sentences, no <coord> tokens; matches --polar in train_correspondence.py
+                       prompt has no <coord> tokens; matches --polar in train_correspondence.py
       both               — baseline + coordinate
 
     Returns dict mapping method name → list of result dicts.
@@ -1210,9 +1258,8 @@ def evaluate(
     run_vanilla = method == "vanilla"
     run_position_embedding = method == "position_embedding"
     run_coordinate = method in ("coordinate", "both")
-    run_coordinate_pose = method == "coordinate_pose"
     run_polar = method == "polar"
-    run_spa = run_vanilla or run_position_embedding or run_coordinate or run_coordinate_pose or run_polar
+    run_spa = run_vanilla or run_position_embedding or run_coordinate or run_polar
 
     # Lazy-load only what we need
     baseline_model = baseline_proc = None
@@ -1228,7 +1275,7 @@ def evaluate(
     if run_spa:
         if correspondence_ckpt is None:
             raise ValueError(
-                f"--correspondence_ckpt is required for method='{method}'"
+                f"--correspondence_ckpt is required for SPA method='{method}'"
             )
         use_vanilla_arch = run_vanilla
         spa_model, spa_proc = load_spa_model(
@@ -1248,31 +1295,28 @@ def evaluate(
             image_token_id_val = _iid
 
         # Load DepthPredictionTransformer if this is a coordinate checkpoint
-        if run_coordinate or run_coordinate_pose:
+        if run_coordinate:
             spa_coord_head = _load_coord_head(correspondence_ckpt, device)
 
     # Determine which SPA variants to run.
-    # Tuple: (method_name, use_coord, use_pose, is_polar)
-    # vanilla           : no <coord> tokens, NO pose sentences, 3D RoPE
-    # position_embedding: no <coord> tokens, NO pose sentences, 4D Cartesian RoPE
-    # coordinate (no_cam): <coord> tokens, NO pose sentences, 4D Cartesian RoPE
-    # coordinate_pose   : <coord> tokens, WITH pose sentences, 4D Cartesian RoPE
-    # polar             : no <coord> tokens, NO pose sentences, 4D spherical RoPE (polar=True)
-    spa_variants: List[Tuple[str, bool, bool, bool]] = []
+    # Tuple: (method_name, use_coord, is_polar)
+    # vanilla           : no <coord> tokens, 3D RoPE
+    # position_embedding: no <coord> tokens, 4D Cartesian RoPE
+    # coordinate (no_cam): <coord> tokens, 4D Cartesian RoPE
+    # polar             : no <coord> tokens, 4D spherical RoPE (polar=True)
+    spa_variants: List[Tuple[str, bool, bool]] = []
     if run_vanilla:
-        spa_variants.append(("vanilla", False, False, False))
+        spa_variants.append(("vanilla", False, False))
     if run_position_embedding:
-        spa_variants.append(("position_embedding", False, False, False))
+        spa_variants.append(("position_embedding", False, False))
     if run_coordinate:
-        spa_variants.append(("coordinate", True, False, False))
-    if run_coordinate_pose:
-        spa_variants.append(("coordinate_pose", True, True, False))
+        spa_variants.append(("coordinate", True, False))
     if run_polar:
-        spa_variants.append(("polar", False, False, True))
+        spa_variants.append(("polar", False, True))
 
     active_methods = (
         (["baseline"] if run_baseline else [])
-        + [name for name, _, __, ___ in spa_variants]
+        + [name for name, _, __ in spa_variants]
     )
     results_map: Dict[str, List[Dict]] = {m: [] for m in active_methods}
 
@@ -1296,12 +1340,11 @@ def evaluate(
                 results_map["baseline"].append(_error_result(item, exc, "baseline"))
 
         # ---- SPA variants ----
-        for spa_method_name, use_coord, use_pose, is_polar in spa_variants:
+        for spa_method_name, use_coord, is_polar in spa_variants:
             inputs, prompt, image_xyz = prepare_batch_spa(
                 item, spa_proc,
                 spatial_merge_size, use_coord, coord_scale,
                 thinking=thinking,
-                use_pose=use_pose,
                 load_xyz=is_polar,  # polar needs xyz for RoPE but no coord sentences
             )
             output = run_inference_spa(
@@ -1480,15 +1523,14 @@ def main() -> None:
     # ── method ────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--method", type=str, default="both",
-        choices=["baseline", "vanilla", "position_embedding", "coordinate", "coordinate_pose", "polar", "both"],
+        choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar", "both"],
         help=(
             "Which method(s) to run. "
             "baseline=stock Qwen3.5-VL; "
-            "vanilla=SPA LoRA + 3D M-RoPE, no pose/coord sentences; "
-            "position_embedding=SPA LoRA + 4D M-RoPE, no pose/coord sentences; "
-            "coordinate=SPA LoRA + 4D M-RoPE + <coord> tokens (no_cam, no pose, Cartesian); "
-            "coordinate_pose=SPA LoRA + 4D M-RoPE + <coord> tokens (full, with pose); "
-            "polar=SPA LoRA + 4D M-RoPE, XYZ→spherical for RoPE, no pose/coord sentences; "
+            "vanilla=SPA LoRA + 3D M-RoPE, prompt has no <coord> tokens; "
+            "position_embedding=SPA LoRA + 4D M-RoPE, prompt has no <coord> tokens; "
+            "coordinate=SPA LoRA + 4D M-RoPE + <coord> tokens (no_cam, Cartesian); "
+            "polar=SPA LoRA + 4D M-RoPE, XYZ→spherical for RoPE, prompt has no <coord> tokens; "
             "both=baseline + coordinate."
         ),
     )
@@ -1501,9 +1543,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--correspondence_ckpt", type=str, default=None,
-        help="Path to the LoRA checkpoint saved by train_correspondence.py "
-             "(contains adapter_model.safetensors + tokenizer). "
-             "Required when --method is 'correspondence' or 'both'.",
+        help=(
+            "Path to SPA LoRA checkpoint (step directory or run root). "
+            "Should contain adapter_model.safetensors + tokenizer files. "
+            "For --method coordinate, checkpoint should also contain "
+            "coord_head.pt (or dpt_head.pt)."
+        ),
     )
 
     # ── 3D coordinate estimation ──────────────────────────────────────────────
@@ -1653,7 +1698,6 @@ def main() -> None:
         "vanilla":            args.method == "vanilla",
         "position_embedding": args.method == "position_embedding",
         "coordinate":         args.method in ("coordinate", "both"),
-        "coordinate_pose":    args.method == "coordinate_pose",
         "polar":              args.method == "polar",
     }
     all_results: Dict[str, List[Dict]] = {}
@@ -1667,8 +1711,7 @@ def main() -> None:
         "vanilla":            "vanilla            (SPA LoRA + 3D M-RoPE)",
         "position_embedding": "position_embedding (SPA LoRA + 4D M-RoPE)",
         "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + <coord>, no_cam, Cartesian)",
-        "coordinate_pose":    "coordinate_pose    (SPA LoRA + 4D M-RoPE + <coord> + pose)",
-        "polar":              "polar              (SPA LoRA + 4D M-RoPE, XYZ→spherical, no pose/coord)",
+        "polar":              "polar              (SPA LoRA + 4D M-RoPE, XYZ→spherical, no <coord>)",
     }
     _metrics_fn = compute_metrics_robospatial if args.dataset == "robospatial" else compute_metrics
     for mname, mresults in all_results.items():
@@ -1688,7 +1731,6 @@ def main() -> None:
     # baseline vs coordinate (the "both" mode).
     _compare_pairs = [
         ("baseline", "coordinate"),
-        ("baseline", "coordinate_pose"),
         ("baseline", "polar"),
         ("baseline", "position_embedding"),
         ("baseline", "vanilla"),

@@ -1,35 +1,49 @@
 """
-train_coordinate.py
+train_rotation.py
 
-LoRA fine-tuning of SpaForConditionalGeneration (Qwen3.5-VL) with two
-simultaneous supervision signals:
+LoRA fine-tuning of SpaForConditionalGeneration (Qwen3.5-VL) with a
+two-pass rotation-aware coordinate prediction pipeline.
 
-    1. LM answer   — causal cross-entropy on answer tokens
-                                     (question appended to prompt; answer supervised)
-    2. Coordinate  — L1 loss predicting sub-pixel 3D (x,y,z)
-                                     (decoded from vision-token hidden states)
+Architecture
+~~~~~~~~~~~~
+RotationModel
++-- SpaForConditionalGeneration [backbone + LoRA]
+|    +-- SpaVisionModel (ViT, optional frozen)
+|    +-- SpaModel (LLM + 4D M-RoPE)
++-- CameraTokenRotationEncoder   [shallow transformer, predicts R]
++-- DepthPredictionTransformer   [coordinate head]
 
-Architecture:
-    CoordinateModel
-    +-- SpaForConditionalGeneration  [backbone + LoRA adapters]
-        |    +-- SpaVisionModel (ViT, optional frozen)
-    |    +-- SpaModel (LLM + 4D M-RoPE)
-        +-- CoordinateRegressionHead [DepthPredictionTransformer -> sub-pixel 3D]
+Pipeline
+~~~~~~~~
+Pass 1  MLLM forward with original world-frame XYZ position embeddings
+        (runs under torch.no_grad(); last hidden states captured via
+        lm_head pre-hook).
 
-Coordinate GT:
-  For each image and each LLM patch token (after spatial merge), the GT is the
-  mean (x,y,z) of all valid pixels that fall within that patch -- exactly the
-  values already computed by resize_xyz() and stored as image_xyz.
+Rotation encoder
+        All MLLM token hidden states + learnable cam token are fed into
+        a 2-layer TransformerEncoder.  3-D sinusoidal PE is computed
+        from the XYZ coordinates centred at the first-frame camera
+        position.  The cam token output predicts a 3×3 rotation matrix R.
 
-Total loss:
-    loss = answer_weight * lm_loss + coord_weight * coord_loss
+Pass 2  MLLM forward with rotated XYZ = R @ (xyz_world - cam_pos_0).
+        This encodes a canonical coordinate frame aligned with the
+        first-frame camera orientation as new position embeddings.
 
-Camera transform prediction is removed in this script.
+Coordinate head
+        Decodes pass-2 hidden states → sub-pixel (x, y, z) predictions
+        in the rotated frame.
+        GT: R.detach() @ (xyz_hires - cam_pos_0).
 
-Usage:
-  python train_coordinate.py \\
+Total loss
+    loss = answer_weight * lm_loss
+         + rot_weight   * rot_loss    (geodesic, optional)
+         + coord_weight * coord_loss
+
+Usage
+~~~~~
+  python train_rotation.py \\
       --model_path checkpoints/Qwen3.5-4B \\
-      --output_dir checkpoints/spa_coordinate
+      --output_dir checkpoints/spa_rotation
 """
 
 import argparse
@@ -56,8 +70,17 @@ from peft import LoraConfig, TaskType, get_peft_model
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
-from src.models import DepthPredictionTransformer, CoordinateModel, SpaForConditionalGeneration
-from src.dataset import MindCube_Train_Dataset_Coord, MindCube_Train_Dataset_Coord_Polar, Eval_Dataset_Coord, xyz_to_polar
+from src.models import (
+    DepthPredictionTransformer,
+    CameraTokenRotationEncoder,
+    RotationModel,
+    SpaForConditionalGeneration,
+)
+from src.models.spa_emb import SpaTextRotaryEmbedding
+from src.dataset import (
+    MindCube_Train_Dataset_Rotation,
+    Eval_Dataset_Coord,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,21 +111,21 @@ def build_model(
     model_path:         str,
     image_token_id:     int,
     spatial_merge_size: int,
-    coord_upscale:      int = 4,
-    lora_rank:          int = 16,
-    freeze_vision:      bool = True,
+    coord_upscale:      int   = 4,
+    lora_rank:          int   = 16,
+    freeze_vision:      bool  = True,
     skip_layers:        tuple[int, ...] = (-1,),
     answer_weight:      float = 1.0,
     coord_weight:       float = 1.0,
-    polar:              bool  = False,
-) -> CoordinateModel:
-    """
-    Build CoordinateModel with LM + coordinate supervision.
-    Camera transform prediction is removed.
-    """
+    rot_weight:         float = 1.0,
+    rot_nhead:          int   = 4,
+    rot_dim_feedforward: int  = 2048,
+    rot_num_layers:     int   = 2,
+) -> RotationModel:
+    """Build RotationModel with LM + rotation + coordinate supervision."""
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
-    total = sum(orig_section)
+    total    = sum(orig_section)
     xyz_size = (total - 2) // 3
     new_section = [2, xyz_size, xyz_size, xyz_size]
     config.text_config.rope_scaling["mrope_section"] = new_section
@@ -110,6 +133,16 @@ def build_model(
         f"mrope_section: {orig_section} -> {new_section}  "
         f"(4D M-RoPE: 2 for t, {xyz_size} each for x/y/z)"
     )
+
+    # MLLM explicit head_dim (e.g. 256 for Qwen3.5-4B).
+    # This is config.head_dim, NOT hidden_size // num_attention_heads.
+    # The rotation encoder must use the same head_dim so RoPE freq mapping
+    # is byte-for-byte identical.
+    mllm_head_dim = getattr(config.text_config, "head_dim", None) or (
+        config.text_config.hidden_size // config.text_config.num_attention_heads
+    )
+    log.info(f"mllm_head_dim={mllm_head_dim}  rot_nhead={rot_nhead}  "
+             f"→ rotation_enc d_model={rot_nhead * mllm_head_dim}")
 
     spa = SpaForConditionalGeneration.from_pretrained(
         model_path,
@@ -137,32 +170,54 @@ def build_model(
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
 
-    # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
     spa.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
-    lm = spa.model.model.language_model if hasattr(spa.model, 'model') else spa.model.language_model
-    gc_flag = getattr(lm, 'gradient_checkpointing', False)
+    lm = (spa.model.model.language_model
+          if hasattr(spa.model, "model") else spa.model.language_model)
+    gc_flag = getattr(lm, "gradient_checkpointing", False)
     log.info(f"Gradient checkpointing enabled. language_model.gradient_checkpointing={gc_flag}")
     if not gc_flag:
         lm.gradient_checkpointing = True
         log.info("Manually set gradient_checkpointing=True on language_model")
 
     hidden_dim = config.text_config.hidden_size
+
+    # Build a SpaTextRotaryEmbedding from the SAME (updated) config so that
+    # inv_freq, rope_theta, and mrope_section are byte-for-byte identical to
+    # what the MLLM backbone uses.
+    rot_rope_emb = SpaTextRotaryEmbedding(config=config.text_config).to(torch.bfloat16)
+
+    rotation_enc = CameraTokenRotationEncoder(
+        hidden_dim      = hidden_dim,
+        mllm_head_dim   = mllm_head_dim,
+        rope_emb        = rot_rope_emb,
+        nhead           = rot_nhead,
+        dim_feedforward = rot_dim_feedforward,
+        num_layers      = rot_num_layers,
+    ).to(torch.bfloat16)
+    log.info(
+        f"CameraTokenRotationEncoder  hidden_dim={hidden_dim}  "
+        f"mllm_head_dim={mllm_head_dim}  nhead={rot_nhead}  "
+        f"d_model={rotation_enc.d_model}  "
+        f"dim_feedforward={rot_dim_feedforward}  num_layers={rot_num_layers}"
+    )
+
     coord_head = DepthPredictionTransformer(
         hidden_dim=hidden_dim, upscale_factor=coord_upscale,
     ).to(torch.bfloat16)
     log.info(f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}")
 
-    return CoordinateModel(
+    return RotationModel(
         spa_model          = spa,
+        rotation_enc       = rotation_enc,
         coord_head         = coord_head,
         image_token_id     = image_token_id,
         spatial_merge_size = spatial_merge_size,
         skip_layers        = skip_layers,
         answer_weight      = answer_weight,
         coord_weight       = coord_weight,
-        polar              = polar,
+        rot_weight         = rot_weight,
     )
 
 
@@ -192,7 +247,6 @@ def train(args: argparse.Namespace) -> None:
     )
     tokenizer = processor.tokenizer
 
-    # image_token_id: <|image_pad|> in Qwen-VL tokeniser
     image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     rank0_print(f"<|image_pad|> token id = {image_token_id}")
 
@@ -206,17 +260,19 @@ def train(args: argparse.Namespace) -> None:
     # -- model -----------------------------------------------------------------
     model = build_model(
         args.model_path,
-        image_token_id     = image_token_id,
-        spatial_merge_size = spatial_merge_size,
-        coord_upscale      = args.coord_upscale,
-        lora_rank          = args.lora_rank,
-        freeze_vision      = not args.train_vision,
-        skip_layers        = tuple(args.skip_layers),
-        answer_weight      = args.answer_weight,
-        coord_weight       = args.coord_weight,
-        polar              = args.polar,
+        image_token_id      = image_token_id,
+        spatial_merge_size  = spatial_merge_size,
+        coord_upscale       = args.coord_upscale,
+        lora_rank           = args.lora_rank,
+        freeze_vision       = not args.train_vision,
+        skip_layers         = tuple(args.skip_layers),
+        answer_weight       = args.answer_weight,
+        coord_weight        = args.coord_weight,
+        rot_weight          = args.rot_weight,
+        rot_nhead           = args.rot_nhead,
+        rot_dim_feedforward = args.rot_dim_feedforward,
+        rot_num_layers      = args.rot_num_layers,
     )
-    log.info("Using CoordinateModel (camera transform prediction removed)")
     model = model.to(device)
     if local_rank == 0:
         mem_gb = torch.cuda.memory_allocated(device) / 1e9
@@ -224,15 +280,13 @@ def train(args: argparse.Namespace) -> None:
 
     # -- DDP -------------------------------------------------------------------
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank],
-                    find_unused_parameters=False)
+        model  = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
         _model = model.module
     else:
         _model = model
 
     # -- dataset / loader ------------------------------------------------------
-    _CoordDataset = MindCube_Train_Dataset_Coord_Polar if args.polar else MindCube_Train_Dataset_Coord
-    train_dataset = _CoordDataset(
+    train_dataset = MindCube_Train_Dataset_Rotation(
         args.json_path,
         args.mindcube_results_dir,
         processor,
@@ -244,8 +298,6 @@ def train(args: argparse.Namespace) -> None:
         max_samples        = args.max_samples,
         no_cam             = True,
     )
-    if args.polar:
-        log.info("Polar mode: image_xyz_hires GT converted to (r, θ, α)")
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
                            rank=local_rank, shuffle=True)
@@ -260,9 +312,9 @@ def train(args: argparse.Namespace) -> None:
         sampler     = train_sampler,
     )
 
-    # -- test datasets (full format: same prompt as training) ------------------
+    # -- eval datasets ---------------------------------------------------------
     _eval_dir = os.path.join(_ROOT, "datasets/evaluation")
-    test_loaders = {}
+    test_loaders  = {}
     test_samplers = {}
     for _ds_name, _ds_jsonl, _ds_results, _q_key, _a_key in [
         ("mindcube",
@@ -311,7 +363,6 @@ def train(args: argparse.Namespace) -> None:
         optimizer, T_max=max(total_steps, 1)
     )
 
-    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
     # -- logging to file -------------------------------------------------------
@@ -321,8 +372,7 @@ def train(args: argparse.Namespace) -> None:
     )
     rank_handler = logging.FileHandler(rank_log_file, mode="w", encoding="utf-8")
     rank_handler.setFormatter(logging.Formatter(
-        "%(asctime)s  %(levelname)s  %(message)s",
-        datefmt="%H:%M:%S"
+        "%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S"
     ))
     log.addHandler(rank_handler)
 
@@ -330,11 +380,10 @@ def train(args: argparse.Namespace) -> None:
         summary_log_file = os.path.join(args.output_dir, "train.log")
         summary_handler = logging.FileHandler(summary_log_file, mode="w", encoding="utf-8")
         summary_handler.setFormatter(logging.Formatter(
-            "%(asctime)s  %(levelname)s  %(message)s",
-            datefmt="%H:%M:%S"
+            "%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S"
         ))
         log.addHandler(summary_handler)
-        rank0_print(f"Per-rank logs: train_rank*.log  |  Summary log: {summary_log_file}")
+        rank0_print(f"Per-rank logs: train_rank*.log  |  Summary: {summary_log_file}")
     else:
         rank0_print(f"Logging to {rank_log_file}")
 
@@ -354,7 +403,7 @@ def train(args: argparse.Namespace) -> None:
 
     model.train()
 
-    global_step = 0
+    global_step  = 0
     running_loss = 0.0
     running_loss_dict: dict[str, float] = {}
     optimizer.zero_grad()
@@ -384,13 +433,21 @@ def train(args: argparse.Namespace) -> None:
             if image_xyz_hires is not None:
                 image_xyz_hires = [xyz.to(device) for xyz in image_xyz_hires]
 
+            cam_pos_frame0 = batch.get("cam_pos_frame0")
+            if cam_pos_frame0 is not None:
+                cam_pos_frame0 = cam_pos_frame0.to(device)
+
+            gt_rotation = batch.get("gt_rotation")
+            if gt_rotation is not None:
+                gt_rotation = gt_rotation.to(device)
+
             labels = batch.get("labels")
             if labels is not None:
                 labels = labels.to(device)
 
             if step == 0 and local_rank == 0:
-                n_img_tok = (input_ids[0] == image_token_id).sum().item()
-                pv_shape = tuple(pixel_values.shape) if pixel_values is not None else None
+                n_img_tok  = (input_ids[0] == image_token_id).sum().item()
+                pv_shape   = tuple(pixel_values.shape) if pixel_values is not None else None
                 mem_before = torch.cuda.memory_allocated(device) / 1e9
                 log.info(
                     f"[MEM] Step 0: seq_len={input_ids.shape[1]}, "
@@ -401,7 +458,6 @@ def train(args: argparse.Namespace) -> None:
                 )
 
             # -- forward + loss ------------------------------------------------
-  
             _, loss, loss_dict = model(
                 input_ids       = input_ids,
                 attention_mask  = attention_mask,
@@ -409,7 +465,10 @@ def train(args: argparse.Namespace) -> None:
                 image_grid_thw  = image_grid_thw,
                 image_xyz       = image_xyz,
                 image_xyz_hires = image_xyz_hires,
+                cam_pos_frame0  = cam_pos_frame0,
+                gt_rotation     = gt_rotation,
                 labels          = labels,
+                coord_scale     = args.coord_scale,
             )
 
             if loss is None:
@@ -471,23 +530,20 @@ def train(args: argparse.Namespace) -> None:
                             step=global_step,
                         )
 
-                    # -- checkpoint ------------------------------------------------
                     if global_step % args.save_steps == 0:
-                        _save_checkpoint(_model, tokenizer, args.output_dir,
-                                         global_step)
+                        _save_checkpoint(_model, tokenizer, args.output_dir, global_step)
 
-                # -- periodic evaluation on test sets --------------------------
+                # -- periodic evaluation ---------------------------------------
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
-                    _spa = _model.spa_model if hasattr(_model, 'spa_model') else _model
+                    _spa = _model.spa_model if hasattr(_model, "spa_model") else _model
 
-                    # Disable gradient checkpointing during eval
-                    _spa_gc_flag = getattr(_spa, 'gradient_checkpointing', False)
-                    _lm = _spa.language_model if hasattr(_spa, 'language_model') else None
-                    _lm_gc_flag = getattr(_lm, 'gradient_checkpointing', False) if _lm else False
-                    if _spa_gc_flag:
+                    _spa_gc = getattr(_spa, "gradient_checkpointing", False)
+                    _lm     = getattr(_spa, "language_model", None)
+                    _lm_gc  = getattr(_lm,  "gradient_checkpointing", False) if _lm else False
+                    if _spa_gc:
                         _spa.gradient_checkpointing = False
-                    if _lm and _lm_gc_flag:
+                    if _lm and _lm_gc:
                         _lm.gradient_checkpointing = False
 
                     for ds_name, loader in test_loaders.items():
@@ -505,6 +561,9 @@ def train(args: argparse.Namespace) -> None:
                             t_labels = test_batch.get("labels")
                             t_xyz   = test_batch.get("image_xyz")
                             t_xyz_h = test_batch.get("image_xyz_hires")
+                            # Eval dataset (Eval_Dataset_Coord) does not
+                            # supply cam_pos_frame0 / gt_rotation, so we
+                            # pass None and use zero origin defaults.
 
                             if t_pv is not None:
                                 t_pv = t_pv.to(device, dtype=torch.bfloat16)
@@ -516,10 +575,7 @@ def train(args: argparse.Namespace) -> None:
                                 t_xyz = [x.to(device) for x in t_xyz]
                             if t_xyz_h is not None:
                                 t_xyz_h = [x.to(device) for x in t_xyz_h]
-                                if args.polar:
-                                    t_xyz_h = [xyz_to_polar(x) for x in t_xyz_h]
 
-                        
                             with torch.inference_mode():
                                 _, loss, loss_dict = model(
                                     input_ids       = t_ids,
@@ -528,7 +584,10 @@ def train(args: argparse.Namespace) -> None:
                                     image_grid_thw  = t_thw,
                                     image_xyz       = t_xyz,
                                     image_xyz_hires = t_xyz_h,
+                                    cam_pos_frame0  = None,
+                                    gt_rotation     = None,
                                     labels          = t_labels,
+                                    coord_scale     = args.coord_scale,
                                 )
                             if loss is None:
                                 continue
@@ -536,58 +595,52 @@ def train(args: argparse.Namespace) -> None:
                             if loss_dict:
                                 for k, v in loss_dict.items():
                                     local_loss_sums[k] = local_loss_sums.get(k, 0.0) + v
-                            
 
-                        # Aggregate across all ranks
                         _loss_keys = sorted(local_loss_sums.keys())
                         if world_size > 1:
-                            _vals = [float(local_count)] + [local_loss_sums.get(k, 0.0) for k in _loss_keys]
+                            _vals = [float(local_count)] + [
+                                local_loss_sums.get(k, 0.0) for k in _loss_keys
+                            ]
                             stats = torch.tensor(_vals, dtype=torch.float64, device=device)
                             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
                             total_count = int(stats[0].item())
                             agg_sums = {k: stats[i + 1].item() for i, k in enumerate(_loss_keys)}
                         else:
                             total_count = local_count
-                            agg_sums = dict(local_loss_sums)
+                            agg_sums    = dict(local_loss_sums)
 
                         if total_count > 0 and local_rank == 0:
                             detail = "  ".join(
-                                f"{k}={agg_sums[k] / total_count:.4f}"
-                                for k in _loss_keys
+                                f"{k}={agg_sums[k] / total_count:.4f}" for k in _loss_keys
                             )
                             log.info(
                                 f"[eval] global_step={global_step:05d}  {ds_name}  "
                                 + detail
-                                + f"  (n={total_count}, {world_size} GPU{'s' if world_size > 1 else ''})"
+                                + f"  (n={total_count}, "
+                                f"{world_size} GPU{'s' if world_size > 1 else ''})"
                             )
                             if use_wandb:
-                                _main_keys = {"coord_loss", "lm_loss"}
+                                _main_keys = {"coord_loss", "lm_loss", "rot_loss"}
                                 wandb.log(
                                     {
-                                        **(
-                                            {f"eval/{ds_name}_{k}": agg_sums[k] / total_count
-                                             for k in _loss_keys if k in _main_keys}
-                                        ),
-                                        **(
-                                            {f"eval_sub_loss/{ds_name}_{k}": agg_sums[k] / total_count
-                                             for k in _loss_keys if k not in _main_keys}
-                                        ),
+                                        **{f"eval/{ds_name}_{k}": agg_sums[k] / total_count
+                                           for k in _loss_keys if k in _main_keys},
+                                        **{f"eval_sub/{ds_name}_{k}": agg_sums[k] / total_count
+                                           for k in _loss_keys if k not in _main_keys},
                                     },
                                     step=global_step,
                                 )
 
-                    # Restore gradient checkpointing
-                    if _spa_gc_flag:
+                    if _spa_gc:
                         _spa.gradient_checkpointing = True
-                    if _lm and _lm_gc_flag:
+                    if _lm and _lm_gc:
                         _lm.gradient_checkpointing = True
 
                     model.train()
 
-    # Final checkpoint (rank 0 only)
+    # Final checkpoint
     if local_rank == 0:
-        _save_checkpoint(_model, tokenizer, args.output_dir, global_step,
-                         suffix="final")
+        _save_checkpoint(_model, tokenizer, args.output_dir, global_step, suffix="final")
     log.info(f"[rank{local_rank}] Training complete.")
     if use_wandb:
         wandb.finish()
@@ -596,7 +649,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 def _save_checkpoint(
-    model:      CoordinateModel,
+    model:      RotationModel,
     tokenizer,
     output_dir: str,
     step:       int,
@@ -609,6 +662,10 @@ def _save_checkpoint(
     model.spa_model.save_pretrained(ckpt)
     tokenizer.save_pretrained(ckpt)
     torch.save(
+        model.rotation_enc.state_dict(),
+        os.path.join(ckpt, "rotation_enc.pt"),
+    )
+    torch.save(
         model.coord_head.state_dict(),
         os.path.join(ckpt, "coord_head.pt"),
     )
@@ -619,8 +676,8 @@ def _save_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="LoRA fine-tuning of SpaForConditionalGeneration "
-                    "with answer + coordinate supervision."
+        description="Two-pass rotation-aware coordinate prediction training "
+                    "(LoRA fine-tuning of SpaForConditionalGeneration)."
     )
     p.add_argument(
         "--model_path",
@@ -630,16 +687,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--json_path",
         default=os.path.join(_ROOT, "datasets/train/MindCube/MindCube_train.jsonl"),
-        help="Path to MindCube training JSONL",
     )
     p.add_argument(
         "--mindcube_results_dir",
         default=os.path.join(_ROOT, "datasets/train/MindCube/3d_results"),
-        help="Directory containing per-sample 3d_results folders for MindCube training",
     )
     p.add_argument(
         "--output_dir",
-        default=os.path.join(_ROOT, "checkpoints/spa_coordinate"),
+        default=os.path.join(_ROOT, "checkpoints/spa_rotation"),
     )
     p.add_argument("--epochs",      type=int,   default=3)
     p.add_argument("--lr",          type=float, default=2e-4)
@@ -653,37 +708,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--train_vision",
         action="store_true",
-        help="Unfreeze the vision encoder (ViT) for fine-tuning",
-    )
-    p.add_argument(
-        "--polar",
-        action="store_true",
-        help="Convert coordinate GT from Cartesian (x,y,z) to spherical (r,θ,α) "
-             "before computing coord loss. Uses MindCube_Train_Dataset_Coord_Polar.",
+        help="Unfreeze the vision encoder (ViT) for fine-tuning.",
     )
     p.add_argument(
         "--skip_layers",
         type=int, nargs="+", default=[-8, -4, -1],
-        help="LLM layer indices used by CoordinateModel. "
-             "e.g. --skip_layers -4 -1 (default: -8 -4 -1)",
+        help="LLM layer indices for CoordHead hidden states.",
+    )
+    p.add_argument("--answer_weight", type=float, default=1.0)
+    p.add_argument("--coord_weight",  type=float, default=1.0)
+    p.add_argument(
+        "--rot_weight", type=float, default=1.0,
+        help="Weight for rotation geodesic loss (0 to disable).",
     )
     p.add_argument(
-        "--answer_weight",
-        type=float, default=1.0,
-        help="Weight for the LM answer-prediction loss.",
+        "--coord_upscale", type=int, default=4,
+        help="PixelShuffle upscale factor for the coordinate head.",
     )
+    # Coordinate scale (must match MLLM's coord_scale in SpaModel)
     p.add_argument(
-        "--coord_weight",
-        type=float, default=1.0,
-        help="Weight for the per-patch coordinate prediction loss.",
+        "--coord_scale", type=float, default=100.0,
+        help="Multiplier applied to float XYZ before rounding to integer "
+             "RoPE indices.  Must be the same value used everywhere "
+             "(SpaModel.get_vision_position_ids, rotation encoder PE, "
+             "coord head GT).  Default 100 maps ±10 m → ±1000.",
     )
+    # Rotation encoder hyper-parameters
+    # d_model = rot_nhead × mllm_head_dim  (mllm_head_dim read from config,
+    # e.g. 256 for Qwen3.5-4B  →  rot_nhead=4 gives d_model=1024)
     p.add_argument(
-        "--coord_upscale",
-        type=int, default=4,
-        help="PixelShuffle upscale factor for coord head. "
-             "Each <coord> token predicts upscale^2 sub-pixel (x,y,z) values.",
+        "--rot_nhead", type=int, default=4,
+        help="Number of attention heads in CameraTokenRotationEncoder. "
+             "d_model = rot_nhead × config.head_dim (e.g. 4×256=1024).",
     )
-    # -- WandB -----------------------------------------------------------------
+    p.add_argument("--rot_dim_feedforward", type=int, default=2048)
+    p.add_argument("--rot_num_layers",      type=int, default=2)
+    # WandB
     p.add_argument("--wandb_project",  default="", help="WandB project name.")
     p.add_argument("--wandb_entity",   default="", help="WandB entity.")
     p.add_argument("--wandb_run_name", default="", help="WandB run name.")

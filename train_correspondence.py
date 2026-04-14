@@ -2,25 +2,22 @@
 train_correspondence.py
 
 LoRA fine-tuning of SpaForConditionalGeneration (Qwen3.5-VL) to predict
-relative camera transformations between image pairs in a scene.
+answers from multi-image prompts with optional 4D M-RoPE spatial conditioning.
 
 Architecture:
-  SpaCorrespondenceModel
+    AnswerOnlyModel / AnswerRelativeModel
     ├── SpaForConditionalGeneration  [backbone + LoRA adapters]
     │    ├── SpaVisionModel (ViT, frozen)
     │    └── SpaModel (LLM + 4D M-RoPE)
-    └── PoseRegressionHead           [MLP: hidden_dim → 9D]
 
 Training strategy:
   - Each SPAR entry = one scene with N images
-  - Prompt inserts one <pose> token per ordered pair (i→j), i≠j  → A(N,2) tokens
-    e.g. N=2: 2 tokens (0→1, 1→0); N=3: 6 tokens (all permutations)
-  - Hidden state at each <pose> token → PoseRegressionHead → (6D rot, 3D trans)
-  - Loss = geodesic rotation loss + L1 translation loss
+    - Prompt uses images + question (no pairwise camera-language template)
+    - Supervision is LM answer loss (with optional xyz conditioning in RoPE)
 
 Coordinate convention:
-  - Predicts T_{i→j} = relative_transforms[i, j] from the .npz GT files
-  - T = [R | t; 0 | 1],  parameterised as 6D-rotation + 3D-translation
+    - For non-vanilla mode, per-patch xyz is used in vision-token M-RoPE
+    - For --relative mode, coordinates are transformed per query frame
 
 Usage:
   python train_correspondence.py \\
@@ -612,7 +609,7 @@ def _save_checkpoint(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="LoRA fine-tuning of SpaForConditionalGeneration "
-                    "for relative camera pose prediction."
+                    "for answer prediction with optional 4D M-RoPE spatial conditioning."
     )
     p.add_argument(
         "--model_path",

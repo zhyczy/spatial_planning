@@ -663,6 +663,58 @@ class MindCube_Train_Dataset_Relative(Dataset):
         }
 
 
+class MindCube_Train_Dataset_Rotation(MindCube_Train_Dataset_Coord):
+    """
+    Extends MindCube_Train_Dataset_Coord with camera-pose data needed for
+    the two-pass RotationModel.
+
+    Additional items returned in each batch:
+      cam_pos_frame0  (3,)    float32 — first-frame camera position in world
+      gt_rotation     (3, 3)  float32 — world-to-camera rotation of frame 0
+                              i.e. R_w2c = poses[0][:3, :3].T
+                              (inverse = transpose for orthogonal matrices)
+
+    If camera_pose.npy is missing for frame 0, cam_pos_frame0 is zeros and
+    gt_rotation is the identity matrix.
+    """
+
+    def __getitem__(self, idx):
+        batch = super().__getitem__(idx)
+        entry, sample_dir = self.samples[idx]
+
+        view_dirs = sorted(
+            d for d in os.listdir(sample_dir) if d.startswith("view_")
+        )
+
+        # Load first-frame camera pose (camera-to-world, 4×4)
+        cam_pos_frame0 = torch.zeros(3, dtype=torch.float32)
+        gt_rotation    = torch.eye(3,  dtype=torch.float32)
+
+        first_view = view_dirs[0] if view_dirs else None
+        if first_view is not None:
+            cp_path = os.path.join(sample_dir, first_view, "camera_pose.npy")
+            if os.path.exists(cp_path):
+                try:
+                    pose = np.load(cp_path).astype(np.float32)  # (4, 4) C2W
+                    cam_pos_frame0 = torch.tensor(
+                        pose[:3, 3], dtype=torch.float32
+                    )
+                    # World-to-camera rotation:
+                    #   R_w2c = inv(C2W)[:3, :3] = C2W[:3, :3].T
+                    #   (rotation matrices: inv = transpose)
+                    gt_rotation = torch.tensor(
+                        pose[:3, :3].T, dtype=torch.float32
+                    )
+                except Exception as exc:
+                    self.log.debug(
+                        f"camera_pose load failed for {sample_dir}/{first_view}: {exc}"
+                    )
+
+        batch["cam_pos_frame0"] = cam_pos_frame0
+        batch["gt_rotation"]    = gt_rotation
+        return batch
+
+
 class MindCube_Train_Dataset_Coord_Polar(MindCube_Train_Dataset_Coord):
     """
     Variant of MindCube_Train_Dataset_Coord where image_xyz_hires is

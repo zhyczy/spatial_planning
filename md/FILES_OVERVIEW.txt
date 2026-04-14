@@ -1,0 +1,289 @@
+================================================================================
+CameraMovementRL - 文件概览
+================================================================================
+
+spatial_planning/
+│
+├── 📄 camera_movement_rl.py ⭐ [核心实现]
+│   ├─ CamTokenRotationHead: 6D旋转预测MLP
+│   ├─ CameraMovementRL: 主模型类
+│   │  ├─ __init__: 初始化可学习Cam Token、Encoder、旋转头
+│   │  ├─ forward: 四步前向传播
+│   │  ├─ get_trainable_params: 返回可训练参数
+│   │  └─ print_trainable_parameters: 参数统计
+│   └─ build_model_from_checkpoint: 从LoRA检查点加载
+│
+├── 📄 train_camera_movement.py [训练脚本框架]
+│   ├─ main(): 主训练循环
+│   ├─ parse_args(): 命令行参数解析
+│   ├─ DDP支持: 分布式训练
+│   ├─ 优化器和调度器
+│   └─ 检查点保存 [待实现]
+│
+├── 📄 test_camera_movement.py [验证脚本]
+│   ├─ 模型加载测试
+│   ├─ Forward pass验证
+│   ├─ 正交性检验: |R^T R - I| < 1e-6
+│   ├─ 行列式检验: det(R) ≈ 1
+│   └─ 旋转矩阵SO(3)约束验证
+│
+├── 📚 CAMERA_MOVEMENT_README.md [详细文档]
+│   ├─ 概述和四步设计
+│   ├─ 文件说明
+│   ├─ 使用方法和代码示例
+│   ├─ 模型架构细节
+│   ├─ 可学习参数统计
+│   ├─ 6D旋转表示优势
+│   ├─ 损失函数说明
+│   ├─ 训练建议
+│   ├─ 故障排除
+│   └─ 参考文献
+│
+├── 📘 QUICKSTART.md [快速开始]
+│   ├─ 文件清单（30秒概览）
+│   ├─ 3步快速使用（加载→前向→验证）
+│   ├─ 模型结构图
+│   ├─ 可配置参数表
+│   ├─ 验证安装步骤
+│   ├─ 关键设计决策
+│   ├─ 训练检查清单
+│   ├─ 常见问题解答
+│   └─ 下一步建议
+│
+├── 📊 IMPLEMENTATION_SUMMARY.md [实现总结]
+│   ├─ 项目概述
+│   ├─ 文件详细清单
+│   ├─ 架构细节和流程图
+│   ├─ 参数统计
+│   ├─ 关键设计选择
+│   ├─ 最小化示例
+│   ├─ 依赖关系图
+│   ├─ 验证清单
+│   ├─ 下一步规划
+│   └─ 技术参数速查
+│
+└── 📋 FILES_OVERVIEW.txt [本文件]
+    └─ 文件结构和导航指南
+
+================================================================================
+快速导航
+================================================================================
+
+📖 我应该先读什么?
+  ① QUICKSTART.md (2分钟) - 快速了解
+  ② test_camera_movement.py 运行 (1分钟) - 验证工作
+  ③ CAMERA_MOVEMENT_README.md (10分钟) - 深入理解
+  ④ IMPLEMENTATION_SUMMARY.md (15分钟) - 完整细节
+
+🚀 我想快速开始使用
+  → 看 QUICKSTART.md 的"快速使用"部分
+  → 运行 python test_camera_movement.py
+  → 复制"最小化示例"代码
+
+🔍 我想理解设计细节
+  → 看 CAMERA_MOVEMENT_README.md 的"四步设计"
+  → 查看 IMPLEMENTATION_SUMMARY.md 的"架构细节"
+  → 阅读源码 camera_movement_rl.py
+
+🏋️ 我想开始训练
+  → 看 CAMERA_MOVEMENT_README.md 的"训练建议"
+  → 使用 train_camera_movement.py 框架
+  → 实现数据加载和完整训练循环
+
+🐛 我遇到了问题
+  → 查看 CAMERA_MOVEMENT_README.md 的"故障排除"
+  → 查看 QUICKSTART.md 的"常见问题"
+  → 检查 test_camera_movement.py 的验证逻辑
+
+================================================================================
+核心功能映射
+================================================================================
+
+需求                          文件                      代码位置
+─────────────────────────────────────────────────────────────────────────────
+加载冻结的MLLM               camera_movement_rl.py    build_model_from_checkpoint()
+四步前向传播                 camera_movement_rl.py    CameraMovementRL.forward()
+6D→3×3旋转转换              src/models/              rot6d_to_rotmat()
+                             correspondence_llm.py
+旋转损失计算                 src/loss/                geodesic_loss()
+                             cam_loss.py
+训练循环框架                 train_camera_movement.py main()
+模型验证                     test_camera_movement.py  (完整验证脚本)
+
+================================================================================
+参数和配置
+================================================================================
+
+模型参数                        默认值        备注
+─────────────────────────────────────────────────────────────────────────────
+hidden_dim                     2560        LLM隐层维度 (Qwen3.5-4B)
+d_encoder                      512         Transformer Encoder维度
+encoder_nhead                  8           注意力头数
+encoder_depth                  2           Encoder层数
+dropout                        0.05        Dropout率
+
+训练参数
+─────────────────────────────────────────────────────────────────────────────
+learning_rate                  1e-4        建议范围 [1e-5, 5e-4]
+weight_decay                   0.0         L2正则化强度
+warmup_steps                   0           预热步数（可选）
+batch_size                     1           当前固定为1
+num_epochs                     10          总训练轮数
+
+================================================================================
+文件依赖关系
+================================================================================
+
+camera_movement_rl.py
+  ├─ src.models.SpaForConditionalGeneration (冻结基础模型)
+  ├─ src.models.correspondence_llm.rot6d_to_rotmat (旋转转换)
+  ├─ src.loss.cam_loss.geodesic_loss (损失函数)
+  ├─ transformers (AutoConfig, AutoProcessor)
+  ├─ peft (PeftConfig, PeftModel)
+  └─ torch (核心)
+
+train_camera_movement.py
+  └─ camera_movement_rl.py (模型实现)
+
+test_camera_movement.py
+  ├─ camera_movement_rl.py (模型实现)
+  └─ torch (验证)
+
+================================================================================
+代码统计
+================================================================================
+
+文件                          行数    功能数    类数
+─────────────────────────────────────────────────────────────────────────────
+camera_movement_rl.py         332     3         2      (核心实现)
+train_camera_movement.py      250+    2         -      (框架)
+test_camera_movement.py       80      1         -      (验证)
+CAMERA_MOVEMENT_README.md     250     -         -      (文档)
+QUICKSTART.md                 150     -         -      (指南)
+IMPLEMENTATION_SUMMARY.md     400     -         -      (总结)
+
+================================================================================
+首次使用步骤
+================================================================================
+
+步骤1: 理解设计 (5分钟)
+  □ 阅读 QUICKSTART.md 前两节
+  □ 了解四步设计概念
+
+步骤2: 验证安装 (2分钟)
+  □ 运行 python test_camera_movement.py
+  □ 确认 "✓ All checks passed!"
+
+步骤3: 加载模型 (1分钟)
+  □ 复制 QUICKSTART.md 中的加载代码
+  □ 测试能否成功加载
+
+步骤4: 前向传播 (1分钟)
+  □ 创建输入张量
+  □ 运行前向传播
+  □ 检查输出形状
+
+步骤5: 验证旋转矩阵 (2分钟)
+  □ 验证正交性: |R^T R - I|
+  □ 验证行列式: det(R) ≈ 1
+
+步骤6: 理解架构 (15分钟)
+  □ 阅读 CAMERA_MOVEMENT_README.md
+  □ 阅读 camera_movement_rl.py 源码
+  □ 查看 IMPLEMENTATION_SUMMARY.md 的架构图
+
+步骤7: 开始训练 (可选)
+  □ 实现数据加载
+  □ 使用 train_camera_movement.py 框架
+  □ 开始训练循环
+
+================================================================================
+常用命令
+================================================================================
+
+# 验证模型
+python test_camera_movement.py
+
+# 查看可训练参数
+python -c "
+from camera_movement_rl import build_model_from_checkpoint
+model, _ = build_model_from_checkpoint('train_records/coordinate_no_cam_mindcube/step_550')
+model.print_trainable_parameters()
+"
+
+# 训练 (框架已准备，需实现数据加载)
+python train_camera_movement.py \
+    --adapter_path train_records/coordinate_no_cam_mindcube/step_550 \
+    --output_dir checkpoints/camera_movement_rl \
+    --num_epochs 10 \
+    --learning_rate 1e-4
+
+# 检查模型大小
+python -c "
+import torch
+from camera_movement_rl import build_model_from_checkpoint
+model, _ = build_model_from_checkpoint('train_records/coordinate_no_cam_mindcube/step_550')
+total = sum(p.numel() for p in model.parameters())
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f'Total: {total/1e9:.2f}B, Trainable: {trainable/1e6:.2f}M')
+"
+
+================================================================================
+推荐学习路径
+================================================================================
+
+初学者:
+  QUICKSTART.md
+    → test_camera_movement.py
+      → CAMERA_MOVEMENT_README.md (四步设计部分)
+        → camera_movement_rl.py (源码阅读)
+
+进阶用户:
+  IMPLEMENTATION_SUMMARY.md (完整总结)
+    → 源码深度阅读
+      → 修改参数和实验
+
+================================================================================
+相关资源
+================================================================================
+
+第一阶段训练:
+  - train_coordinate.py: 第一阶段MLLM训练
+  - 输出: train_records/coordinate_no_cam_mindcube/step_550 ✓ (已用)
+
+基础模型:
+  - checkpoints/Qwen3.5-4B: Qwen3.5-VL基础模型
+  - src/models/spa_emb.py: SpaForConditionalGeneration实现
+
+损失和工具:
+  - src/loss/cam_loss.py: 测地线损失等
+  - src/models/correspondence_llm.py: rot6d_to_rotmat转换
+
+数据处理:
+  - src/dataset/: 数据加载器 (train_camera_movement.py 需要集成)
+
+================================================================================
+更新日志
+================================================================================
+
+2026-04-13 v1.0 初始发布
+  ✓ camera_movement_rl.py: 完整模型实现
+  ✓ train_camera_movement.py: 训练框架
+  ✓ test_camera_movement.py: 验证脚本
+  ✓ CAMERA_MOVEMENT_README.md: 详细文档
+  ✓ QUICKSTART.md: 快速指南
+  ✓ IMPLEMENTATION_SUMMARY.md: 总结
+
+================================================================================
+支持和反馈
+================================================================================
+
+如有问题:
+  1. 查看对应文档的"常见问题"部分
+  2. 阅读源代码注释
+  3. 参考 test_camera_movement.py 的验证逻辑
+  4. 查阅相关论文和参考资源
+
+================================================================================
+END OF FILE
+================================================================================

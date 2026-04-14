@@ -15,3 +15,7 @@ from .coordinate_llm import (
     CoordinatePlusModel,
     CoordinateModel,
 )
+from .rotation_llm import (
+    CameraTokenRotationEncoder,
+    RotationModel,
+)
