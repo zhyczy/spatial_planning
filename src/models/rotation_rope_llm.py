@@ -414,6 +414,7 @@ class RotationRoPEModel(nn.Module):
         image_xyz_hires:  list | None = None,        # list[k]: (llm_H*up, llm_W*up, 3)
         labels:           torch.Tensor | None = None,
         coord_scale:      float = 100.0,
+        use_rotation_enc: bool  = True,
         **kwargs,
     ):
         """Single-pass forward with differentiable RoPE.
@@ -448,8 +449,10 @@ class RotationRoPEModel(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         # ── Step 2: rotation encoder on merged inputs_embeds (detached) ──
+        # When use_rotation_enc is False (e.g. warm-up epoch), skip the
+        # encoder entirely: R stays None → rotated_xyz = image_xyz (identity).
         R = None
-        if image_xyz is not None and image_grid_thw is not None:
+        if use_rotation_enc and image_xyz is not None and image_grid_thw is not None:
             token_txyz_int = _build_token_txyz_int(
                 input_ids, self.image_token_id,
                 image_xyz, image_grid_thw, self.spatial_merge_size,

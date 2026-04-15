@@ -16,7 +16,7 @@
 #   --end       last step to evaluate       (default: 1000)
 #   --step      step stride                 (default: 50)
 #   --method    evaluation method           (default: coordinate)
-#               choices: baseline vanilla position_embedding coordinate coordinate_pose polar
+#               choices: baseline vanilla position_embedding coordinate polar rotation
 #   --datasets  comma-separated dataset list (default: mindcube,sat_real,spinbench,robospatial)
 #   --gpus      comma-separated GPU IDs     (default: all visible)
 #   --limit     truncate each dataset to N samples (debug / smoke test)
@@ -103,7 +103,7 @@ if [[ ! -d "$CKPT_DIR" ]]; then
     exit 1
 fi
 
-VALID_METHODS="baseline vanilla position_embedding coordinate coordinate_pose polar"
+VALID_METHODS="baseline vanilla position_embedding coordinate polar rotation"
 if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
     echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1

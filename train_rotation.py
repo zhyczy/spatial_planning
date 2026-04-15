@@ -268,7 +268,10 @@ def train(args: argparse.Namespace) -> None:
 
     # -- DDP -------------------------------------------------------------------
     if world_size > 1:
-        model  = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        # find_unused_parameters=True so the rotation_enc warm-up phase
+        # (epoch < begin_round) is allowed: rotation_enc is skipped in
+        # forward, so its params receive no grad, and DDP must tolerate that.
+        model  = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
         _model = model.module
     else:
         _model = model
@@ -422,6 +425,15 @@ def train(args: argparse.Namespace) -> None:
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
+        # Warm-up phase: skip rotation_enc for epoch < begin_round so the
+        # LoRA + coord_head learn against an identity rotation first.
+        use_rot_enc = epoch >= args.begin_round
+        if local_rank == 0:
+            log.info(
+                f"[epoch {epoch+1:02d}] use_rotation_enc={use_rot_enc} "
+                f"(begin_round={args.begin_round})"
+            )
+
         for step, batch in enumerate(train_loader):
 
             # -- move batch to device ------------------------------------------
@@ -461,14 +473,15 @@ def train(args: argparse.Namespace) -> None:
 
             # -- forward + loss ------------------------------------------------
             _, loss, loss_dict = model(
-                input_ids       = input_ids,
-                attention_mask  = attention_mask,
-                pixel_values    = pixel_values,
-                image_grid_thw  = image_grid_thw,
-                image_xyz       = image_xyz,
-                image_xyz_hires = image_xyz_hires,
-                labels          = labels,
-                coord_scale     = args.coord_scale,
+                input_ids        = input_ids,
+                attention_mask   = attention_mask,
+                pixel_values     = pixel_values,
+                image_grid_thw   = image_grid_thw,
+                image_xyz        = image_xyz,
+                image_xyz_hires  = image_xyz_hires,
+                labels           = labels,
+                coord_scale      = args.coord_scale,
+                use_rotation_enc = use_rot_enc,
             )
 
             if loss is None:
@@ -584,14 +597,15 @@ def train(args: argparse.Namespace) -> None:
 
                             with torch.inference_mode():
                                 _, loss, loss_dict = model(
-                                    input_ids       = t_ids,
-                                    attention_mask  = t_mask,
-                                    pixel_values    = t_pv,
-                                    image_grid_thw  = t_thw,
-                                    image_xyz       = t_xyz,
-                                    image_xyz_hires = t_xyz_h,
-                                    labels          = t_labels,
-                                    coord_scale     = args.coord_scale,
+                                    input_ids        = t_ids,
+                                    attention_mask   = t_mask,
+                                    pixel_values     = t_pv,
+                                    image_grid_thw   = t_thw,
+                                    image_xyz        = t_xyz,
+                                    image_xyz_hires  = t_xyz_h,
+                                    labels           = t_labels,
+                                    coord_scale      = args.coord_scale,
+                                    use_rotation_enc = use_rot_enc,
                                 )
                             if loss is None:
                                 continue
@@ -702,6 +716,13 @@ def parse_args() -> argparse.Namespace:
         default=os.path.join(_ROOT, "checkpoints/spa_rotation"),
     )
     p.add_argument("--epochs",      type=int,   default=3)
+    p.add_argument(
+        "--begin_round", type=int, default=1,
+        help="Epoch index (0-based) at which to start training the "
+             "CameraTokenRotationEncoder.  Earlier epochs run with R=I "
+             "(identity rotation).  Default 1 = skip epoch 0, enable from "
+             "epoch 1 onwards.",
+    )
     p.add_argument("--lr",              type=float, default=2e-4,
                    help="learning rate for LoRA + coord_head group")
     p.add_argument("--rotation_enc_lr", type=float, default=2e-4,

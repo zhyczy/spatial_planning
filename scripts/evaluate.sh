@@ -10,7 +10,7 @@
 #   bash scripts/evaluate.sh [options]
 #
 # Options:
-#   --method    baseline | vanilla | position_embedding | coordinate | polar | both
+#   --method    baseline | vanilla | position_embedding | coordinate | polar | rotation | both
 #               (default: both = baseline + coordinate)
 #   --ckpt      path to SPA LoRA checkpoint dir
 #               (required when method != baseline)
@@ -33,6 +33,8 @@
 #   position_embedding — SPA LoRA + 4D M-RoPE, no <coord> tokens
 #   coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens, no_cam variant (Cartesian)
 #   polar              — SPA LoRA + 4D M-RoPE, no <coord> tokens (polar r/θ/α)
+#   rotation           — SPA LoRA + 4D M-RoPE + rotation_enc + coord head
+#                        (predicts canonical R; xyz rotated before RoPE/MAE)
 #   both               — baseline + coordinate
 #
 # Examples:
@@ -130,7 +132,7 @@ done
 # Validate arguments
 # =============================================================================
 
-VALID_METHODS="baseline vanilla position_embedding coordinate polar both"
+VALID_METHODS="baseline vanilla position_embedding coordinate polar rotation both"
 if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
     echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1

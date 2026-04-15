@@ -79,6 +79,8 @@ JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
 MINDCUBE_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
 
 EPOCHS=6
+BEGIN_ROUND=1           # epoch index (0-based) to start training rotation_enc
+                        # epochs < BEGIN_ROUND run with R=I (identity rotation)
 LR=2e-4                 # LoRA + coord_head learning rate
 ROTATION_ENC_LR=2e-4    # rotation_enc (train-from-scratch) learning rate
 LORA_CLIP=1.0           # grad-norm clip for LoRA + coord_head group
@@ -88,8 +90,8 @@ MAX_IMAGES=4
 GRAD_ACCUM=8
 NUM_WORKERS=4
 
-SAVE_STEPS=200
-EVAL_STEPS=100
+SAVE_STEPS=50
+EVAL_STEPS=50
 
 # Rotation encoder architecture
 # d_model = ROT_NHEAD × mllm_head_dim (e.g. 4 × 256 = 1024 for Qwen3.5-4B)
@@ -152,6 +154,7 @@ $TORCHRUN \
     --mindcube_results_dir   "$MINDCUBE_RESULTS_DIR"   \
     --output_dir             "$OUTPUT_DIR"             \
     --epochs                 "$EPOCHS"                 \
+    --begin_round            "$BEGIN_ROUND"            \
     --lr                     "$LR"                     \
     --rotation_enc_lr        "$ROTATION_ENC_LR"        \
     --lora_clip              "$LORA_CLIP"              \

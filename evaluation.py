@@ -24,8 +24,17 @@ Multi-method QA evaluation:
 
   polar
       Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA  (trained with --polar)
-      Input : images + question 
+      Input : images + question
       3D pos: precomputed XYZ → spherical (ρ, θ, α) → 4D M-RoPE on image patches
+
+  rotation
+      Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
+              + CameraTokenRotationEncoder (predicts canonical R)
+              + DepthPredictionTransformer (coord head in rotated frame)
+      Input : images + question  (no pose sentences, no <coord> tokens; no_cam)
+      3D pos: R = rotation_enc(merged_embeds, token_txyz_int);
+              rotated_xyz = R @ xyz_world → 4D M-RoPE on image patches
+      Coord : predicted in rotated frame; GT = R @ gt_xyz before MAE
 
   both   → baseline + coordinate  (primary comparison)
 
@@ -86,7 +95,15 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 from peft import PeftModel
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
-from src.models import SpaForConditionalGeneration, DepthPredictionTransformer
+from src.models import (
+    SpaForConditionalGeneration,
+    DepthPredictionTransformer,
+    CameraTokenRotationEncoder,
+)
+from src.models.rotation_llm import (
+    _build_token_txyz_int,
+    _apply_rotation_to_xyz,
+)
 from src.dataset import load_testing_dataset, chunk_dataset
 
 # ── sys.path: ensure spatial_planning/ root is importable ──────────────────
@@ -415,6 +432,123 @@ def _load_coord_head(
         f"(hidden_dim={hidden_dim}, d_model={d_model}, upscale={upscale_factor})"
     )
     return coord_head
+
+
+def _load_rotation_enc(
+    ckpt_path: str,
+    spa_model: Any,
+    device: str,
+) -> Optional[CameraTokenRotationEncoder]:
+    """Load CameraTokenRotationEncoder from checkpoint directory.
+
+    Infers architecture (hidden_dim, d_model, dim_feedforward, num_layers) from
+    the saved weight shapes. `nhead` is derived from d_model / mllm_head_dim.
+    Reuses the merged SPA model's SpaTextRotaryEmbedding so inv_freq and
+    mrope_section are byte-identical to training.
+    """
+    logger = logging.getLogger(__name__)
+    ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=False)
+    rot_path = ckpt_dir / "rotation_enc.pt"
+    if not rot_path.exists():
+        logger.info(f"[rotation] rotation_enc.pt not found in {ckpt_dir} — skipping.")
+        return None
+
+    state = torch.load(str(rot_path), map_location="cpu", weights_only=True)
+
+    # Infer architecture from state dict shapes
+    d_model = int(state["cam_token"].shape[1])
+    hidden_dim = int(state["input_proj.weight"].shape[1])
+    dim_feedforward = int(state["layers.0.ffn.0.weight"].shape[0])
+    num_layers = len({k.split(".")[1] for k in state if k.startswith("layers.")})
+
+    # Retrieve rotary_emb and head_dim from the merged spa_model
+    spa_inner = spa_model.model  # SpaModel
+    rotary_emb = spa_inner.language_model.rotary_emb  # SpaTextRotaryEmbedding
+    text_config = spa_model.config.text_config
+    mllm_head_dim = getattr(text_config, "head_dim", None) or (
+        text_config.hidden_size // text_config.num_attention_heads
+    )
+    if d_model % mllm_head_dim != 0:
+        raise ValueError(
+            f"[rotation] d_model={d_model} not divisible by mllm_head_dim={mllm_head_dim}"
+        )
+    nhead = d_model // mllm_head_dim
+
+    rotation_enc = CameraTokenRotationEncoder(
+        hidden_dim=hidden_dim,
+        mllm_head_dim=mllm_head_dim,
+        rope_emb=rotary_emb,
+        nhead=nhead,
+        dim_feedforward=dim_feedforward,
+        num_layers=num_layers,
+    )
+    # rope_emb's inv_freq is a non-persistent buffer shared with the MLLM;
+    # allow strict=False so the missing inv_freq keys don't fail the load.
+    missing, unexpected = rotation_enc.load_state_dict(state, strict=False)
+    if unexpected:
+        logger.warning(f"[rotation] unexpected keys when loading rotation_enc: {unexpected}")
+    rotation_enc = rotation_enc.to(device).to(torch.bfloat16).eval()
+    logger.info(
+        f"[rotation] CameraTokenRotationEncoder loaded from {rot_path} "
+        f"(hidden_dim={hidden_dim}, d_model={d_model}, nhead={nhead}, "
+        f"dim_ff={dim_feedforward}, num_layers={num_layers})"
+    )
+    return rotation_enc
+
+
+def _compute_rotation_R(
+    spa_model: Any,
+    rotation_enc: CameraTokenRotationEncoder,
+    inputs: Dict[str, Any],
+    image_xyz: List[torch.Tensor],
+    image_token_id: int,
+    spatial_merge_size: int,
+    coord_scale: float,
+) -> Optional[torch.Tensor]:
+    """Compute rotation R via a partial forward: text embed + vision scatter → rotation_enc.
+
+    Mirrors RotationRoPEModel.forward Steps 1-2 but without gradients.
+    Returns the (3, 3) float rotation matrix, or None if required inputs are missing.
+    """
+    device = next(spa_model.parameters()).device
+    inputs_dev = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in inputs.items()
+    }
+    input_ids = inputs_dev["input_ids"]
+    pixel_values = inputs_dev.get("pixel_values")
+    image_grid_thw = inputs_dev.get("image_grid_thw")
+    if pixel_values is None or image_grid_thw is None:
+        return None
+
+    spa_inner = spa_model.model  # SpaModel (post LoRA merge)
+
+    with torch.no_grad():
+        # Step 1: merged inputs_embeds (text embed + vision encoder scatter)
+        inputs_embeds = spa_inner.get_input_embeddings()(input_ids)
+        image_outputs = spa_inner.get_image_features(
+            pixel_values, image_grid_thw, return_dict=True,
+        )
+        image_embeds = image_outputs.pooler_output
+        if isinstance(image_embeds, (list, tuple)):
+            image_embeds = torch.cat(list(image_embeds), dim=0)
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        # Step 2: rotation encoder
+        xyz_on_device = [x.to(device=device, dtype=torch.float32) for x in image_xyz]
+        token_txyz_int = _build_token_txyz_int(
+            input_ids,
+            image_token_id,
+            xyz_on_device,
+            image_grid_thw,
+            spatial_merge_size,
+            coord_scale,
+        )
+        R = rotation_enc(inputs_embeds, token_txyz_int)
+
+    return R
 
 
 def _get_coord_predictions(
@@ -1248,6 +1382,8 @@ def evaluate(
       coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens, no_cam variant (Cartesian)
       polar              — SPA LoRA + 4D M-RoPE, XYZ → spherical (ρ,θ,α) for RoPE;
                        prompt has no <coord> tokens; matches --polar in train_correspondence.py
+      rotation           — SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder
+                       + coord head (rotated frame); matches train_rotation.py
       both               — baseline + coordinate
 
     Returns dict mapping method name → list of result dicts.
@@ -1259,7 +1395,11 @@ def evaluate(
     run_position_embedding = method == "position_embedding"
     run_coordinate = method in ("coordinate", "both")
     run_polar = method == "polar"
-    run_spa = run_vanilla or run_position_embedding or run_coordinate or run_polar
+    run_rotation = method == "rotation"
+    run_spa = (
+        run_vanilla or run_position_embedding or run_coordinate
+        or run_polar or run_rotation
+    )
 
     # Lazy-load only what we need
     baseline_model = baseline_proc = None
@@ -1271,6 +1411,7 @@ def evaluate(
 
     image_token_id_val: Optional[int] = None
     spa_coord_head: Optional[DepthPredictionTransformer] = None
+    spa_rotation_enc: Optional[CameraTokenRotationEncoder] = None
 
     if run_spa:
         if correspondence_ckpt is None:
@@ -1294,29 +1435,36 @@ def evaluate(
         if isinstance(_iid, int) and _iid != spa_proc.tokenizer.unk_token_id:
             image_token_id_val = _iid
 
-        # Load DepthPredictionTransformer if this is a coordinate checkpoint
-        if run_coordinate:
+        # Load DepthPredictionTransformer for coordinate / rotation checkpoints
+        if run_coordinate or run_rotation:
             spa_coord_head = _load_coord_head(correspondence_ckpt, device)
 
+        # Load CameraTokenRotationEncoder for rotation checkpoint
+        if run_rotation:
+            spa_rotation_enc = _load_rotation_enc(correspondence_ckpt, spa_model, device)
+
     # Determine which SPA variants to run.
-    # Tuple: (method_name, use_coord, is_polar)
+    # Tuple: (method_name, use_coord, is_polar, is_rotation)
     # vanilla           : no <coord> tokens, 3D RoPE
     # position_embedding: no <coord> tokens, 4D Cartesian RoPE
     # coordinate (no_cam): <coord> tokens, 4D Cartesian RoPE
     # polar             : no <coord> tokens, 4D spherical RoPE (polar=True)
-    spa_variants: List[Tuple[str, bool, bool]] = []
+    # rotation          : no <coord> tokens, 4D Cartesian RoPE on rotated xyz
+    spa_variants: List[Tuple[str, bool, bool, bool]] = []
     if run_vanilla:
-        spa_variants.append(("vanilla", False, False))
+        spa_variants.append(("vanilla", False, False, False))
     if run_position_embedding:
-        spa_variants.append(("position_embedding", False, False))
+        spa_variants.append(("position_embedding", False, False, False))
     if run_coordinate:
-        spa_variants.append(("coordinate", True, False))
+        spa_variants.append(("coordinate", True, False, False))
     if run_polar:
-        spa_variants.append(("polar", False, True))
+        spa_variants.append(("polar", False, True, False))
+    if run_rotation:
+        spa_variants.append(("rotation", False, False, True))
 
     active_methods = (
         (["baseline"] if run_baseline else [])
-        + [name for name, _, __ in spa_variants]
+        + [name for name, _, __, ___ in spa_variants]
     )
     results_map: Dict[str, List[Dict]] = {m: [] for m in active_methods}
 
@@ -1340,15 +1488,47 @@ def evaluate(
                 results_map["baseline"].append(_error_result(item, exc, "baseline"))
 
         # ---- SPA variants ----
-        for spa_method_name, use_coord, is_polar in spa_variants:
+        for spa_method_name, use_coord, is_polar, is_rotation in spa_variants:
             inputs, prompt, image_xyz = prepare_batch_spa(
                 item, spa_proc,
                 spatial_merge_size, use_coord, coord_scale,
                 thinking=thinking,
-                load_xyz=is_polar,  # polar needs xyz for RoPE but no coord sentences
+                # polar/rotation need xyz for RoPE even without coord sentences
+                load_xyz=(is_polar or is_rotation),
             )
+
+            # ---- Rotation: compute R and rotate image_xyz (matches train_rotation.py) ----
+            # GT used for coord MAE must also be rotated (training uses R @ gt_xyz).
+            xyz_for_rope = image_xyz
+            xyz_for_mae = image_xyz
+            if (
+                is_rotation
+                and spa_rotation_enc is not None
+                and image_xyz is not None
+                and image_token_id_val is not None
+            ):
+                try:
+                    R_mat = _compute_rotation_R(
+                        spa_model, spa_rotation_enc, inputs, image_xyz,
+                        image_token_id_val, spatial_merge_size, coord_scale,
+                    )
+                    if R_mat is not None:
+                        rotated = _apply_rotation_to_xyz(
+                            R_mat,
+                            [x.to(next(spa_model.parameters()).device) for x in image_xyz],
+                        )
+                        xyz_for_rope = rotated
+                        # Keep xyz_for_mae on CPU so it matches coord_head
+                        # predictions (which _get_coord_predictions returns on CPU).
+                        xyz_for_mae = [r.detach().cpu() for r in rotated]
+                except Exception as re:
+                    logger.warning(
+                        f"[rotation] rotation_enc failed for idx="
+                        f"{item.get('index')}: {re}"
+                    )
+
             output = run_inference_spa(
-                inputs, image_xyz, spa_model, spa_proc,
+                inputs, xyz_for_rope, spa_model, spa_proc,
                 max_new_tokens, coord_scale,
                 vanilla=use_vanilla_arch,
                 polar=is_polar,
@@ -1356,24 +1536,24 @@ def evaluate(
             result = _make_result(item, output, prompt, spa_method_name,
                                     thinking=thinking)
 
-            # ---- DepthPredictionTransformer evaluation (coordinate method only) ----
+            # ---- DepthPredictionTransformer evaluation (coordinate + rotation) ----
             if (
-                use_coord
+                (use_coord or is_rotation)
                 and spa_coord_head is not None
                 and image_token_id_val is not None
-                and image_xyz is not None
+                and xyz_for_rope is not None
             ):
                 try:
                     preds = _get_coord_predictions(
                         spa_model, inputs,
                         image_token_id_val, spa_coord_head,
-                        spatial_merge_size, image_xyz, coord_scale,
+                        spatial_merge_size, xyz_for_rope, coord_scale,
                     )
                     if preds is not None:
-                        result["coord_mae"] = _compute_coord_mae(preds, image_xyz)
+                        result["coord_mae"] = _compute_coord_mae(preds, xyz_for_mae)
                 except Exception as ce:
                     logger.warning(
-                        f"[coordinate] coord_head failed for idx="
+                        f"[{spa_method_name}] coord_head failed for idx="
                         f"{item.get('index')}: {ce}"
                     )
 
@@ -1523,7 +1703,7 @@ def main() -> None:
     # ── method ────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--method", type=str, default="both",
-        choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar", "both"],
+        choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar", "rotation", "both"],
         help=(
             "Which method(s) to run. "
             "baseline=stock Qwen3.5-VL; "
@@ -1531,6 +1711,7 @@ def main() -> None:
             "position_embedding=SPA LoRA + 4D M-RoPE, prompt has no <coord> tokens; "
             "coordinate=SPA LoRA + 4D M-RoPE + <coord> tokens (no_cam, Cartesian); "
             "polar=SPA LoRA + 4D M-RoPE, XYZ→spherical for RoPE, prompt has no <coord> tokens; "
+            "rotation=SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder (canonical R) + coord head; "
             "both=baseline + coordinate."
         ),
     )
@@ -1699,6 +1880,7 @@ def main() -> None:
         "position_embedding": args.method == "position_embedding",
         "coordinate":         args.method in ("coordinate", "both"),
         "polar":              args.method == "polar",
+        "rotation":           args.method == "rotation",
     }
     all_results: Dict[str, List[Dict]] = {}
     for mname, active in _method_names.items():
@@ -1712,6 +1894,7 @@ def main() -> None:
         "position_embedding": "position_embedding (SPA LoRA + 4D M-RoPE)",
         "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + <coord>, no_cam, Cartesian)",
         "polar":              "polar              (SPA LoRA + 4D M-RoPE, XYZ→spherical, no <coord>)",
+        "rotation":           "rotation           (SPA LoRA + 4D M-RoPE + rotation_enc + coord head)",
     }
     _metrics_fn = compute_metrics_robospatial if args.dataset == "robospatial" else compute_metrics
     for mname, mresults in all_results.items():
@@ -1732,6 +1915,7 @@ def main() -> None:
     _compare_pairs = [
         ("baseline", "coordinate"),
         ("baseline", "polar"),
+        ("baseline", "rotation"),
         ("baseline", "position_embedding"),
         ("baseline", "vanilla"),
     ]
