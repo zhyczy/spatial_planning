@@ -72,6 +72,7 @@ from src.models import (
 from src.models.spa_emb import SpaTextRotaryEmbedding
 from src.dataset import (
     MindCube_Train_Dataset_Rotation,
+    SAT_Train_Dataset_Rotation,
     Eval_Dataset_Coord,
 )
 
@@ -277,18 +278,32 @@ def train(args: argparse.Namespace) -> None:
         _model = model
 
     # -- dataset / loader ------------------------------------------------------
-    train_dataset = MindCube_Train_Dataset_Rotation(
-        args.json_path,
-        args.mindcube_results_dir,
-        processor,
-        None,
-        log,
-        max_images         = args.max_images,
-        spatial_merge_size = spatial_merge_size,
-        coord_upscale      = args.coord_upscale,
-        max_samples        = args.max_samples,
-        no_cam             = True,
-    )
+    if args.training_dataset == "mindcube":
+        train_dataset = MindCube_Train_Dataset_Rotation(
+            args.json_path,
+            args.results_dir,
+            processor,
+            None,
+            log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            coord_upscale      = args.coord_upscale,
+            max_samples        = args.max_samples,
+            no_cam             = True,
+        )
+    elif args.training_dataset == "sat":
+        train_dataset = SAT_Train_Dataset_Rotation(
+            args.json_path,
+            args.results_dir,
+            processor,
+            log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            coord_upscale      = args.coord_upscale,
+            max_samples        = args.max_samples,
+        )
+    else:
+        raise ValueError(f"Unknown --training_dataset: {args.training_dataset}")
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
                            rank=local_rank, shuffle=True)
@@ -371,6 +386,21 @@ def train(args: argparse.Namespace) -> None:
         f"@ lr={args.lr}, rotation_enc={len(rotation_enc_params)} params "
         f"@ lr={args.rotation_enc_lr}"
     )
+    log.info("=" * 72)
+    log.info(
+        f">>> begin_round = {args.begin_round}  "
+        f"(rotation_enc activates at epoch {args.begin_round}; "
+        f"epochs 0..{args.begin_round - 1} use R=I identity)"
+        if args.begin_round > 0
+        else f">>> begin_round = 0  (rotation_enc active from epoch 0)"
+    )
+    log.info(
+        f">>> no_coord    = {args.no_coord}  "
+        + ("(coord_loss + coord_head DISABLED for entire run)"
+           if args.no_coord
+           else "(coord_loss active)")
+    )
+    log.info("=" * 72)
     total_steps = args.epochs * len(train_loader) // args.grad_accum
     scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1)
@@ -482,6 +512,7 @@ def train(args: argparse.Namespace) -> None:
                 labels           = labels,
                 coord_scale      = args.coord_scale,
                 use_rotation_enc = use_rot_enc,
+                use_coord_loss   = not args.no_coord,
             )
 
             if loss is None:
@@ -606,6 +637,7 @@ def train(args: argparse.Namespace) -> None:
                                     labels           = t_labels,
                                     coord_scale      = args.coord_scale,
                                     use_rotation_enc = use_rot_enc,
+                                    use_coord_loss   = not args.no_coord,
                                 )
                             if loss is None:
                                 continue
@@ -704,12 +736,20 @@ def parse_args() -> argparse.Namespace:
         help="Path to Qwen3.5-VL checkpoint",
     )
     p.add_argument(
-        "--json_path",
-        default=os.path.join(_ROOT, "datasets/train/MindCube/MindCube_train.jsonl"),
+        "--training_dataset",
+        choices=["mindcube", "sat"],
+        default="sat",
+        help="Which training dataset class to use.",
     )
     p.add_argument(
-        "--mindcube_results_dir",
-        default=os.path.join(_ROOT, "datasets/train/MindCube/3d_results"),
+        "--json_path",
+        default=os.path.join(_ROOT, "datasets/train/SAT/train_36k.json"),
+        help="Path to train JSON/JSONL. mindcube → JSONL; sat → JSON list.",
+    )
+    p.add_argument(
+        "--results_dir",
+        default=os.path.join(_ROOT, "datasets/train/SAT/3d_results"),
+        help="Directory containing per-entry 3d_results/<id>/view_XXXX/.",
     )
     p.add_argument(
         "--output_dir",
@@ -746,6 +786,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--answer_weight", type=float, default=1.0)
     p.add_argument("--coord_weight",  type=float, default=1.0)
+    p.add_argument(
+        "--no_coord", action="store_true",
+        help="Disable the coordinate L1 loss and coord_head forward entirely. "
+             "Only the LM loss supervises training; coord_head receives no "
+             "gradient and is effectively frozen.",
+    )
     p.add_argument(
         "--coord_upscale", type=int, default=4,
         help="PixelShuffle upscale factor for the coordinate head.",

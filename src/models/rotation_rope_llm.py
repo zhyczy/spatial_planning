@@ -415,6 +415,7 @@ class RotationRoPEModel(nn.Module):
         labels:           torch.Tensor | None = None,
         coord_scale:      float = 100.0,
         use_rotation_enc: bool  = True,
+        use_coord_loss:   bool  = True,
         **kwargs,
     ):
         """Single-pass forward with differentiable RoPE.
@@ -503,10 +504,13 @@ class RotationRoPEModel(nn.Module):
         del logits2
 
         # ── Coordinate loss in rotated frame ─────────────────────────────
+        # When use_coord_loss is False (--no_coord), skip the coord head and
+        # its L1 loss entirely: coord_head receives no gradient, and AdamW's
+        # `p.grad is None: continue` skip keeps it untouched.
         coord_loss   = None
         coord_gt_src = image_xyz_hires if image_xyz_hires is not None else image_xyz
 
-        if coord_gt_src is not None and image_grid_thw is not None:
+        if use_coord_loss and coord_gt_src is not None and image_grid_thw is not None:
             if R is not None:
                 coord_gt = _apply_rotation_to_xyz(R.detach(), coord_gt_src)
             else:

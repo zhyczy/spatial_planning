@@ -13,18 +13,24 @@
 #
 # Usage:
 #   bash scripts/train_rotation.sh [num_gpus] [--max_samples N] \
-#       [--coord_weight W] [--coord_scale S]
+#       [--coord_weight W] [--coord_scale S] [--no_coord]
 #
 #   num_gpus        — first positional arg, number of GPUs (default: all)
 #   --max_samples N — truncate dataset to N entries (default: all)
 #   --coord_weight W— weight for coordinate L1 loss (default: 1.0)
 #   --coord_scale S — XYZ discretization multiplier, must match MLLM (default: 100.0)
+#   --no_coord      — disable coord loss / coord_head forward entirely
+#                     (LM-only training; rotation_enc still active when
+#                     epoch ≥ BEGIN_ROUND, R_trace still logged). Run name
+#                     and OUTPUT_DIR switch to the "rotation_no_coord_*"
+#                     variants automatically.
 #
 # Examples:
 #   bash scripts/train_rotation.sh                        # all GPUs
 #   bash scripts/train_rotation.sh 2                      # 2 GPUs
 #   bash scripts/train_rotation.sh 1 --max_samples 64    # debug run
 #   bash scripts/train_rotation.sh 4 --coord_weight 0.5  # lower coord loss weight
+#   bash scripts/train_rotation.sh 4 --no_coord          # LM-only, coord head frozen
 # =============================================================================
 
 set -euo pipefail
@@ -42,6 +48,7 @@ NPROC=""
 MAX_SAMPLES=""
 COORD_WEIGHT=""
 COORD_SCALE=""
+NO_COORD_CLI=false
 _positional=0
 
 while [ $# -gt 0 ]; do
@@ -52,6 +59,8 @@ while [ $# -gt 0 ]; do
             COORD_WEIGHT="$2"; shift 2 ;;
         --coord_scale)
             COORD_SCALE="$2"; shift 2 ;;
+        --no_coord)
+            NO_COORD_CLI=true; shift ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -75,12 +84,29 @@ fi
 # =============================================================================
 
 MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
-JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
-MINDCUBE_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
+TRAINING_DATASET="sat"   # {mindcube, sat} — JSON_PATH/RESULTS_DIR auto-sync below
+
+case "$TRAINING_DATASET" in
+    mindcube)
+        JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
+        RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
+        ;;
+    sat)
+        JSON_PATH="$SPATIAL_DIR/datasets/train/SAT/train_36k.json"
+        RESULTS_DIR="$SPATIAL_DIR/datasets/train/SAT/3d_results"
+        ;;
+    *)
+        echo "[ERR] Unknown TRAINING_DATASET: $TRAINING_DATASET" >&2
+        exit 1
+        ;;
+esac
 
 EPOCHS=6
 BEGIN_ROUND=1           # epoch index (0-based) to start training rotation_enc
                         # epochs < BEGIN_ROUND run with R=I (identity rotation)
+NO_COORD=$NO_COORD_CLI  # true → disable coord loss / coord_head entirely
+                        # (LM loss only; coord_head frozen by no-grad)
+                        # toggle via `--no_coord` CLI flag
 LR=2e-4                 # LoRA + coord_head learning rate
 ROTATION_ENC_LR=2e-4    # rotation_enc (train-from-scratch) learning rate
 LORA_CLIP=1.0           # grad-norm clip for LoRA + coord_head group
@@ -110,8 +136,13 @@ WANDB_ENTITY="actmrv"
 # Run name / output dir
 # =============================================================================
 
-RUN_NAME="rotation_mindcube"
-WANDB_RUN_NAME="rot_mindcube_r${LORA_RANK}_ep${EPOCHS}_cw${_COORD_WEIGHT}"
+if [ "$NO_COORD" = "true" ]; then
+    RUN_NAME="rotation_no_coord_${TRAINING_DATASET}"
+    WANDB_RUN_NAME="rot_no_coord_${TRAINING_DATASET}_r${LORA_RANK}_ep${EPOCHS}"
+else
+    RUN_NAME="rotation_${TRAINING_DATASET}"
+    WANDB_RUN_NAME="rot_${TRAINING_DATASET}_r${LORA_RANK}_ep${EPOCHS}_cw${_COORD_WEIGHT}"
+fi
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 # =============================================================================
@@ -124,7 +155,13 @@ mkdir -p "$OUTPUT_DIR"
 
 echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
+echo "[INFO] TRAINING_DATASET     = $TRAINING_DATASET"
+echo "[INFO] JSON_PATH            = $JSON_PATH"
+echo "[INFO] RESULTS_DIR          = $RESULTS_DIR"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
+echo "[INFO] EPOCHS               = $EPOCHS"
+echo "[INFO] BEGIN_ROUND          = $BEGIN_ROUND    (rotation_enc activates at this epoch)"
+echo "[INFO] NO_COORD             = $NO_COORD"
 echo "[INFO] coord_weight         = $_COORD_WEIGHT"
 echo "[INFO] coord_scale          = $_COORD_SCALE"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
@@ -139,6 +176,11 @@ if [ -n "$MAX_SAMPLES" ]; then
     MAX_SAMPLES_FLAG="--max_samples $MAX_SAMPLES"
 fi
 
+NO_COORD_FLAG=""
+if [ "$NO_COORD" = "true" ]; then
+    NO_COORD_FLAG="--no_coord"
+fi
+
 # =============================================================================
 # Run via torchrun (DDP)
 # =============================================================================
@@ -150,8 +192,9 @@ $TORCHRUN \
     --master_port    29501 \
     train_rotation.py \
     --model_path             "$MODEL_PATH"             \
+    --training_dataset       "$TRAINING_DATASET"       \
     --json_path              "$JSON_PATH"              \
-    --mindcube_results_dir   "$MINDCUBE_RESULTS_DIR"   \
+    --results_dir            "$RESULTS_DIR"            \
     --output_dir             "$OUTPUT_DIR"             \
     --epochs                 "$EPOCHS"                 \
     --begin_round            "$BEGIN_ROUND"            \
@@ -173,6 +216,7 @@ $TORCHRUN \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
-    $MAX_SAMPLES_FLAG
+    $MAX_SAMPLES_FLAG \
+    $NO_COORD_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

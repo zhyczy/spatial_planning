@@ -715,6 +715,214 @@ class MindCube_Train_Dataset_Rotation(MindCube_Train_Dataset_Coord):
         return batch
 
 
+_SAT_LETTERS = "ABCDEFGHIJ"
+
+
+class SAT_Train_Dataset_Rotation(Dataset):
+    """
+    SAT training dataset for RotationRoPEModel.
+
+    Reads a SAT train JSON (list, not JSONL) whose entries look like:
+        {
+            "database_idx": 127503,
+            "question_type": "obj_movement",
+            "question": "...",
+            "answer_choices": ["no objects moved", "sofa was ..."],
+            "correct_answer": "no objects moved",
+            "img_paths": ["./data/train/image_127503_0.png", ...]
+        }
+
+    3D layout expected under ``results_dir``:
+        <results_dir>/<database_idx>/view_XXXX/
+            image.png          — RGB image
+            pts3d.npy          — (H, W, 3) per-pixel 3D coords (world frame
+                                 = view_0000 camera frame)
+            mask.npy           — (H, W) bool valid mask
+            camera_pose.npy    — (4, 4) camera-to-world
+
+    Unlike MindCube_Train_Dataset_Coord, single-view samples (N=1) are
+    allowed: SAT has both single- and multi-view entries. Camera-pair
+    pose sentences are always suppressed (``no_cam=True`` in spirit).
+
+    Returns the same per-item fields as MindCube_Train_Dataset_Rotation:
+      input_ids, attention_mask, pixel_values, image_grid_thw,
+      labels, image_xyz, image_xyz_hires,
+      gt_transforms (None), cam_pos_frame0, gt_rotation.
+    """
+
+    def __init__(
+        self,
+        json_path:          str,
+        results_dir:        str,
+        processor,
+        log,
+        max_images:         int = 4,
+        spatial_merge_size: int = 2,
+        coord_upscale:      int = 4,
+        max_samples:        int | None = None,
+    ):
+        import json
+        with open(json_path) as fh:
+            raw = json.load(fh)
+
+        self.samples = []
+        for entry in raw:
+            eid = str(entry.get("database_idx", ""))
+            sample_dir = os.path.join(results_dir, eid)
+            if not os.path.isdir(sample_dir):
+                continue
+            self.samples.append((entry, sample_dir))
+
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
+
+        self.processor          = processor
+        self.max_images         = max_images
+        self.spatial_merge_size = spatial_merge_size
+        self.coord_upscale      = coord_upscale
+        self.log = log
+        log.info(
+            f"SAT_Train_Dataset_Rotation: {len(self.samples)} valid entries "
+            f"(out of {len(raw)} total) from {json_path}"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    @staticmethod
+    def _format_question(entry: dict) -> tuple[str, str]:
+        """Return (prompt_text, answer_letter_or_text) for a SAT entry."""
+        question = entry.get("question", "")
+        choices  = entry.get("answer_choices", []) or []
+        correct  = entry.get("correct_answer", "")
+        if choices:
+            formatted = "\n".join(
+                f"{_SAT_LETTERS[i]}. {c}" for i, c in enumerate(choices)
+            )
+            prompt_text = question + "\n" + formatted
+            try:
+                answer = _SAT_LETTERS[choices.index(correct)]
+            except ValueError:
+                answer = str(correct)
+        else:
+            prompt_text = question
+            answer = str(correct)
+        return prompt_text, answer
+
+    def __getitem__(self, idx):
+        entry, sample_dir = self.samples[idx]
+
+        # ── load images + per-pixel xyz ──────────────────────────────────────
+        view_dirs = sorted(
+            d for d in os.listdir(sample_dir) if d.startswith("view_")
+        )
+        images, xyz_raw_list, mask_raw_list = [], [], []
+        for vd in view_dirs[: self.max_images]:
+            img_path = os.path.join(sample_dir, vd, "image.png")
+            try:
+                images.append(Image.open(img_path).convert("RGB"))
+            except (FileNotFoundError, OSError):
+                break
+            pts3d_path = os.path.join(sample_dir, vd, "pts3d.npy")
+            mask_path  = os.path.join(sample_dir, vd, "mask.npy")
+            xyz_raw_list.append(
+                np.load(pts3d_path).astype(np.float32)
+                if os.path.exists(pts3d_path) else None
+            )
+            mask_raw_list.append(
+                np.load(mask_path) if os.path.exists(mask_path) else None
+            )
+
+        N = len(images)
+        if N < 1:
+            raise RuntimeError(
+                f"SAT sample {idx} (database_idx={entry.get('database_idx')}) "
+                f"has no valid images under {sample_dir}."
+            )
+
+        # ── build prompt (QA + choices) ──────────────────────────────────────
+        question_text, answer_text = self._format_question(entry)
+        if not question_text or not answer_text:
+            raise RuntimeError(
+                f"SAT sample {idx} (database_idx={entry.get('database_idx')}) "
+                f"has no QA pair."
+            )
+
+        content: list = [{"type": "image", "image": img} for img in images]
+        content.append({"type": "text", "text": question_text})
+
+        text_full = self.processor.apply_chat_template(
+            [{"role": "user",      "content": content},
+             {"role": "assistant", "content": answer_text}],
+            tokenize=False, add_generation_prompt=False,
+        )
+        proc_out = self.processor(
+            text=[text_full], images=images,
+            return_tensors="pt", padding=False,
+        )
+        suffix_ids = self.processor.tokenizer(
+            answer_text + "<|im_end|>\n", add_special_tokens=False
+        )["input_ids"]
+        labels = proc_out["input_ids"].clone()
+        labels[0, :-len(suffix_ids)] = -100
+
+        # ── 3D position maps (patch-level + sub-pixel) ───────────────────────
+        image_xyz = None
+        image_xyz_hires = None
+        try:
+            thw_all = proc_out["image_grid_thw"]  # (N, 3)
+            sms     = self.spatial_merge_size
+            up      = self.coord_upscale
+            xyz_list = []
+            xyz_hires_list = []
+            for k in range(N):
+                xyz_raw  = xyz_raw_list[k]
+                mask_raw = mask_raw_list[k]
+                thw_k    = thw_all[k]
+                llm_h    = int(thw_k[1]) // sms
+                llm_w    = int(thw_k[2]) // sms
+                if xyz_raw is not None:
+                    xyz_list.append(resize_xyz(xyz_raw, llm_h, llm_w, valid=mask_raw))
+                    xyz_hires_list.append(
+                        resize_xyz(xyz_raw, llm_h * up, llm_w * up, valid=mask_raw)
+                    )
+                else:
+                    xyz_list.append(torch.zeros(llm_h, llm_w, 3))
+                    xyz_hires_list.append(torch.zeros(llm_h * up, llm_w * up, 3))
+            image_xyz = xyz_list
+            image_xyz_hires = xyz_hires_list
+        except Exception as exc:
+            self.log.debug(f"pts3d load failed for {sample_dir}: {exc}")
+            image_xyz = None
+            image_xyz_hires = None
+
+        # ── first-frame camera pose (for RotationRoPEModel) ──────────────────
+        cam_pos_frame0 = torch.zeros(3, dtype=torch.float32)
+        gt_rotation    = torch.eye(3,  dtype=torch.float32)
+        first_view = view_dirs[0] if view_dirs else None
+        if first_view is not None:
+            cp_path = os.path.join(sample_dir, first_view, "camera_pose.npy")
+            if os.path.exists(cp_path):
+                try:
+                    pose = np.load(cp_path).astype(np.float32)
+                    cam_pos_frame0 = torch.tensor(pose[:3, 3], dtype=torch.float32)
+                    gt_rotation    = torch.tensor(pose[:3, :3].T, dtype=torch.float32)
+                except Exception as exc:
+                    self.log.debug(
+                        f"camera_pose load failed for {sample_dir}/{first_view}: {exc}"
+                    )
+
+        return {
+            **proc_out,
+            "gt_transforms":   None,
+            "image_xyz":       image_xyz,
+            "image_xyz_hires": image_xyz_hires,
+            "labels":          labels,
+            "cam_pos_frame0":  cam_pos_frame0,
+            "gt_rotation":     gt_rotation,
+        }
+
+
 class MindCube_Train_Dataset_Coord_Polar(MindCube_Train_Dataset_Coord):
     """
     Variant of MindCube_Train_Dataset_Coord where image_xyz_hires is
