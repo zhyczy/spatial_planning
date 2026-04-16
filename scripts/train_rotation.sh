@@ -12,25 +12,27 @@
 # Multi-GPU via torchrun (DDP).
 #
 # Usage:
-#   bash scripts/train_rotation.sh [num_gpus] [--max_samples N] \
-#       [--coord_weight W] [--coord_scale S] [--no_coord]
+#   bash scripts/train_rotation.sh [num_gpus] [--train_data NAME] \
+#       [--max_samples N] [--coord_weight W] [--coord_scale S] \
+#       [--no_coord] [--relative]
 #
-#   num_gpus        — first positional arg, number of GPUs (default: all)
-#   --max_samples N — truncate dataset to N entries (default: all)
-#   --coord_weight W— weight for coordinate L1 loss (default: 1.0)
-#   --coord_scale S — XYZ discretization multiplier, must match MLLM (default: 100.0)
-#   --no_coord      — disable coord loss / coord_head forward entirely
-#                     (LM-only training; rotation_enc still active when
-#                     epoch ≥ BEGIN_ROUND, R_trace still logged). Run name
-#                     and OUTPUT_DIR switch to the "rotation_no_coord_*"
-#                     variants automatically.
+#   num_gpus         — first positional arg, number of GPUs (default: all)
+#   --train_data NAME— dataset name: mindcube | sat (default: mindcube)
+#   --max_samples N  — truncate dataset to N entries (default: all)
+#   --coord_weight W — weight for coordinate L1 loss (default: 1.0)
+#   --coord_scale S  — XYZ discretization multiplier, must match MLLM (default: 100.0)
+#   --no_coord       — disable coord loss / coord_head forward entirely
+#   --relative       — coord_head predicts original (un-rotated) xyz with
+#                      detached cam_feat conditioning from rotation_enc
 #
 # Examples:
-#   bash scripts/train_rotation.sh                        # all GPUs
+#   bash scripts/train_rotation.sh                        # all GPUs, mindcube
 #   bash scripts/train_rotation.sh 2                      # 2 GPUs
 #   bash scripts/train_rotation.sh 1 --max_samples 64    # debug run
+#   bash scripts/train_rotation.sh 4 --train_data sat    # train on SAT dataset
 #   bash scripts/train_rotation.sh 4 --coord_weight 0.5  # lower coord loss weight
 #   bash scripts/train_rotation.sh 4 --no_coord          # LM-only, coord head frozen
+#   bash scripts/train_rotation.sh 4 --relative          # relative coord prediction
 # =============================================================================
 
 set -euo pipefail
@@ -45,14 +47,18 @@ cd "$SPATIAL_DIR"
 # =============================================================================
 
 NPROC=""
+TRAIN_DATA_CLI=""
 MAX_SAMPLES=""
 COORD_WEIGHT=""
 COORD_SCALE=""
 NO_COORD_CLI=false
+RELATIVE_CLI=false
 _positional=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --train_data)
+            TRAIN_DATA_CLI="$2"; shift 2 ;;
         --max_samples)
             MAX_SAMPLES="$2"; shift 2 ;;
         --coord_weight)
@@ -61,6 +67,8 @@ while [ $# -gt 0 ]; do
             COORD_SCALE="$2"; shift 2 ;;
         --no_coord)
             NO_COORD_CLI=true; shift ;;
+        --relative)
+            RELATIVE_CLI=true; shift ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -84,7 +92,7 @@ fi
 # =============================================================================
 
 MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
-TRAINING_DATASET="sat"   # {mindcube, sat} — JSON_PATH/RESULTS_DIR auto-sync below
+TRAINING_DATASET="${TRAIN_DATA_CLI:-mindcube}"   # {mindcube, sat} — via --train_data flag
 
 case "$TRAINING_DATASET" in
     mindcube)
@@ -107,6 +115,8 @@ BEGIN_ROUND=1           # epoch index (0-based) to start training rotation_enc
 NO_COORD=$NO_COORD_CLI  # true → disable coord loss / coord_head entirely
                         # (LM loss only; coord_head frozen by no-grad)
                         # toggle via `--no_coord` CLI flag
+RELATIVE=$RELATIVE_CLI  # true → coord_head predicts original (un-rotated) xyz
+                        # with detached cam_feat conditioning; toggle via `--relative`
 LR=2e-4                 # LoRA + coord_head learning rate
 ROTATION_ENC_LR=2e-4    # rotation_enc (train-from-scratch) learning rate
 LORA_CLIP=1.0           # grad-norm clip for LoRA + coord_head group
@@ -136,12 +146,18 @@ WANDB_ENTITY="actmrv"
 # Run name / output dir
 # =============================================================================
 
+_METHOD="rotation"
 if [ "$NO_COORD" = "true" ]; then
-    RUN_NAME="rotation_no_coord_${TRAINING_DATASET}"
-    WANDB_RUN_NAME="rot_no_coord_${TRAINING_DATASET}_r${LORA_RANK}_ep${EPOCHS}"
+    _METHOD="rotation_no_coord"
+fi
+if [ "$RELATIVE" = "true" ]; then
+    _METHOD="${_METHOD}_relative"
+fi
+RUN_NAME="${_METHOD}_${TRAINING_DATASET}"
+if [ "$NO_COORD" = "true" ]; then
+    WANDB_RUN_NAME="${_METHOD}_${TRAINING_DATASET}_r${LORA_RANK}_ep${EPOCHS}"
 else
-    RUN_NAME="rotation_${TRAINING_DATASET}"
-    WANDB_RUN_NAME="rot_${TRAINING_DATASET}_r${LORA_RANK}_ep${EPOCHS}_cw${_COORD_WEIGHT}"
+    WANDB_RUN_NAME="${_METHOD}_${TRAINING_DATASET}_r${LORA_RANK}_ep${EPOCHS}_cw${_COORD_WEIGHT}"
 fi
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
@@ -162,6 +178,7 @@ echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EPOCHS               = $EPOCHS"
 echo "[INFO] BEGIN_ROUND          = $BEGIN_ROUND    (rotation_enc activates at this epoch)"
 echo "[INFO] NO_COORD             = $NO_COORD"
+echo "[INFO] RELATIVE             = $RELATIVE"
 echo "[INFO] coord_weight         = $_COORD_WEIGHT"
 echo "[INFO] coord_scale          = $_COORD_SCALE"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
@@ -179,6 +196,11 @@ fi
 NO_COORD_FLAG=""
 if [ "$NO_COORD" = "true" ]; then
     NO_COORD_FLAG="--no_coord"
+fi
+
+RELATIVE_FLAG=""
+if [ "$RELATIVE" = "true" ]; then
+    RELATIVE_FLAG="--relative"
 fi
 
 # =============================================================================
@@ -217,6 +239,7 @@ $TORCHRUN \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
     $MAX_SAMPLES_FLAG \
-    $NO_COORD_FLAG
+    $NO_COORD_FLAG \
+    $RELATIVE_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

@@ -416,6 +416,7 @@ class RotationRoPEModel(nn.Module):
         coord_scale:      float = 100.0,
         use_rotation_enc: bool  = True,
         use_coord_loss:   bool  = True,
+        use_relative:     bool  = False,
         **kwargs,
     ):
         """Single-pass forward with differentiable RoPE.
@@ -453,16 +454,17 @@ class RotationRoPEModel(nn.Module):
         # When use_rotation_enc is False (e.g. warm-up epoch), skip the
         # encoder entirely: R stays None → rotated_xyz = image_xyz (identity).
         R = None
+        cam_feat = None
         if use_rotation_enc and image_xyz is not None and image_grid_thw is not None:
             token_txyz_int = _build_token_txyz_int(
                 input_ids, self.image_token_id,
                 image_xyz, image_grid_thw, self.spatial_merge_size,
                 coord_scale,
             )                                              # (seq_len, 4) long
-            R = self.rotation_enc(
+            R, cam_feat = self.rotation_enc(
                 inputs_embeds.detach(),
                 token_txyz_int,
-            )                                              # (3, 3) float32
+            )                                              # (3, 3) float32, (d_model,)
             _ldict["R_trace"] = R.trace().item()
 
         # ── Step 3: rotated xyz (FLOAT, gradient-preserving) ──
@@ -511,10 +513,19 @@ class RotationRoPEModel(nn.Module):
         coord_gt_src = image_xyz_hires if image_xyz_hires is not None else image_xyz
 
         if use_coord_loss and coord_gt_src is not None and image_grid_thw is not None:
-            if R is not None:
-                coord_gt = _apply_rotation_to_xyz(R.detach(), coord_gt_src)
-            else:
+            # --relative: GT is the original (un-rotated) input coordinates;
+            # cam_feat (detached) is passed to coord_head so it can learn the
+            # inverse mapping from rotated RoPE features → original frame.
+            # Default: GT is R @ xyz (rotated frame), no cam conditioning.
+            if use_relative:
                 coord_gt = coord_gt_src
+                _cam_cond = cam_feat.detach() if cam_feat is not None else None
+            else:
+                if R is not None:
+                    coord_gt = _apply_rotation_to_xyz(R.detach(), coord_gt_src)
+                else:
+                    coord_gt = coord_gt_src
+                _cam_cond = None
 
             vis_pos = (input_ids[0] == self.image_token_id).nonzero(
                 as_tuple=True,
@@ -532,7 +543,8 @@ class RotationRoPEModel(nn.Module):
                     break
 
                 coord_h_k = hidden2[0, vis_pos[start: start + n_tok]]
-                pred_k    = self.coord_head(coord_h_k, llm_h, llm_w)
+                pred_k    = self.coord_head(coord_h_k, llm_h, llm_w,
+                                            cam_feat=_cam_cond)
 
                 gt_k = coord_gt[k].to(pred_k.device, dtype=pred_k.dtype)
                 per_img.append(F.l1_loss(pred_k, gt_k))

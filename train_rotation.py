@@ -113,6 +113,7 @@ def build_model(
     rot_nhead:          int   = 4,
     rot_dim_feedforward: int  = 2048,
     rot_num_layers:     int   = 2,
+    relative:           bool  = False,
 ) -> RotationRoPEModel:
     """Build RotationRoPEModel with LM + coordinate supervision
     (rotation learned end-to-end via differentiable M-RoPE)."""
@@ -196,10 +197,14 @@ def build_model(
         f"dim_feedforward={rot_dim_feedforward}  num_layers={rot_num_layers}"
     )
 
+    cam_dim = rotation_enc.d_model if relative else 0
     coord_head = DepthPredictionTransformer(
         hidden_dim=hidden_dim, upscale_factor=coord_upscale,
+        cam_dim=cam_dim,
     ).to(torch.bfloat16)
-    log.info(f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}")
+    log.info(f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}"
+             f"  cam_dim={cam_dim}" if relative else
+             f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}")
 
     return RotationRoPEModel(
         spa_model          = spa,
@@ -261,6 +266,7 @@ def train(args: argparse.Namespace) -> None:
         rot_nhead           = args.rot_nhead,
         rot_dim_feedforward = args.rot_dim_feedforward,
         rot_num_layers      = args.rot_num_layers,
+        relative            = args.relative,
     )
     model = model.to(device)
     if local_rank == 0:
@@ -400,6 +406,12 @@ def train(args: argparse.Namespace) -> None:
            if args.no_coord
            else "(coord_loss active)")
     )
+    log.info(
+        f">>> relative    = {args.relative}  "
+        + ("(coord GT = original xyz, cam_feat conditioning ON)"
+           if args.relative
+           else "(coord GT = R @ xyz, default)")
+    )
     log.info("=" * 72)
     total_steps = args.epochs * len(train_loader) // args.grad_accum
     scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -513,6 +525,7 @@ def train(args: argparse.Namespace) -> None:
                 coord_scale      = args.coord_scale,
                 use_rotation_enc = use_rot_enc,
                 use_coord_loss   = not args.no_coord,
+                use_relative     = args.relative,
             )
 
             if loss is None:
@@ -638,6 +651,7 @@ def train(args: argparse.Namespace) -> None:
                                     coord_scale      = args.coord_scale,
                                     use_rotation_enc = use_rot_enc,
                                     use_coord_loss   = not args.no_coord,
+                use_relative     = args.relative,
                                 )
                             if loss is None:
                                 continue
@@ -791,6 +805,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable the coordinate L1 loss and coord_head forward entirely. "
              "Only the LM loss supervises training; coord_head receives no "
              "gradient and is effectively frozen.",
+    )
+    p.add_argument(
+        "--relative", action="store_true",
+        help="Relative coordinate prediction: coord_head predicts original "
+             "(un-rotated) xyz with detached cam_feat as conditioning.",
     )
     p.add_argument(
         "--coord_upscale", type=int, default=4,

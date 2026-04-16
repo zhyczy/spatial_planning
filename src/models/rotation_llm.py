@@ -381,7 +381,7 @@ class CameraTokenRotationEncoder(nn.Module):
         cam_feat = x[0, 0]                                       # (d_model,) bf16
         r6d      = self.rot_head(cam_feat).float()               # (6,) float32
         R        = rot6d_to_rotmat(r6d.unsqueeze(0)).squeeze(0)  # (3, 3)
-        return R
+        return R, cam_feat
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +493,7 @@ class RotationModel(nn.Module):
                 image_xyz, image_grid_thw, self.spatial_merge_size,
                 coord_scale,
             )                                              # (seq_len, 4) long
-            R = self.rotation_enc(
+            R, _cam_feat = self.rotation_enc(
                 inputs_embeds.detach(),
                 token_txyz_int,
             )                                              # (3, 3) float32
