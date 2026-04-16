@@ -665,8 +665,7 @@ class MindCube_Train_Dataset_Relative(Dataset):
 
 class MindCube_Train_Dataset_Rotation(MindCube_Train_Dataset_Coord):
     """
-    Extends MindCube_Train_Dataset_Coord with camera-pose data needed for
-    the two-pass RotationModel.
+    Extends MindCube_Train_Dataset_Coord with camera-pose data.
 
     Additional items returned in each batch:
       cam_pos_frame0  (3,)    float32 — first-frame camera position in world
@@ -676,6 +675,9 @@ class MindCube_Train_Dataset_Rotation(MindCube_Train_Dataset_Coord):
 
     If camera_pose.npy is missing for frame 0, cam_pos_frame0 is zeros and
     gt_rotation is the identity matrix.
+
+    Note: RotationRoPEModel does not consume gt_rotation (no rot_loss);
+    these fields are preserved for optional diagnostic use.
     """
 
     def __getitem__(self, idx):

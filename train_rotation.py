@@ -368,9 +368,9 @@ def train(args: argparse.Namespace) -> None:
             log.warning(f"Failed to load eval dataset '{_ds_name}': {exc}")
 
     # -- optimiser -------------------------------------------------------------
-    # Split into two mutually-exclusive groups:
-    #   (a) rotation_enc — train-from-scratch, strict RoPE-aware clip
-    #   (b) rest (LoRA + coord_head) — standard fine-tune regime
+    # Two groups:
+    #   (a) rotation_enc  — train-from-scratch, strict RoPE-aware clip
+    #   (b) other         — LoRA + coord_head, standard fine-tune regime
     rotation_enc_params = [
         p for n, p in model.named_parameters()
         if p.requires_grad and "rotation_enc" in n
@@ -379,18 +379,16 @@ def train(args: argparse.Namespace) -> None:
         p for n, p in model.named_parameters()
         if p.requires_grad and "rotation_enc" not in n
     ]
-    trainable = rotation_enc_params + other_params
     optimizer = torch.optim.AdamW(
         [
-            {"params": other_params,        "lr": args.lr,              "name": "lora"},
+            {"params": other_params,        "lr": args.lr,              "name": "other"},
             {"params": rotation_enc_params, "lr": args.rotation_enc_lr, "name": "rotation_enc"},
         ],
         weight_decay=0.01,
     )
     log.info(
-        f"Optimizer groups: lora/coord_head={len(other_params)} params "
-        f"@ lr={args.lr}, rotation_enc={len(rotation_enc_params)} params "
-        f"@ lr={args.rotation_enc_lr}"
+        f"Optimizer groups: other={len(other_params)} @ lr={args.lr}, "
+        f"rotation_enc={len(rotation_enc_params)} @ lr={args.rotation_enc_lr}"
     )
     log.info("=" * 72)
     log.info(
@@ -477,7 +475,6 @@ def train(args: argparse.Namespace) -> None:
             )
 
         for step, batch in enumerate(train_loader):
-
             # -- move batch to device ------------------------------------------
             input_ids      = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
@@ -515,17 +512,17 @@ def train(args: argparse.Namespace) -> None:
 
             # -- forward + loss ------------------------------------------------
             _, loss, loss_dict = model(
-                input_ids        = input_ids,
-                attention_mask   = attention_mask,
-                pixel_values     = pixel_values,
-                image_grid_thw   = image_grid_thw,
-                image_xyz        = image_xyz,
-                image_xyz_hires  = image_xyz_hires,
-                labels           = labels,
-                coord_scale      = args.coord_scale,
-                use_rotation_enc = use_rot_enc,
-                use_coord_loss   = not args.no_coord,
-                use_relative     = args.relative,
+                input_ids           = input_ids,
+                attention_mask      = attention_mask,
+                pixel_values        = pixel_values,
+                image_grid_thw      = image_grid_thw,
+                image_xyz           = image_xyz,
+                image_xyz_hires     = image_xyz_hires,
+                labels              = labels,
+                coord_scale         = args.coord_scale,
+                use_rotation_enc    = use_rot_enc,
+                use_coord_loss      = not args.no_coord,
+                use_relative        = args.relative,
             )
 
             if loss is None:
@@ -641,17 +638,17 @@ def train(args: argparse.Namespace) -> None:
 
                             with torch.inference_mode():
                                 _, loss, loss_dict = model(
-                                    input_ids        = t_ids,
-                                    attention_mask   = t_mask,
-                                    pixel_values     = t_pv,
-                                    image_grid_thw   = t_thw,
-                                    image_xyz        = t_xyz,
-                                    image_xyz_hires  = t_xyz_h,
-                                    labels           = t_labels,
-                                    coord_scale      = args.coord_scale,
-                                    use_rotation_enc = use_rot_enc,
-                                    use_coord_loss   = not args.no_coord,
-                use_relative     = args.relative,
+                                    input_ids           = t_ids,
+                                    attention_mask      = t_mask,
+                                    pixel_values        = t_pv,
+                                    image_grid_thw      = t_thw,
+                                    image_xyz           = t_xyz,
+                                    image_xyz_hires     = t_xyz_h,
+                                    labels              = t_labels,
+                                    coord_scale         = args.coord_scale,
+                                    use_rotation_enc    = use_rot_enc,
+                                    use_coord_loss      = not args.no_coord,
+                                    use_relative        = args.relative,
                                 )
                             if loss is None:
                                 continue

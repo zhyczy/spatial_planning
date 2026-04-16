@@ -1,20 +1,38 @@
 #!/usr/bin/env bash
 # =============================================================================
-# train_rotation.sh
+# train_alternate.sh
 #
-# Single-pass rotation-aware coordinate prediction training with
-# differentiable M-RoPE.
-# LoRA fine-tuning of SpaForConditionalGeneration (Qwen3.5-VL) with:
+# Alternating two-phase single-pass rotation-aware coordinate prediction
+# training with differentiable M-RoPE.  LoRA fine-tuning of
+# SpaForConditionalGeneration (Qwen3.5-VL) with:
 #   - CameraTokenRotationEncoder  → predicts canonical rotation R
-#     (trained end-to-end via lm_loss + coord_loss; no GT rotation)
+#     (trained end-to-end via lm_loss; no GT rotation)
 #   - DepthPredictionTransformer  → coordinate head in rotated frame
+#
+# Schedule (per epoch — two full passes over the dataset)
+#   Each epoch iterates the dataloader TWICE; pass 0 is Phase A, pass 1
+#   is Phase B.  With EPOCHS=N both branches see N full passes total.
+#   Phase A (first full pass):
+#     * rotation_enc frozen; train LoRA + coord_head
+#     * epoch 0   → R = I  (rotation_enc untrained)
+#     * epoch ≥ 1 → R from current (frozen) rotation_enc
+#   Phase B (second full pass):
+#     * LoRA frozen; train rotation_enc via lm_loss only
+#     * coord_head still trained by coord_loss (on detached hidden so
+#       rotation_enc is NOT updated by the coord_loss path)
+#
+# Learning rate
+#   Phase A and Phase B each run an independent cosine decay over their own
+#   optimizer steps.  Set --lr_phase_a / --lr_phase_b to control per-phase
+#   base LRs (fall back to --lr / --rotation_enc_lr respectively).
 #
 # Multi-GPU via torchrun (DDP).
 #
 # Usage:
-#   bash scripts/train_rotation.sh [num_gpus] [--train_data NAME] \
+#   bash scripts/train_alternate.sh [num_gpus] [--train_data NAME] \
 #       [--max_samples N] [--coord_weight W] [--coord_scale S] \
-#       [--no_coord] [--relative]
+#       [--no_coord] [--relative] \
+#       [--lr_phase_a LR] [--lr_phase_b LR]
 #
 #   num_gpus         — first positional arg, number of GPUs (default: all)
 #   --train_data NAME— dataset name: mindcube | sat (default: mindcube)
@@ -24,15 +42,17 @@
 #   --no_coord       — disable coord loss / coord_head forward entirely
 #   --relative       — coord_head predicts original (un-rotated) xyz with
 #                      detached cam_feat conditioning from rotation_enc
+#   --lr_phase_a LR  — base LR for Phase A (LoRA + coord_head); independent
+#                      cosine decay over Phase A optim steps. Defaults to $LR.
+#   --lr_phase_b LR  — base LR for Phase B (rotation_enc + coord_head);
+#                      independent cosine decay over Phase B optim steps.
+#                      Defaults to $ROTATION_ENC_LR.
 #
 # Examples:
-#   bash scripts/train_rotation.sh                       # all GPUs, mindcube
-#   bash scripts/train_rotation.sh 2                     # 2 GPUs
-#   bash scripts/train_rotation.sh 1 --max_samples 64    # debug run
-#   bash scripts/train_rotation.sh 4 --train_data sat    # train on SAT dataset
-#   bash scripts/train_rotation.sh 4 --coord_weight 0.5  # lower coord loss weight
-#   bash scripts/train_rotation.sh 4 --no_coord          # LM-only, coord head frozen
-#   bash scripts/train_rotation.sh 4 --relative          # relative coord prediction
+#   bash scripts/train_alternate.sh                   # all GPUs
+#   bash scripts/train_alternate.sh 4                 # 4 GPUs
+#   bash scripts/train_alternate.sh 4 --train_data sat
+#   bash scripts/train_alternate.sh 4 --lr_phase_a 2e-4 --lr_phase_b 5e-5
 # =============================================================================
 
 set -euo pipefail
@@ -53,6 +73,8 @@ COORD_WEIGHT=""
 COORD_SCALE=""
 NO_COORD_CLI=false
 RELATIVE_CLI=false
+LR_PHASE_A_CLI=""
+LR_PHASE_B_CLI=""
 _positional=0
 
 while [ $# -gt 0 ]; do
@@ -69,6 +91,10 @@ while [ $# -gt 0 ]; do
             NO_COORD_CLI=true; shift ;;
         --relative)
             RELATIVE_CLI=true; shift ;;
+        --lr_phase_a)
+            LR_PHASE_A_CLI="$2"; shift 2 ;;
+        --lr_phase_b)
+            LR_PHASE_B_CLI="$2"; shift 2 ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -110,15 +136,20 @@ case "$TRAINING_DATASET" in
 esac
 
 EPOCHS=6
-BEGIN_ROUND=1           # epoch index (0-based) to start training rotation_enc
-                        # epochs < BEGIN_ROUND run with R=I (identity rotation)
 NO_COORD=$NO_COORD_CLI  # true → disable coord loss / coord_head entirely
                         # (LM loss only; coord_head frozen by no-grad)
                         # toggle via `--no_coord` CLI flag
 RELATIVE=$RELATIVE_CLI  # true → coord_head predicts original (un-rotated) xyz
                         # with detached cam_feat conditioning; toggle via `--relative`
-LR=2e-4                 # LoRA + coord_head learning rate
-ROTATION_ENC_LR=2e-4    # rotation_enc (train-from-scratch) learning rate
+LR=2e-4                 # Phase A base LR fallback (LoRA + coord_head)
+                        # used when --lr_phase_a is not given.
+ROTATION_ENC_LR=2e-4    # Phase B base LR fallback (rotation_enc + coord_head)
+                        # used when --lr_phase_b is not given.
+# Phase-specific base LRs. Each phase runs its own cosine decay that counts
+# only that phase's optimizer steps. Empty = let train_alternate.py
+# fall back to --lr / --rotation_enc_lr respectively.
+LR_PHASE_A="$LR_PHASE_A_CLI"
+LR_PHASE_B="$LR_PHASE_B_CLI"
 LORA_CLIP=1.0           # grad-norm clip for LoRA + coord_head group
 ROTATION_ENC_CLIP=0.3   # strict clip for rotation_enc (RoPE high-freq amplification)
 LORA_RANK=16
@@ -146,9 +177,9 @@ WANDB_ENTITY="actmrv"
 # Run name / output dir
 # =============================================================================
 
-_METHOD="rotation"
+_METHOD="rotation_alternate"
 if [ "$NO_COORD" = "true" ]; then
-    _METHOD="rotation_no_coord"
+    _METHOD="${_METHOD}_no_coord"
 fi
 if [ "$RELATIVE" = "true" ]; then
     _METHOD="${_METHOD}_relative"
@@ -176,9 +207,10 @@ echo "[INFO] JSON_PATH            = $JSON_PATH"
 echo "[INFO] RESULTS_DIR          = $RESULTS_DIR"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EPOCHS               = $EPOCHS"
-echo "[INFO] BEGIN_ROUND          = $BEGIN_ROUND    (rotation_enc activates at this epoch)"
 echo "[INFO] NO_COORD             = $NO_COORD"
 echo "[INFO] RELATIVE             = $RELATIVE"
+echo "[INFO] LR_PHASE_A           = ${LR_PHASE_A:-<fallback to \$LR=$LR>}"
+echo "[INFO] LR_PHASE_B           = ${LR_PHASE_B:-<fallback to \$ROTATION_ENC_LR=$ROTATION_ENC_LR>}"
 echo "[INFO] coord_weight         = $_COORD_WEIGHT"
 echo "[INFO] coord_scale          = $_COORD_SCALE"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
@@ -203,6 +235,16 @@ if [ "$RELATIVE" = "true" ]; then
     RELATIVE_FLAG="--relative"
 fi
 
+LR_PHASE_A_FLAG=""
+if [ -n "$LR_PHASE_A" ]; then
+    LR_PHASE_A_FLAG="--lr_phase_a $LR_PHASE_A"
+fi
+
+LR_PHASE_B_FLAG=""
+if [ -n "$LR_PHASE_B" ]; then
+    LR_PHASE_B_FLAG="--lr_phase_b $LR_PHASE_B"
+fi
+
 # =============================================================================
 # Run via torchrun (DDP)
 # =============================================================================
@@ -212,14 +254,13 @@ TORCHRUN=/egr/research-actionlab/caizhon2/miniconda3/envs/spc/bin/torchrun
 $TORCHRUN \
     --nproc_per_node "$NPROC" \
     --master_port    29501 \
-    train_rotation.py \
+    train_alternate.py \
     --model_path             "$MODEL_PATH"             \
     --training_dataset       "$TRAINING_DATASET"       \
     --json_path              "$JSON_PATH"              \
     --results_dir            "$RESULTS_DIR"            \
     --output_dir             "$OUTPUT_DIR"             \
     --epochs                 "$EPOCHS"                 \
-    --begin_round            "$BEGIN_ROUND"            \
     --lr                     "$LR"                     \
     --rotation_enc_lr        "$ROTATION_ENC_LR"        \
     --lora_clip              "$LORA_CLIP"              \
@@ -240,6 +281,8 @@ $TORCHRUN \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
     $MAX_SAMPLES_FLAG \
     $NO_COORD_FLAG \
-    $RELATIVE_FLAG
+    $RELATIVE_FLAG \
+    $LR_PHASE_A_FLAG \
+    $LR_PHASE_B_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

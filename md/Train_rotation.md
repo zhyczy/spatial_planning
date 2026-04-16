@@ -5,7 +5,7 @@
 learning rate	args.rotation_enc_lr (默认 2e-4)	args.lr (默认 2e-4)
 grad clip	args.rotation_enc_clip (默认 0.3)	args.lora_clip (默认 1.0)
 初始化	从零训练（rot_head 零权重 + 恒等 bias）	LoRA 从 0 起；coord_head 默认 init
-Group A — rotation_enc.* 具体参数（来自 rotation_llm.py:264 CameraTokenRotationEncoder）
+Group A — rotation_enc.* 具体参数（来自 rotation_rope_llm.py:263 CameraTokenRotationEncoder）
 
 路径	形状来源
 rotation_enc.cam_token	(1, d_model=1024)
@@ -179,3 +179,129 @@ LoRA 参数名前缀是 spa_model.base_model...，coord_head 前缀是 coord_hea
     • LoRA + coord_head 正常下降，用 lora_clip=1.0
     • 整个系统通过 lm_loss 端到端地学出一个"帮助 LLM 答题"的 R
 关键点一句话总结：step 0 从恒等旋转起步，DifferentiableMRoPE 让 lm_loss 能把梯度送回 rotation_enc，两组独立 clip 让高频梯度不会冲垮训练。
+
+
+
+rotation_enc
+                         │
+                         ▼
+                      R, cam_feat
+                 ┌───────┴───────────────────────┐
+                 │                                │
+                 ▼                                ▼
+         rotated_xyz = R @ xyz           cam_feat（原始，带梯度）
+                 │                                │
+                 ▼                         ┌──────┴──── .detach() ────┐
+          rope_pos_float                   │                          │
+                 │                       coord_gt                coord_head
+                 ▼                      (R.detach())              (cam 条件)
+          DiffMRoPE cos,sin                  │                          │
+                 │                           │                          │
+                 ▼                           │                          │
+         text_model.layers                   │                          │
+                 │                           │                          │
+                 ▼                           │                          │
+             hidden2 ───────────────────────────────────┐               │
+              │   │                                     ▼               │
+              │   └─► lm_head → logits → lm_loss     coord_h_k          │
+              │                              │          │               │
+              │                              │          ▼               │
+              │                              │       pred_k ◄───────────┘
+              │                              │          │
+              │                              │          ▼
+              │                              │       coord_loss
+              │                              │          │
+              └──────────────────────────────┴──────────┘
+                         （共享 hidden2）
+.detach() 真正阻断的是什么
+.detach() 位置	阻断的路径	没阻断的路径
+coord_gt = R.detach() @ xyz	coord_loss → coord_gt → R（旋转 GT 去就 pred 的平凡解）	coord_loss → pred_k → hidden2 → cos/sin → R
+cam_feat=cam_feat.detach()	coord_loss → cam_proj → cam_feat → rotation_enc（直连短路）	coord_loss → hidden2 → cos/sin → R → rotation_enc
+修正后的结论
+两个 loss 都通过 hidden2 → cos/sin → R → rotation_enc 这条共享通道回传给 encoder：
+
+lm_loss → rotation_enc：唯一路径（hidden2 → DiffMRoPE → R）
+coord_loss → rotation_enc：也通过 hidden2 → DiffMRoPE → R 回传；只是被 R.detach() / cam_feat.detach() 掐断了另两条"直连短路"
+.detach() 的设计意图
+R.detach() 在 coord_gt：防止 coord_loss 通过"旋转 GT"的平凡解（把 GT 转去迎合坏 pred）来最小化自己——保证 coord_loss 在每一步看到固定的几何目标。
+cam_feat.detach() 在 coord_head 条件：防止 coord_head 把 cam_feat 当作自由可学的 bias 向量直接改写 rotation_enc，避免 coord_loss 绕过 LLM 抄近路。
+两条 detach 都只是关掉"绕过 LLM 的近路"，coord_loss 对 rotation_enc 的监督依然会通过 LLM hidden state 这条长路径到达——只不过要"跨越整个 LLM"才能改 R。
+
+
+rotation vs rotation_relative — 训练 / 测试对照
+1. 模型结构差异（构建期）
+组件	rotation	rotation_relative
+CLI 标志	（无）	--relative
+coord_head.cam_dim	0	rotation_enc.d_model（1024）
+coord_head.cam_proj	不存在	nn.Linear(1024, d_model)
+ckpt 识别	state 无 cam_proj.weight	state 含 cam_proj.weight
+训练入口：train_rotation.py:200
+Eval 识别：evaluation.py:401-469 _load_coord_head 通过 state["cam_proj.weight"].shape[1] 自动推断
+2. 前向数据流差异（每 step 共通部分）
+两者共用 Steps 1–5（inputs_embeds → rotation_enc → R, cam_feat → rotated_xyz → DifferentiableMRoPE / 推理时整数 RoPE → hidden2），差异只在 coord loss / coord MAE 分支：
+
+
+          ┌────── rotation ──────┐           ┌─── rotation_relative ───┐
+GT        │  R.detach() @ xyz     │           │  xyz（原坐标，不旋转）    │
+          │  （rotated frame）      │           │  （original frame）       │
+cam 条件  │  coord_head(hidden,   │           │  coord_head(hidden,      │
+          │   cam_feat=None)     │           │   cam_feat.detach())    │
+监督信号  │  让 head 在旋转帧预测   │           │  让 head 学"旋转帧特征    │
+          │                      │           │   → 原帧坐标"的反变换      │
+3. 代码锚点
+训练 (rotation_rope_llm.py:822-830)：
+
+
+if use_relative:
+    coord_gt = coord_gt_src                           # 原坐标
+    _cam_cond = cam_feat.detach()
+else:
+    coord_gt = _apply_rotation_to_xyz(R.detach(), coord_gt_src)  # 旋转后
+    _cam_cond = None
+pred_k = self.coord_head(coord_h_k, llm_h, llm_w, cam_feat=_cam_cond)
+测试 (evaluation.py:1588-1593, 1617-1622)：
+
+
+if is_relative:
+    xyz_for_mae = [x.detach().cpu() for x in image_xyz]  # 原坐标做 MAE
+    cam_feat_for_head = cam_feat
+else:
+    xyz_for_mae = [r.detach().cpu() for r in rotated]    # 旋转后坐标做 MAE
+# ...
+preds = _get_coord_predictions(..., cam_feat=cam_feat_for_head)
+result["coord_mae"] = _compute_coord_mae(preds, xyz_for_mae)
+4. 共同点（两者完全一致）
+LM 路径：xyz_for_rope = rotated（RoPE 用旋转后坐标），lm_loss 回传到 LoRA + rotation_enc 完全相同
+梯度：R.detach() / cam_feat.detach() 阻断 coord_loss 回流到 rotation_enc，仅 lm_loss 端到端学 R
+step 0：R = I（rot_head 恒等初始化），两者初始等价于 baseline 无旋转
+
+
+
+是的，cam_feat 被投影后作为序列第 0 个 token prepend 在最前面。
+
+具体流程（coordinate_llm.py:108-120）
+
+x = self.input_proj(hidden)                          # (h*w, d_model) —— vision tokens
+x = x + self._sinusoidal_2d_pe(h, w, ...)            # 加 2D 正弦位置编码
+
+# ① cam_feat 投影并 prepend 到序列最前
+if cam_feat is not None and self.cam_proj is not None:
+    cam_tok = self.cam_proj(cam_feat).unsqueeze(0)   # (1, d_model)
+    x = torch.cat([cam_tok, x], dim=0)               # (1 + h*w, d_model)
+    #              ↑ 位置 0
+
+x = self.transformer(x.unsqueeze(0)).squeeze(0)      # Transformer 全序列自注意力
+
+# ② transformer 后把位置 0 的 cam token 剥掉
+if cam_feat is not None and self.cam_proj is not None:
+    x = x[1:]                                        # (h*w, d_model)
+
+x = self.output_proj(x)                              # 只用 h*w 个 vision token 出坐标
+关键点
+步骤	行为
+prepend 位置	序列第 0 位（cam 在 [0]，vision tokens 在 [1 : 1+h*w]）
+位置编码	不加 2D PE（只给 vision tokens 加 PE），cam 天然独立于网格
+作用机制	通过 TransformerEncoder 的 self-attention 让每个 vision token 都能读到 cam 信息
+输出截断	forward 尾部 x = x[1:] 剥掉 cam token，保证 PixelShuffle 的 (h, w) 形状不变
+梯度	训练时 cam_feat.detach()（rotation_rope_llm.py:824），coord_loss 不回传到 rotation_enc
+一句话：cam_feat → cam_proj → 作为序列 index 0 的 conditioning token 插在最前面，通过 transformer 全局注意力广播到所有 vision patch，最后再被剥掉不影响空间输出。

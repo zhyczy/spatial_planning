@@ -30,11 +30,20 @@ Multi-method QA evaluation:
   rotation
       Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
               + CameraTokenRotationEncoder (predicts canonical R)
-              + DepthPredictionTransformer (coord head in rotated frame)
+              + DepthPredictionTransformer (coord head in rotated frame, cam_dim=0)
       Input : images + question  (no pose sentences, no <coord> tokens; no_cam)
       3D pos: R = rotation_enc(merged_embeds, token_txyz_int);
               rotated_xyz = R @ xyz_world → 4D M-RoPE on image patches
       Coord : predicted in rotated frame; GT = R @ gt_xyz before MAE
+      Ckpt  : coord_head.pt must NOT contain cam_proj.* weights
+              (trained by train_rotation.py WITHOUT --relative).
+
+  rotation_relative
+      Same architecture as `rotation` at inference time, but paired with a
+      checkpoint trained by train_rotation.py --relative, i.e. the coord head
+      has an extra cam_proj (cam_dim = rotation_enc.d_model). cam_proj weights
+      are loaded but currently unused in forward (matches training).
+      Ckpt  : coord_head.pt MUST contain cam_proj.* weights.
 
   both   → baseline + coordinate  (primary comparison)
 
@@ -100,7 +109,7 @@ from src.models import (
     DepthPredictionTransformer,
     CameraTokenRotationEncoder,
 )
-from src.models.rotation_llm import (
+from src.models.rotation_rope_llm import (
     _build_token_txyz_int,
     _apply_rotation_to_xyz,
 )
@@ -392,12 +401,18 @@ def load_spa_model(
 def _load_coord_head(
     ckpt_path: str,
     device: str,
+    expect_relative: Optional[bool] = None,
 ) -> Optional[DepthPredictionTransformer]:
     """Load DepthPredictionTransformer from checkpoint directory.
 
     Infers hidden_dim, d_model, and upscale_factor from the saved weight shapes so
     no extra config is needed. Accepts either coord_head.pt or dpt_head.pt.
     Returns None when no coordinate head checkpoint is available.
+
+    expect_relative:
+        None  — auto (accept both with/without cam_proj).
+        True  — require cam_proj.* in state dict (method='rotation_relative').
+        False — require cam_proj.* absent in state dict (method='rotation').
     """
     logger = logging.getLogger(__name__)
     ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=True)
@@ -421,15 +436,35 @@ def _load_coord_head(
     # output_proj.weight shape: (3 * upscale^2, d_model)
     proj_out = state["output_proj.weight"].shape[0]
     upscale_factor = int(round((proj_out / 3) ** 0.5))
+    # cam_proj.weight shape: (d_model, cam_dim) — present only when trained with
+    # --relative (rotation checkpoint); infer cam_dim so strict load succeeds.
+    has_cam_proj = "cam_proj.weight" in state
+    cam_dim = int(state["cam_proj.weight"].shape[1]) if has_cam_proj else 0
+
+    if expect_relative is True and not has_cam_proj:
+        raise RuntimeError(
+            f"[rotation_relative] {coord_head_path} has no cam_proj.* — this is a "
+            "non-relative rotation checkpoint. Use --method rotation instead, or "
+            "retrain with train_rotation.py --relative."
+        )
+    if expect_relative is False and has_cam_proj:
+        raise RuntimeError(
+            f"[rotation] {coord_head_path} contains cam_proj.* — this is a "
+            "relative rotation checkpoint. Use --method rotation_relative instead."
+        )
 
     coord_head = DepthPredictionTransformer(
-        hidden_dim=hidden_dim, d_model=d_model, upscale_factor=upscale_factor
+        hidden_dim=hidden_dim,
+        d_model=d_model,
+        upscale_factor=upscale_factor,
+        cam_dim=cam_dim,
     )
     coord_head.load_state_dict(state)
     coord_head = coord_head.to(device).to(torch.bfloat16).eval()
     logger.info(
         f"[coordinate] DepthPredictionTransformer loaded from {coord_head_path} "
-        f"(hidden_dim={hidden_dim}, d_model={d_model}, upscale={upscale_factor})"
+        f"(hidden_dim={hidden_dim}, d_model={d_model}, upscale={upscale_factor}, "
+        f"cam_dim={cam_dim})"
     )
     return coord_head
 
@@ -504,11 +539,13 @@ def _compute_rotation_R(
     image_token_id: int,
     spatial_merge_size: int,
     coord_scale: float,
-) -> Optional[torch.Tensor]:
-    """Compute rotation R via a partial forward: text embed + vision scatter → rotation_enc.
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Compute rotation R (and cam_feat) via a partial forward.
 
-    Mirrors RotationRoPEModel.forward Steps 1-2 but without gradients.
-    Returns the (3, 3) float rotation matrix, or None if required inputs are missing.
+    Mirrors RotationRoPEModel.forward Steps 1-2 without gradients.
+    Returns (R (3,3), cam_feat (d_model,)) or (None, None) on missing inputs.
+    cam_feat is needed by DepthPredictionTransformer when the ckpt was trained
+    with train_rotation.py --relative (method='rotation_relative').
     """
     device = next(spa_model.parameters()).device
     inputs_dev = {
@@ -519,7 +556,7 @@ def _compute_rotation_R(
     pixel_values = inputs_dev.get("pixel_values")
     image_grid_thw = inputs_dev.get("image_grid_thw")
     if pixel_values is None or image_grid_thw is None:
-        return None
+        return None, None
 
     spa_inner = spa_model.model  # SpaModel (post LoRA merge)
 
@@ -536,7 +573,7 @@ def _compute_rotation_R(
         image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        # Step 2: rotation encoder
+        # Step 2: rotation encoder → (R, cam_feat)
         xyz_on_device = [x.to(device=device, dtype=torch.float32) for x in image_xyz]
         token_txyz_int = _build_token_txyz_int(
             input_ids,
@@ -546,9 +583,9 @@ def _compute_rotation_R(
             spatial_merge_size,
             coord_scale,
         )
-        R = rotation_enc(inputs_embeds, token_txyz_int)
+        R, cam_feat = rotation_enc(inputs_embeds, token_txyz_int)
 
-    return R
+    return R, cam_feat
 
 
 def _get_coord_predictions(
@@ -559,6 +596,7 @@ def _get_coord_predictions(
     spatial_merge_size: int,
     image_xyz: List[torch.Tensor],   # llm-resolution GT, used as xyz for 4D RoPE
     coord_scale: float,
+    cam_feat: Optional[torch.Tensor] = None,   # only used by rotation_relative
 ) -> Optional[List[torch.Tensor]]:
     """Single forward pass (no generation) → coord head predictions at vision tokens.
 
@@ -636,6 +674,11 @@ def _get_coord_predictions(
     start = 0
     dtype = coord_head.input_proj.weight.dtype
 
+    # cam_feat must match coord_head dtype (bf16) when cam_proj is active.
+    cam_feat_dev: Optional[torch.Tensor] = None
+    if cam_feat is not None and coord_head.cam_proj is not None:
+        cam_feat_dev = cam_feat.to(device=device, dtype=dtype).detach()
+
     with torch.no_grad():
         for k in range(N):
             thw_k = image_grid_thw[k]
@@ -645,7 +688,7 @@ def _get_coord_predictions(
             if start + n_tok > len(vis_positions):
                 break
             h_k = last_hidden[vis_positions[start: start + n_tok]].to(dtype)
-            pred_k = coord_head(h_k, llm_h, llm_w)    # (llm_h*up, llm_w*up, 3)
+            pred_k = coord_head(h_k, llm_h, llm_w, cam_feat=cam_feat_dev)
             preds.append(pred_k.cpu().float())
             start += n_tok
 
@@ -1284,6 +1327,21 @@ def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
         metrics["coord_mae_mean"] = float(np.mean(coord_maes))
         metrics["coord_mae_std"]  = float(np.std(coord_maes))
         metrics["coord_mae_n"]    = len(coord_maes)
+    # Aggregate rotation angle (deg) when present (rotation / rotation_relative)
+    angles = [
+        r["rotation_angle_deg"] for r in results
+        if r.get("rotation_angle_deg") is not None
+    ]
+    if angles:
+        a = np.asarray(angles, dtype=np.float64)
+        metrics["rotation_angle_deg"] = {
+            "min":    float(a.min()),
+            "max":    float(a.max()),
+            "mean":   float(a.mean()),
+            "median": float(np.median(a)),
+            "var":    float(a.var()),
+            "n":      int(a.size),
+        }
     return metrics
 
 
@@ -1347,6 +1405,13 @@ def log_metrics(metrics: Dict, label: str, logger: logging.Logger) -> None:
             f"  Coord MAE: {metrics['coord_mae_mean']:.4f} ± {metrics['coord_mae_std']:.4f}"
             f"  (n={metrics['coord_mae_n']})"
         )
+    if "rotation_angle_deg" in metrics:
+        ra = metrics["rotation_angle_deg"]
+        logger.info(
+            f"  Rotation angle (deg): min={ra['min']:.2f}  max={ra['max']:.2f}  "
+            f"mean={ra['mean']:.2f}  median={ra['median']:.2f}  var={ra['var']:.2f}  "
+            f"(n={ra['n']})"
+        )
     logger.info("  Per-category accuracy:")
     for cat, acc in sorted(metrics["category_accuracy"].items()):
         n = metrics["category_counts"].get(cat, 0)
@@ -1383,7 +1448,10 @@ def evaluate(
       polar              — SPA LoRA + 4D M-RoPE, XYZ → spherical (ρ,θ,α) for RoPE;
                        prompt has no <coord> tokens; matches --polar in train_correspondence.py
       rotation           — SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder
-                       + coord head (rotated frame); matches train_rotation.py
+                       + coord head (rotated frame, cam_dim=0);
+                       matches train_rotation.py (no --relative)
+      rotation_relative  — same as rotation, but paired with a --relative
+                       checkpoint (coord head has extra cam_proj; cam_dim>0)
       both               — baseline + coordinate
 
     Returns dict mapping method name → list of result dicts.
@@ -1396,9 +1464,11 @@ def evaluate(
     run_coordinate = method in ("coordinate", "both")
     run_polar = method == "polar"
     run_rotation = method == "rotation"
+    run_rotation_relative = method == "rotation_relative"
+    run_any_rotation = run_rotation or run_rotation_relative
     run_spa = (
         run_vanilla or run_position_embedding or run_coordinate
-        or run_polar or run_rotation
+        or run_polar or run_any_rotation
     )
 
     # Lazy-load only what we need
@@ -1436,11 +1506,22 @@ def evaluate(
             image_token_id_val = _iid
 
         # Load DepthPredictionTransformer for coordinate / rotation checkpoints
-        if run_coordinate or run_rotation:
-            spa_coord_head = _load_coord_head(correspondence_ckpt, device)
+        if run_coordinate or run_any_rotation:
+            # rotation          → expect no cam_proj (strict)
+            # rotation_relative → expect cam_proj (strict)
+            # coordinate        → auto (no constraint)
+            if run_rotation:
+                _expect_rel = False
+            elif run_rotation_relative:
+                _expect_rel = True
+            else:
+                _expect_rel = None
+            spa_coord_head = _load_coord_head(
+                correspondence_ckpt, device, expect_relative=_expect_rel,
+            )
 
         # Load CameraTokenRotationEncoder for rotation checkpoint
-        if run_rotation:
+        if run_any_rotation:
             spa_rotation_enc = _load_rotation_enc(correspondence_ckpt, spa_model, device)
 
     # Determine which SPA variants to run.
@@ -1461,6 +1542,8 @@ def evaluate(
         spa_variants.append(("polar", False, True, False))
     if run_rotation:
         spa_variants.append(("rotation", False, False, True))
+    if run_rotation_relative:
+        spa_variants.append(("rotation_relative", False, False, True))
 
     active_methods = (
         (["baseline"] if run_baseline else [])
@@ -1497,10 +1580,15 @@ def evaluate(
                 load_xyz=(is_polar or is_rotation),
             )
 
-            # ---- Rotation: compute R and rotate image_xyz (matches train_rotation.py) ----
-            # GT used for coord MAE must also be rotated (training uses R @ gt_xyz).
+            # ---- Rotation: compute R (and cam_feat) and rotate image_xyz ----
+            # Mirrors train_rotation.py:
+            #   rotation          : coord GT = R @ xyz (rotated frame), cam_feat unused
+            #   rotation_relative : coord GT = original xyz,            cam_feat fed into DPT
+            is_relative = spa_method_name == "rotation_relative"
             xyz_for_rope = image_xyz
             xyz_for_mae = image_xyz
+            cam_feat_for_head: Optional[torch.Tensor] = None
+            rotation_angle_deg: Optional[float] = None
             if (
                 is_rotation
                 and spa_rotation_enc is not None
@@ -1508,11 +1596,19 @@ def evaluate(
                 and image_token_id_val is not None
             ):
                 try:
-                    R_mat = _compute_rotation_R(
+                    R_mat, cam_feat = _compute_rotation_R(
                         spa_model, spa_rotation_enc, inputs, image_xyz,
                         image_token_id_val, spatial_merge_size, coord_scale,
                     )
                     if R_mat is not None:
+                        # Rotation angle from trace: θ = acos((tr(R) - 1) / 2)
+                        with torch.no_grad():
+                            R_f = R_mat.detach().float()
+                            trace = R_f[0, 0] + R_f[1, 1] + R_f[2, 2]
+                            cos_theta = ((trace - 1.0) / 2.0).clamp(-1.0, 1.0)
+                            rotation_angle_deg = float(
+                                torch.acos(cos_theta) * (180.0 / np.pi)
+                            )
                         rotated = _apply_rotation_to_xyz(
                             R_mat,
                             [x.to(next(spa_model.parameters()).device) for x in image_xyz],
@@ -1520,10 +1616,15 @@ def evaluate(
                         xyz_for_rope = rotated
                         # Keep xyz_for_mae on CPU so it matches coord_head
                         # predictions (which _get_coord_predictions returns on CPU).
-                        xyz_for_mae = [r.detach().cpu() for r in rotated]
+                        if is_relative:
+                            # coord_head predicts in the ORIGINAL (un-rotated) frame
+                            xyz_for_mae = [x.detach().cpu() for x in image_xyz]
+                            cam_feat_for_head = cam_feat
+                        else:
+                            xyz_for_mae = [r.detach().cpu() for r in rotated]
                 except Exception as re:
                     logger.warning(
-                        f"[rotation] rotation_enc failed for idx="
+                        f"[{spa_method_name}] rotation_enc failed for idx="
                         f"{item.get('index')}: {re}"
                     )
 
@@ -1535,6 +1636,8 @@ def evaluate(
             )
             result = _make_result(item, output, prompt, spa_method_name,
                                     thinking=thinking)
+            if rotation_angle_deg is not None:
+                result["rotation_angle_deg"] = rotation_angle_deg
 
             # ---- DepthPredictionTransformer evaluation (coordinate + rotation) ----
             if (
@@ -1548,6 +1651,7 @@ def evaluate(
                         spa_model, inputs,
                         image_token_id_val, spa_coord_head,
                         spatial_merge_size, xyz_for_rope, coord_scale,
+                        cam_feat=cam_feat_for_head,
                     )
                     if preds is not None:
                         result["coord_mae"] = _compute_coord_mae(preds, xyz_for_mae)
@@ -1703,7 +1807,8 @@ def main() -> None:
     # ── method ────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--method", type=str, default="both",
-        choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar", "rotation", "both"],
+        choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
+                 "rotation", "rotation_relative", "both"],
         help=(
             "Which method(s) to run. "
             "baseline=stock Qwen3.5-VL; "
@@ -1711,7 +1816,8 @@ def main() -> None:
             "position_embedding=SPA LoRA + 4D M-RoPE, prompt has no <coord> tokens; "
             "coordinate=SPA LoRA + 4D M-RoPE + <coord> tokens (no_cam, Cartesian); "
             "polar=SPA LoRA + 4D M-RoPE, XYZ→spherical for RoPE, prompt has no <coord> tokens; "
-            "rotation=SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder (canonical R) + coord head; "
+            "rotation=SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder (canonical R) + coord head (cam_dim=0, non-relative ckpt); "
+            "rotation_relative=same as rotation but for --relative ckpts (coord head has cam_proj, cam_dim>0); "
             "both=baseline + coordinate."
         ),
     )
@@ -1881,6 +1987,7 @@ def main() -> None:
         "coordinate":         args.method in ("coordinate", "both"),
         "polar":              args.method == "polar",
         "rotation":           args.method == "rotation",
+        "rotation_relative":  args.method == "rotation_relative",
     }
     all_results: Dict[str, List[Dict]] = {}
     for mname, active in _method_names.items():
@@ -1894,7 +2001,8 @@ def main() -> None:
         "position_embedding": "position_embedding (SPA LoRA + 4D M-RoPE)",
         "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + <coord>, no_cam, Cartesian)",
         "polar":              "polar              (SPA LoRA + 4D M-RoPE, XYZ→spherical, no <coord>)",
-        "rotation":           "rotation           (SPA LoRA + 4D M-RoPE + rotation_enc + coord head)",
+        "rotation":           "rotation           (SPA LoRA + 4D M-RoPE + rotation_enc + coord head, cam_dim=0)",
+        "rotation_relative":  "rotation_relative  (SPA LoRA + 4D M-RoPE + rotation_enc + coord head, --relative ckpt)",
     }
     _metrics_fn = compute_metrics_robospatial if args.dataset == "robospatial" else compute_metrics
     for mname, mresults in all_results.items():
@@ -1916,6 +2024,7 @@ def main() -> None:
         ("baseline", "coordinate"),
         ("baseline", "polar"),
         ("baseline", "rotation"),
+        ("baseline", "rotation_relative"),
         ("baseline", "position_embedding"),
         ("baseline", "vanilla"),
     ]
