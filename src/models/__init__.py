@@ -17,5 +17,6 @@ from .coordinate_llm import (
 )
 from .rotation_rope_llm import (
     CameraTokenRotationEncoder,
+    CameraTokenRotationEncoderRL,
     RotationRoPEModel,
 )

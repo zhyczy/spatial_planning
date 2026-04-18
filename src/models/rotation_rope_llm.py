@@ -48,6 +48,7 @@ lm_loss / coord_loss — no ground-truth rotation or geodesic loss needed.
 """
 
 import itertools
+import math
 from typing import List, Tuple
 
 import torch
@@ -870,3 +871,374 @@ class RotationRoPEModel(nn.Module):
                    else (self.coord_weight * coord_loss)
 
         return R, loss, (_ldict if _ldict else None)
+
+    # ------------------------------------------------------------------
+    # Decomposed forward (used by train_rl.py — lets the caller cache
+    # inputs_embeds across multiple LLM forwards with different R values
+    # and decide per-call whether to enable autograd on the LLM path).
+    # ------------------------------------------------------------------
+
+    def encode_inputs(
+        self,
+        input_ids:      torch.Tensor,
+        pixel_values:   torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Step 1 only: text embed + vision feature scatter → inputs_embeds."""
+        inner         = self._unwrap()
+        spa_inner     = inner.model
+        inputs_embeds = spa_inner.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            image_outputs = spa_inner.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True,
+            )
+            image_embeds = image_outputs.pooler_output
+            if isinstance(image_embeds, (list, tuple)):
+                image_embeds = torch.cat(list(image_embeds), dim=0)
+            image_embeds = image_embeds.to(
+                inputs_embeds.device, inputs_embeds.dtype,
+            )
+            image_mask = (input_ids == self.image_token_id).unsqueeze(-1) \
+                                                            .expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        return inputs_embeds
+
+    def compute_losses_from_R(
+        self,
+        R:                  torch.Tensor | None,
+        inputs_embeds:      torch.Tensor,
+        input_ids:          torch.Tensor,
+        attention_mask:     torch.Tensor,
+        image_xyz:          list | None,
+        image_xyz_hires:    list | None,
+        image_grid_thw:     torch.Tensor | None,
+        labels:             torch.Tensor | None,
+        coord_scale:        float = 100.0,
+        use_coord_loss:     bool  = True,
+        use_relative:       bool  = False,
+        detach_coord_hidden: bool = False,
+        cam_feat:           torch.Tensor | None = None,
+        compute_reward:     bool = False,
+    ):
+        """Steps 3-5 + losses: rotate xyz, build float position_ids, run LLM, losses.
+
+        Unlike `forward`, this method does NOT run the rotation encoder — R is
+        supplied directly. When called under torch.no_grad() it acts as a
+        cheap reward-collection pass; called with grad it back-propagates
+        lm_loss through R to whatever produced R (head_res path).
+
+        Args:
+            R: (3, 3) rotation matrix (or None → identity). The caller decides
+               whether R has grad (for head_res update) or not (for reward
+               collection).
+            compute_reward: if True, add `_ldict["acc"]` (0/1 top-1 accuracy on
+               the first non-masked answer token — used as binary reward).
+
+        Returns:
+            (lm_loss, coord_loss, _ldict).  Each loss may be None.
+        """
+        _ldict: dict = {}
+
+        inner      = self._unwrap()
+        spa_inner  = inner.model
+        lm_head    = inner.lm_head
+        text_model = spa_inner.language_model
+
+        # Step 3: rotated xyz ------------------------------------------------
+        if R is not None and image_xyz is not None:
+            rotated_xyz = _apply_rotation_to_xyz(R, image_xyz)
+        else:
+            rotated_xyz = image_xyz
+
+        # Step 4: float 5D position_ids --------------------------------------
+        position_ids_float = _build_float_position_ids(
+            input_ids          = input_ids,
+            attention_mask     = attention_mask,
+            image_token_id     = self.image_token_id,
+            image_xyz          = rotated_xyz,
+            image_grid_thw     = image_grid_thw,
+            spatial_merge_size = self.spatial_merge_size,
+            coord_scale        = coord_scale,
+        )
+
+        # Step 5: manual LLM forward with differentiable RoPE ---------------
+        hidden2 = self._run_text_model_manual(
+            text_model         = text_model,
+            inputs_embeds      = inputs_embeds,
+            attention_mask     = attention_mask,
+            position_ids_float = position_ids_float,
+        )
+        logits2 = lm_head(hidden2)
+
+        # LM loss + optional binary accuracy (reward) -----------------------
+        lm_loss = None
+        if labels is not None:
+            shift_logits = logits2[:, :-1, :]
+            shift_labels = labels[:, 1:].to(logits2.device)
+            mask         = shift_labels[0] != -100
+            if mask.any():
+                lm_loss = F.cross_entropy(
+                    shift_logits[0, mask], shift_labels[0, mask],
+                )
+                _ldict["lm_loss"] = lm_loss.item()
+                if compute_reward:
+                    first_pos = mask.nonzero(as_tuple=True)[0][0].item()
+                    pred = shift_logits[0, first_pos].argmax(-1).item()
+                    gt   = int(shift_labels[0, first_pos].item())
+                    _ldict["acc"] = 1.0 if pred == gt else 0.0
+        del logits2
+
+        # Coord loss --------------------------------------------------------
+        coord_loss   = None
+        coord_gt_src = image_xyz_hires if image_xyz_hires is not None else image_xyz
+
+        if use_coord_loss and coord_gt_src is not None and image_grid_thw is not None:
+            if use_relative:
+                coord_gt  = coord_gt_src
+                _cam_cond = cam_feat.detach() if cam_feat is not None else None
+            else:
+                if R is not None:
+                    coord_gt = _apply_rotation_to_xyz(R.detach(), coord_gt_src)
+                else:
+                    coord_gt = coord_gt_src
+                _cam_cond = None
+
+            vis_pos = (input_ids[0] == self.image_token_id).nonzero(
+                as_tuple=True,
+            )[0]
+            sms   = self.spatial_merge_size
+            start = 0
+            per_img: list[torch.Tensor] = []
+            for k in range(min(len(coord_gt), len(image_grid_thw))):
+                thw_k = image_grid_thw[k]
+                llm_h = int(thw_k[1]) // sms
+                llm_w = int(thw_k[2]) // sms
+                n_tok = llm_h * llm_w
+                if start + n_tok > len(vis_pos):
+                    break
+                coord_h_k = hidden2[0, vis_pos[start: start + n_tok]]
+                if detach_coord_hidden:
+                    coord_h_k = coord_h_k.detach()
+                pred_k = self.coord_head(coord_h_k, llm_h, llm_w,
+                                         cam_feat=_cam_cond)
+                gt_k   = coord_gt[k].to(pred_k.device, dtype=pred_k.dtype)
+                per_img.append(F.l1_loss(pred_k, gt_k))
+                start += n_tok
+            if per_img:
+                coord_loss = torch.stack(per_img).mean()
+                _ldict["coord_loss"] = coord_loss.item()
+
+        return lm_loss, coord_loss, _ldict
+
+
+# ---------------------------------------------------------------------------
+# Chiral cube rotation group + so(3) exponential map (used by RL encoder)
+# ---------------------------------------------------------------------------
+
+def _build_chiral_cube_group() -> torch.Tensor:
+    """24 proper rotations of the cube (orientation-preserving symmetries).
+
+    Constructed as signed permutation matrices with det = +1:
+    for each permutation σ of (0,1,2) and each sign assignment
+    (s0, s1, s2) ∈ {-1, +1}³, build M with M[i, σ(i)] = s_i.  6 × 8 = 48
+    matrices total; 24 have det = +1 (proper rotations).
+
+    Returns:
+        (24, 3, 3) float32 tensor.
+    """
+    mats: list[torch.Tensor] = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product([-1, 1], repeat=3):
+            M = torch.zeros(3, 3, dtype=torch.float32)
+            for i, j in enumerate(perm):
+                M[i, j] = float(signs[i])
+            if torch.det(M) > 0.5:
+                mats.append(M)
+    # Sort descending by trace so identity (trace=3, angle=0) is index 0.
+    # Angle θ = acos((trace - 1) / 2), so higher trace = smaller angle;
+    # R_bins[0] = I, and neighbours are the lowest-angle cube rotations.
+    mats.sort(key=lambda M: -(M[0, 0] + M[1, 1] + M[2, 2]).item())
+    R_bins = torch.stack(mats, dim=0)
+    assert R_bins.shape == (24, 3, 3), f"unexpected shape {R_bins.shape}"
+    assert torch.allclose(R_bins[0], torch.eye(3)), "R_bins[0] must be identity"
+    return R_bins
+
+
+def _hat(v: torch.Tensor) -> torch.Tensor:
+    """Skew-symmetric matrix of (3,) vector v (differentiable in v)."""
+    vx, vy, vz = v[0], v[1], v[2]
+    zero = torch.zeros_like(vx)
+    return torch.stack([
+        torch.stack([zero,  -vz,   vy]),
+        torch.stack([vz,    zero,  -vx]),
+        torch.stack([-vy,   vx,    zero]),
+    ])
+
+
+def _rodrigues(axis_angle: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Exponential map so(3) → SO(3) via Rodrigues formula.
+
+    R = I + (sinθ / θ) · hat(δ) + ((1 - cosθ) / θ²) · hat(δ)²
+      where δ = axis_angle and θ = ||δ||.  Uses the normalized form
+      (I + sinθ · K + (1 - cosθ) · K²) with K = hat(δ/θ), ε-safe.
+
+    Args:
+        axis_angle: (3,) float tensor; magnitude = rotation angle (radians),
+                    direction = rotation axis.  Fully differentiable.
+
+    Returns:
+        (3, 3) rotation matrix.
+    """
+    theta = torch.linalg.vector_norm(axis_angle) + eps
+    K     = _hat(axis_angle / theta)
+    I     = torch.eye(3, dtype=axis_angle.dtype, device=axis_angle.device)
+    return I + torch.sin(theta) * K + (1.0 - torch.cos(theta)) * (K @ K)
+
+
+# ---------------------------------------------------------------------------
+# CameraTokenRotationEncoderRL — 24-anchor + optional 3-DOF residual head
+# ---------------------------------------------------------------------------
+
+class CameraTokenRotationEncoderRL(nn.Module):
+    """Shallow M-RoPE encoder predicting (anchor_logits, per-anchor residual).
+
+    Output heads
+    ~~~~~~~~~~~~
+    head_cls: Linear(d_model, 24)   → anchor logits (softmax = π(a|s))
+    head_res: Linear(d_model, 72)   → (24, 3) axis-angle residual per anchor,
+                                       zero-init, active only in "hybrid" mode.
+
+    Final rotation (for anchor k):
+        R_final(k) = R_bins[k] @ exp(hat(residual_clamp · tanh(residual_all[k])))
+
+    With zero-init head_cls → uniform π₀ at step 0; entropy bonus in the
+    RL objective prevents dead anchors.  With zero-init head_res → ΔR = I,
+    so R_final(k) = R_bins[k] at step 0 and residual only learns corrections
+    on anchors the policy has already identified as high-reward.
+
+    Args:
+        hidden_dim:      MLLM hidden size.
+        mllm_head_dim:   MLLM head_dim (must match rope_emb).
+        rope_emb:        SpaTextRotaryEmbedding shared with MLLM.
+        nhead:           attention heads in this encoder (d_model = nhead × head_dim).
+        dim_feedforward: FFN width.
+        num_layers:      encoder depth.
+        dropout:         MUST be 0.0 for RL training — the 24 no_grad reward
+                         pass and the grad pass must be deterministic on the
+                         same inputs so advantages are comparable.
+        action_space:    "discrete" (head_cls only, head_res = None) or
+                         "hybrid"   (head_cls + head_res).
+        residual_clamp:  max axis-angle magnitude (rad) per DoF after tanh.
+                         Default π/6 ≈ 30° — chosen so adjacent cube anchors
+                         (separated by 60°–90° geodesic) do not overlap.
+    """
+
+    def __init__(
+        self,
+        hidden_dim:      int,
+        mllm_head_dim:   int,
+        rope_emb:        nn.Module,
+        nhead:           int   = 4,
+        dim_feedforward: int   = 2048,
+        num_layers:      int   = 2,
+        dropout:         float = 0.0,
+        action_space:    str   = "hybrid",
+        residual_clamp:  float = math.pi / 6,
+    ):
+        super().__init__()
+        assert action_space in ("discrete", "hybrid"), \
+            f"action_space must be 'discrete' or 'hybrid', got {action_space}"
+        assert mllm_head_dim > 0 and nhead > 0
+        self.d_model        = nhead * mllm_head_dim
+        self.nhead          = nhead
+        self.mllm_head_dim  = mllm_head_dim
+        self.action_space   = action_space
+        self.residual_clamp = float(residual_clamp)
+
+        self.cam_token = nn.Parameter(torch.empty(1, self.d_model))
+        nn.init.normal_(self.cam_token, std=0.02)
+
+        self.input_proj = nn.Linear(hidden_dim, self.d_model)
+
+        self.layers = nn.ModuleList([
+            _MRoPEEncoderLayer(
+                d_model         = self.d_model,
+                nhead           = nhead,
+                dim_feedforward = dim_feedforward,
+                rope_emb        = rope_emb,
+                dropout         = dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # Anchor classifier — zero-init → uniform π at step 0.
+        self.head_cls = nn.Linear(self.d_model, 24)
+        nn.init.zeros_(self.head_cls.weight)
+        nn.init.zeros_(self.head_cls.bias)
+
+        # Per-anchor 3-DoF residual head — zero-init → ΔR = I at step 0.
+        if action_space == "hybrid":
+            self.head_res = nn.Linear(self.d_model, 24 * 3)
+            nn.init.zeros_(self.head_res.weight)
+            nn.init.zeros_(self.head_res.bias)
+        else:
+            self.head_res = None
+
+        # Fixed 24-element chiral cube rotation group (persistent=False so
+        # we don't pollute state_dict with a constant).
+        R_bins = _build_chiral_cube_group()
+        self.register_buffer("R_bins", R_bins, persistent=False)
+
+    def forward(
+        self,
+        hidden_states:  torch.Tensor,   # (1, seq_len, hidden_dim)
+        token_txyz_int: torch.Tensor,   # (seq_len, 4) long
+    ) -> Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """
+        Returns:
+            logits:       (24,) float32 — anchor classifier logits.
+            residual_all: (24, 3) float32 raw axis-angle output (pre-clamp),
+                          or None if action_space=="discrete".
+            cam_feat:     (d_model,) cam-token feature in encoder dtype.
+        """
+        device = hidden_states.device
+
+        x = self.input_proj(hidden_states[0])
+        cam = self.cam_token.to(dtype=x.dtype, device=device)
+        x   = torch.cat([cam, x], dim=0)
+
+        cam_pos  = torch.zeros(4, 1, 1, dtype=torch.long, device=device)
+        mllm_pos = token_txyz_int.long().T.unsqueeze(1)
+        position_ids = torch.cat([cam_pos, mllm_pos], dim=2)
+
+        x = x.unsqueeze(0)
+        for layer in self.layers:
+            x = layer(x, position_ids)
+
+        cam_feat = x[0, 0]
+        logits   = self.head_cls(cam_feat).float()              # (24,)
+        if self.head_res is not None:
+            residual_all = self.head_res(cam_feat).float().view(24, 3)
+        else:
+            residual_all = None
+        return logits, residual_all, cam_feat
+
+    def compose_R(
+        self,
+        k:            int,
+        residual_all: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """R_final = R_bins[k] @ exp(hat(residual_clamp · tanh(residual_all[k]))).
+
+        In discrete mode (or residual_all None) returns R_bins[k] directly.
+        Return dtype is float32 regardless of the model's bf16 cast, matching
+        the dtype convention established by the 6-D rotation head path.
+        """
+        R_k = self.R_bins[k].float()
+        if residual_all is None or self.head_res is None:
+            return R_k
+        delta_raw = residual_all[k]                              # (3,)
+        delta     = self.residual_clamp * torch.tanh(delta_raw)
+        R_delta   = _rodrigues(delta)                            # (3, 3)
+        return R_k @ R_delta

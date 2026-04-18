@@ -731,11 +731,11 @@ def train(args: argparse.Namespace) -> None:
                             f"{k}={v:.4f}" for k, v in avg_loss_dict.items()
                         )
                         log.info(
-                            f"[train] epoch={epoch+1:02d}  global_step={global_step:05d}  "
+                            f"[train][Phase {current_phase}] "
+                            f"epoch={epoch+1:02d}  global_step={global_step:05d}  "
                             f"loss={avg_loss:.4f}"
                             + (f"  ({detail})" if detail else "")
                             + f"  lr={current_lr:.2e}  coord_lr={coord_head_lr:.2e}  "
-                            f"phase={current_phase}  "
                             f"(aggregated across {world_size} GPU{'s' if world_size > 1 else ''})"
                         )
                         if use_wandb:
