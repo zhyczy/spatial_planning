@@ -3,7 +3,7 @@ train_rl.py
 
 Alternating two-phase LoRA fine-tuning of SpaForConditionalGeneration
 (Qwen3.5-VL) where Phase B is replaced with GRPO-based RL over a
-discretised SO(3) action space.
+discretised SO(3) action space (24 chiral cube rotations).
 
 Architecture
 ~~~~~~~~~~~~
@@ -12,62 +12,61 @@ RotationRLModel = RotationRoPEModel + CameraTokenRotationEncoderRL
     +-- CameraTokenRotationEncoderRL
     |     +-- shallow 4D M-RoPE encoder (2 layers)
     |     +-- head_cls  : Linear(d, 24)   — anchor-classifier logits
-    |     +-- head_res  : Linear(d, 72)   — per-anchor axis-angle (hybrid only)
     |     +-- R_bins    : 24 chiral cube rotations (buffer)
     +-- DepthPredictionTransformer   [coordinate head]
 
-Final rotation composition (hybrid):
-    R_final(k) = R_bins[k] @ exp(hat(residual_clamp * tanh(residual_all[k])))
-Discrete (--action_space discrete): R_final(k) = R_bins[k] only.
+Final rotation composition: R_final(k) = R_bins[k].
 
 Schedule (per epoch — two full passes over the dataset)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Phase A (first full pass): standard SFT
-    * rotation_enc frozen     (epoch 0: logits=0, residual=0 → R = R_bins[0] = I)
+    * rotation_enc frozen     (epoch 0: logits=0 → R = R_bins[0] = I)
     * LoRA       trainable    (lm_loss)
     * coord_head trainable    (coord_loss)
 
 Phase B (second full pass): GRPO RL
     * LoRA            frozen
-    * head_cls        trainable via REINFORCE     (reward = 0/1 MCQ accuracy)
-    * head_res        trainable via RWR-weighted  (loss_lm only)
-    * rot_enc backbone trainable via lm_loss      (shared signal)
-    * coord_head      trainable via loss_coord    (R detached, hidden detached)
+    * head_cls        trainable via PPO/REINFORCE  (reward = 0/1 MCQ accuracy)
+    * rot_enc backbone trainable via PPO surrogate (shared with head_cls)
+    * coord_head      trainable via loss_coord on argmax anchor
+                       (R detached, hidden detached)
 
 Gradient flow in Phase B
 ~~~~~~~~~~~~~~~~~~~~~~~~
-    head_cls  ← policy gradient     ← REINFORCE(log π · advantage)
-    head_res  ← differentiable SFT  ← loss_lm on correct anchors (RWR)
-    coord_head ← differentiable SFT ← loss_coord, R detached, hidden detached
-    (head_res NEVER receives loss_coord; coord_head NEVER receives loss_lm.)
+    head_cls / rot_bb ← PPO clipped surrogate ← (log π · advantage)
+    coord_head        ← differentiable SFT    ← loss_coord on argmax k,
+                                                 R detached, hidden detached
+    (coord_head NEVER receives loss_lm.)
 
 GRPO objective (per batch)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
   1. Enumerate all G=24 cube anchors in a no_grad reward pass
      → rewards[k] ∈ {0, 1} (binary accuracy of MCQ answer)
   2. Group-normalised advantage:  A[k] = (r[k] - mean) / (std + ε)
-     (If std < ε → group is degenerate; skip RL term but still do SFT/KL.)
-  3. L_rl    = -(log_probs · A.detach()).mean()                 # 1-step REINFORCE
-  4. L_ent   = -entropy_beta · H(π)                              # exploration
-  5. L_kl    = kl_lambda · KL(π || Uniform)                      # anti-collapse
-  6. L_sft   (hybrid) = Σ_k w_k · (w_lm · lm_loss_k + w_coord · coord_loss_k)
-                        for k ∈ top-K correct anchors,
-                        w_k = softmax(-lm_loss / τ)              # RWR
-            (discrete) = w_coord · coord_loss(argmax k)
-  7. L_total = rl_weight · (L_rl + L_ent + L_kl) + sft_weight · L_sft
+     (If std < ε → group is degenerate; skip RL term but still do SFT.)
+  3. Snapshot log_probs_old (no_grad) once before the PPO inner loop.
+  4. K = ppo_inner_epochs iterations of:
+       ratio  = exp(log π_θ - log π_old)
+       L_rl   = -mean(min(ratio·A, clip(ratio,1-ε,1+ε)·A))
+       L_ent  = -entropy_beta · H(π)
+       L_kl   =  kl_lambda · KL(π || Uniform)
+       policy_opt.zero_grad / backward / step
+  5. L_sft = w_coord · coord_loss(argmax k)
+  6. L_total = rl_weight · (L_rl + L_ent + L_kl) + sft_weight · L_sft
 
 Learning rate
 ~~~~~~~~~~~~~
 Cosine annealing with warm restarts; one cycle per phase-pass.
-Five independent schedules: LoRA, coord_head, rot_bb, head_cls, head_res.
+Four independent schedules: LoRA, coord_head, rot_bb, head_cls.
+Policy LR (rot_bb / head_cls) is scaled by 1/K so K inner PPO steps
+per rollout stay comparable to one big step.
 
 Usage
 ~~~~~
   python train_rl.py \\
       --model_path checkpoints/Qwen3.5-4B \\
       --output_dir checkpoints/spa_rotation_rl \\
-      --action_space hybrid \\
-      --lr_phase_a 2e-4 --lr_phase_b 5e-5
+      --lr_phase_a 2e-4 --lr_phase_b 2e-4
 """
 
 import argparse
@@ -146,10 +145,8 @@ def build_model(
     rot_dim_feedforward: int   = 2048,
     rot_num_layers:      int   = 2,
     relative:            bool  = False,
-    action_space:        str   = "hybrid",
-    residual_clamp:      float = math.pi / 6,
 ) -> RotationRoPEModel:
-    """Build RotationRoPEModel with the RL encoder (24-class + residual)."""
+    """Build RotationRoPEModel with the RL encoder (discrete 24-class)."""
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
     total    = sum(orig_section)
@@ -215,15 +212,12 @@ def build_model(
         dim_feedforward = rot_dim_feedforward,
         num_layers      = rot_num_layers,
         dropout         = 0.0,                  # MUST be 0 for RL (det. no_grad == grad)
-        action_space    = action_space,
-        residual_clamp  = residual_clamp,
+        action_space    = "discrete",
     ).to(torch.bfloat16)
     log.info(
         f"CameraTokenRotationEncoderRL  hidden_dim={hidden_dim}  "
         f"mllm_head_dim={mllm_head_dim}  nhead={rot_nhead}  "
-        f"d_model={rotation_enc.d_model}  action_space={action_space}  "
-        f"residual_clamp={residual_clamp:.4f} rad "
-        f"({math.degrees(residual_clamp):.1f}°)"
+        f"d_model={rotation_enc.d_model}  (discrete action space)"
     )
 
     cam_dim = rotation_enc.d_model if relative else 0
@@ -252,6 +246,43 @@ def build_model(
 def _set_requires_grad(params, flag: bool) -> None:
     for p in params:
         p.requires_grad_(flag)
+
+
+def _dummy_zero_backward(params, scale: float = 1.0) -> None:
+    """Run a zero-valued backward over *params* to keep DDP bucket allreduces
+    in lockstep with other ranks.
+
+    When a rank would otherwise skip a backward (loss is None, zero-variance
+    PPO batch, missing coord loss), its NCCL op count drifts from peers
+    and eventually hangs. Running a dummy ``sum(p.sum()) *
+    0.0`` backward fires every param's DDP grad hook with a zero gradient —
+    optimizer.step() is then a no-op but ranks stay in sync.
+    """
+    live = [p for p in (params or []) if p.requires_grad]
+    if not live:
+        return
+    dummy = sum(p.sum() for p in live) * 0.0
+    if scale != 1.0:
+        dummy = dummy * scale
+    dummy.backward()
+
+
+def _any_rank_active(local_flag: bool, device) -> bool:
+    """all_reduce(MAX) a per-rank boolean. Returns True iff *any* rank is active."""
+    if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+        return bool(local_flag)
+    t = torch.tensor([1.0 if local_flag else 0.0], device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return t.item() > 0.5
+
+
+def _max_across_ranks(local_val: int, device) -> int:
+    """all_reduce(MAX) an integer across ranks."""
+    if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+        return int(local_val)
+    t = torch.tensor([int(local_val)], device=device, dtype=torch.long)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return int(t.item())
 
 
 # -- Phase A step (SFT with deterministic argmax anchor) -----------------------
@@ -309,6 +340,9 @@ def _phase_a_step(
         compute_reward      = False,
     )
 
+    if R is not None:
+        _ldict["R_trace"] = float(R.trace().item())
+
     loss = None
     if lm_loss is not None:
         loss = _model.answer_weight * lm_loss
@@ -321,15 +355,16 @@ def _phase_a_step(
 # -- Phase B step (GRPO) -------------------------------------------------------
 
 def _phase_b_grpo_step(
-    _model:          RotationRoPEModel,
-    batch_tensors:   dict,
-    args:            argparse.Namespace,
-    grad_accum:      int                    = 1,
-    policy_opt:      torch.optim.Optimizer | None = None,
-    head_cls_params: list | None            = None,
-    rot_bb_params:   list | None            = None,
+    _model:            RotationRoPEModel,
+    batch_tensors:     dict,
+    args:              argparse.Namespace,
+    grad_accum:        int                          = 1,
+    policy_opt:        torch.optim.Optimizer | None = None,
+    head_cls_params:   list | None                  = None,
+    rot_bb_params:     list | None                  = None,
+    coord_head_params: list | None                  = None,
 ):
-    """One GRPO update over all 24 cube anchors.
+    """One GRPO update over all 24 cube anchors (discrete action space only).
 
     Discrete mode: true PPO inner loop.
         - ``log_probs_old`` and group-normalised advantages are snapshotted
@@ -340,20 +375,17 @@ def _phase_b_grpo_step(
           No feature caching — rot_bb weights change between iterations, so
           cam_feat must be regenerated every time.
         - head_cls / rot_bb grads are clipped inside the inner loop; the
-          outer grad_accum pipeline does NOT touch these params in discrete.
+          outer grad_accum pipeline does NOT touch these params.
         - Zero-variance batch: inner loop is skipped entirely (no L_rl /
           L_ent / L_kl).
 
-    Hybrid mode: unchanged — single-step surrogate in Stage 2, reg_loss
-    backward in Stage 4, all scaled by ``1/grad_accum``.
-
-    Stage 3 (coord-head SFT) still runs its own in-loop ``backward(retain_graph=True)``
+    Stage 3 (coord-head SFT) runs its own in-loop ``backward(retain_graph=True)``
     scaled by ``1/grad_accum``; only the coord_head / LoRA path is affected.
 
     Returns:
         (loss_total_scalar: float, loss_dict, R_used) — scalar total loss
         value (already ``backward``-ed internally), dict of diagnostics, and
-        the R used in the RWR/argmax path (for R-visualisation).
+        the R used in the argmax path (for R-visualisation).
     """
     input_ids       = batch_tensors["input_ids"]
     attention_mask  = batch_tensors["attention_mask"]
@@ -362,6 +394,8 @@ def _phase_b_grpo_step(
     image_xyz       = batch_tensors["image_xyz"]
     image_xyz_hires = batch_tensors["image_xyz_hires"]
     labels          = batch_tensors["labels"]
+    bucket          = batch_tensors.get("bucket", "C")
+    k_gt            = int(batch_tensors.get("k_gt", -1))
     device          = input_ids.device
 
     _ldict: dict = {}
@@ -374,11 +408,11 @@ def _phase_b_grpo_step(
         image_xyz, image_grid_thw, _model.spatial_merge_size,
         args.coord_scale,
     )
-    # Encoder forward WITH grad — logits & residual_all carry head_cls /
-    # head_res gradient back to their heads (and to encoder backbone).
+    # Encoder forward WITH grad — logits carries head_cls gradient back to
+    # the head and encoder backbone.
     logits, residual_all, cam_feat = _model.rotation_enc(
         inputs_embeds.detach(), token_txyz_int,
-    )   # logits (24,), residual_all (24,3) or None, cam_feat (d_model,)
+    )   # logits (24,), residual_all=None (discrete), cam_feat (d_model,)
 
     # ── Stage 1: 24 × no_grad reward collection ──────────────────────────
     rewards   = torch.zeros(24, dtype=torch.float32, device=device)
@@ -417,52 +451,88 @@ def _phase_b_grpo_step(
     _ldict["reward_std"]  = float(rewards.std(unbiased=False).item())
     _ldict["lm_loss_best_anchor"] = float(lm_losses.min().item())
 
-    # Discrete reward shaping: within each outcome group (correct / wrong)
-    # add a zero-mean lm_loss-based perturbation. Group means are preserved
-    # (correct stays at 1, wrong stays at 0), so the correct-vs-wrong contrast
-    # is untouched while lm_loss breaks intra-group ties and provides a dense
-    # signal in the all-correct / all-wrong degenerate batches.
-    if _model.rotation_enc.action_space == "discrete":
-        finite_mask    = torch.isfinite(lm_losses)
-        rewards_shaped = rewards.clone()
-        n_shaped_groups = 0
-        for group_mask in (rewards > 0.5, rewards < 0.5):
-            g   = group_mask & finite_mask
-            n_g = int(g.sum().item())
-            if n_g >= 2:
-                lm_g = lm_losses[g]
-                w    = F.softmax(-lm_g / args.rwr_tau, dim=0)
-                rewards_shaped[g] = rewards_shaped[g] + args.w_lm * (w - 1.0 / n_g)
-                n_shaped_groups += 1
-        rewards = rewards_shaped
-        _ldict["reward_shape_groups"] = float(n_shaped_groups)
-        _ldict["reward_shape_spread"] = float(rewards.max() - rewards.min())
+    # Reward shaping: within each outcome group (correct / wrong) add a
+    # zero-mean lm_loss-based perturbation. Group means are preserved
+    # (correct stays at 1, wrong stays at 0), so the correct-vs-wrong
+    # contrast is untouched while lm_loss breaks intra-group ties and
+    # provides a dense signal in the all-correct / all-wrong degenerate
+    # batches.
+    finite_mask    = torch.isfinite(lm_losses)
+    rewards_shaped = rewards.clone()
+    n_shaped_groups = 0
+    for group_mask in (rewards > 0.5, rewards < 0.5):
+        g   = group_mask & finite_mask
+        n_g = int(g.sum().item())
+        if n_g >= 2:
+            lm_g = lm_losses[g]
+            w    = F.softmax(-lm_g / args.rwr_tau, dim=0)
+            rewards_shaped[g] = rewards_shaped[g] + args.w_lm * (w - 1.0 / n_g)
+            n_shaped_groups += 1
+    rewards = rewards_shaped
+    _ldict["reward_shape_groups"] = float(n_shaped_groups)
+    _ldict["reward_shape_spread"] = float(rewards.max() - rewards.min())
+
+    # ── Bucket-aware anchor-prior shaping ───────────────────────────────
+    # Semantics: rewards is shape (24,) — the "group" here is the 24
+    # exhaustive cube anchors (group_size=24, not sampled rollouts). So
+    # rewards[k] is the reward of selecting anchor k, and shape[k_gt] is
+    # exactly "bonus for choosing the correct anchor". ASSERT (24,) to
+    # guard against any future switch to sampled-rollout GRPO: in that
+    # case k_gt ∈ [0,23] would no longer be a valid rewards index.
+    assert rewards.shape == (24,), (
+        f"anchor-prior shaping assumes rewards.shape == (24,), got "
+        f"{tuple(rewards.shape)}. If you switched to sampled rollouts, "
+        f"redesign: look up which rollouts chose anchor k_gt instead."
+    )
+    _w_bucket = {
+        "B": float(getattr(args, "w_rot_hi",  0.0)),
+        "H": float(getattr(args, "w_hypo",    0.0)),
+        "D": float(getattr(args, "w_rot_mid", 0.0)),
+        "E": float(getattr(args, "w_rot_mid", 0.0)),
+        "A": float(getattr(args, "w_trans",   0.0)),
+    }.get(bucket, 0.0)
+    _w_prior = float(getattr(args, "w_anchor_prior", 0.0)) * _w_bucket
+    _prior_active = 0.0
+    if k_gt >= 0 and _w_prior > 0.0:
+        prior_shape = torch.full_like(rewards, -_w_prior / 24.0)
+        prior_shape[k_gt] = _w_prior * (1.0 - 1.0 / 24.0)
+        rewards = rewards + prior_shape
+        _prior_active = 1.0
+    _ldict["prior_active"]      = _prior_active
+    _ldict["prior_weight_used"] = _w_prior
+    _ldict["bucket_id"]         = {"A":0,"B":1,"C":2,"D":3,"E":4,"H":5}.get(bucket, -1)
+    _ldict["k_gt"]              = float(k_gt)
 
     # ── Stage 2: policy-gradient update(s) ──────────────────────────────
-    # Discrete:  K inner PPO epochs, each one re-forwards rotation_enc and
-    #            calls policy_opt.step() inline (no grad-accum on policy
-    #            params).  NO feature caching — rot_bb weights change between
-    #            iterations, so cam_feat must be regenerated every time.
-    # Hybrid:    unchanged — single-step surrogate; Stage 4 handles backward.
+    # K inner PPO epochs, each one re-forwards rotation_enc and calls
+    # policy_opt.step() inline (no grad-accum on policy params).
+    # NO feature caching — rot_bb weights change between iterations, so
+    # cam_feat must be regenerated every time.
     r_mean = rewards.mean()
     r_std  = rewards.std(unbiased=False)
 
-    if _model.rotation_enc.action_space == "discrete":
-        # Snapshot old policy (constant across inner epochs).
-        with torch.no_grad():
-            log_probs_old = F.log_softmax(logits, dim=-1)
+    # Snapshot old policy (constant across inner epochs).
+    with torch.no_grad():
+        log_probs_old = F.log_softmax(logits, dim=-1)
 
-        # Defaults for zero-variance skip.
-        L_rl  = torch.zeros((), device=device)
-        L_ent = torch.zeros((), device=device)
-        L_kl  = torch.zeros((), device=device)
-        _ldict["entropy"]   = 0.0
-        _ldict["L_rl"]      = 0.0
-        _ldict["rl_active"] = 0.0
+    # Defaults for zero-variance skip.
+    L_rl  = torch.zeros((), device=device)
+    L_ent = torch.zeros((), device=device)
+    L_kl  = torch.zeros((), device=device)
+    _ldict["entropy"]   = 0.0
+    _ldict["L_rl"]      = 0.0
+    _ldict["rl_active"] = 0.0
 
-        if r_std.item() > 1e-6 and policy_opt is not None:
+    # Coordinate across ranks: if ANY rank has r_std > 1e-6, ALL ranks
+    # run K inner epochs. Locally-inactive ranks run K zero-gradient
+    # backward+step to keep DDP bucket allreduces aligned.
+    local_active = (r_std.item() > 1e-6) and (policy_opt is not None)
+    any_active   = _any_rank_active(local_active, device)
+
+    if any_active and policy_opt is not None:
+        K = int(args.ppo_inner_epochs)
+        if local_active:
             advantages = ((rewards - r_mean) / (r_std + 1e-8)).detach()
-            K = int(args.ppo_inner_epochs)
             for inner_step in range(K):
                 # Re-forward rotation_enc (rot_bb + head_cls). inputs_embeds
                 # is already detached upstream, so only the shallow M-RoPE
@@ -511,140 +581,62 @@ def _phase_b_grpo_step(
                     _ldict["clip_frac"]  = float(
                         ((ratio_i < 1.0 - args.ppo_clip_eps) |
                          (ratio_i > 1.0 + args.ppo_clip_eps)).float().mean().item())
-            _ldict["rl_active"]        = 1.0
-            _ldict["ppo_inner_epochs"] = float(K)
-
-    else:
-        # Hybrid mode (unchanged single-step surrogate + Stage-4 backward).
-        log_probs = F.log_softmax(logits, dim=-1)
-        probs     = log_probs.exp()
-        H_pi      = -(probs * log_probs).sum()
-        if r_std.item() > 1e-6:
-            advantages = (rewards - r_mean) / (r_std + 1e-8)
-            log_probs_old = log_probs.detach()
-            ratio = torch.exp(log_probs - log_probs_old)
-            adv   = advantages.detach()
-            surr1 = ratio * adv
-            surr2 = torch.clamp(ratio, 1.0 - args.ppo_clip_eps,
-                                        1.0 + args.ppo_clip_eps) * adv
-            L_rl  = -torch.min(surr1, surr2).mean()
-            L_ent = -args.entropy_beta * H_pi
-            L_kl  = args.kl_lambda * (math.log(24) - H_pi)
-            _ldict["rl_active"]   = 1.0
-            _ldict["ratio_mean"]  = float(ratio.mean().item())
-            _ldict["ratio_max"]   = float(ratio.max().item())
-            _ldict["clip_frac"]   = float(
-                ((ratio < 1.0 - args.ppo_clip_eps) |
-                 (ratio > 1.0 + args.ppo_clip_eps)).float().mean().item())
+            _ldict["rl_active"] = 1.0
         else:
-            L_rl  = torch.zeros((), device=device)
-            L_ent = torch.zeros((), device=device)
-            L_kl  = torch.zeros((), device=device)
+            # Zero-gradient PPO inner loop to stay in sync with ranks
+            # that are running the real one.
+            _policy_params = (head_cls_params or []) + (rot_bb_params or [])
+            for _ in range(K):
+                policy_opt.zero_grad(set_to_none=True)
+                _dummy_zero_backward(_policy_params)
+                policy_opt.step()
             _ldict["rl_active"] = 0.0
-        _ldict["entropy"]  = float(H_pi.item())
-        _ldict["L_rl"]     = float(L_rl.item())
+        _ldict["ppo_inner_epochs"] = float(K)
 
-    # ── Stage 3: differentiable SFT (RWR weighted / argmax) ──────────────
-    #   hybrid  : grad forward on up to K_MAX_GRAD correct anchors, weighted
-    #             by softmax(-lm_loss / τ).  head_res receives loss_lm;
-    #             coord_head receives loss_coord (hidden detached).
-    #   discrete: single grad forward on argmax(logits) — coord_loss only
-    #             (head_cls is updated only via policy gradient).
-    #
-    # **In-loop backward**: each SFT iteration calls backward(retain_graph=True)
-    # immediately so the LLM+Vision activation graph of *this* iteration is
-    # released before the next forward.  retain_graph=True keeps the small
-    # rotation_enc graph alive for: (i) subsequent SFT iterations that re-use
-    # residual_all/cam_feat, and (ii) the final reg-loss backward on logits.
+    # ── Stage 3: differentiable SFT (argmax coord) ───────────────────────
+    # Use argmax anchor for the coord_loss grad forward (coord_head updates
+    # only; head_cls is updated only via policy gradient).
     sft_coef     = args.sft_weight / grad_accum
     L_sft_scalar = 0.0              # Σ weights[i] · step_loss (unscaled) for logs
     R_used       = None             # for R-visualisation
 
-    if _model.rotation_enc.action_space == "hybrid":
-        correct_idx = torch.where(rewards > 0.5)[0]
-        if correct_idx.numel() > 0:
-            correct_lm = lm_losses[correct_idx]
-            # Top-K truncation by lowest lm_loss (best anchors first).
-            K = int(min(args.k_max_grad, correct_idx.numel()))
-            if correct_idx.numel() > K:
-                topk = torch.topk(-correct_lm, k=K)
-                keep = topk.indices
-                correct_idx = correct_idx[keep]
-                correct_lm  = correct_lm[keep]
-            # RWR weights: favour anchors with smaller lm_loss.
-            weights = F.softmax(-correct_lm / args.rwr_tau, dim=0)
-            _ldict["sft_n_anchors"] = float(correct_idx.numel())
-
-            for i, k_idx in enumerate(correct_idx.tolist()):
-                R_k_grad = _model.rotation_enc.compose_R(k_idx, residual_all)
-                lm_loss_g, coord_loss_g, _ldict_g = _model.compute_losses_from_R(
-                    R                   = R_k_grad,
-                    inputs_embeds       = inputs_embeds,
-                    input_ids           = input_ids,
-                    attention_mask      = attention_mask,
-                    image_xyz           = image_xyz,
-                    image_xyz_hires     = image_xyz_hires,
-                    image_grid_thw      = image_grid_thw,
-                    labels              = labels,
-                    coord_scale         = args.coord_scale,
-                    use_coord_loss      = not args.no_coord,
-                    use_relative        = args.relative,
-                    detach_coord_hidden = True,
-                    cam_feat            = cam_feat,
-                    compute_reward      = False,
-                )
-                step_loss = torch.zeros((), device=device)
-                if lm_loss_g is not None:
-                    step_loss = step_loss + args.w_lm    * lm_loss_g
-                if coord_loss_g is not None:
-                    step_loss = step_loss + args.w_coord * coord_loss_g
-                weighted = weights[i] * step_loss
-
-                # Backward this iteration NOW → free the LLM/Vision graph.
-                (sft_coef * weighted).backward(retain_graph=True)
-                L_sft_scalar += float(weighted.item())
-
-                if i == 0:
-                    R_used = R_k_grad.detach()          # record best anchor's R
-        else:
-            _ldict["sft_n_anchors"] = 0.0
-    else:
-        # Discrete: no residual head → head_res is None.  Use argmax anchor
-        # for the coord_loss grad forward (coord_head updates only).
-        k_star = int(logits.argmax(-1).item())
-        R_star = _model.rotation_enc.compose_R(k_star, None)
-        _, coord_loss_g, _ldict_g = _model.compute_losses_from_R(
-            R                   = R_star,
-            inputs_embeds       = inputs_embeds,
-            input_ids           = input_ids,
-            attention_mask      = attention_mask,
-            image_xyz           = image_xyz,
-            image_xyz_hires     = image_xyz_hires,
-            image_grid_thw      = image_grid_thw,
-            labels              = labels,
-            coord_scale         = args.coord_scale,
-            use_coord_loss      = not args.no_coord,
-            use_relative        = args.relative,
-            detach_coord_hidden = True,
-            cam_feat            = cam_feat,
-            compute_reward      = False,
-        )
-        if coord_loss_g is not None:
+    k_star = int(logits.argmax(-1).item())
+    R_star = _model.rotation_enc.compose_R(k_star, None)
+    _, coord_loss_g, _ldict_g = _model.compute_losses_from_R(
+        R                   = R_star,
+        inputs_embeds       = inputs_embeds,
+        input_ids           = input_ids,
+        attention_mask      = attention_mask,
+        image_xyz           = image_xyz,
+        image_xyz_hires     = image_xyz_hires,
+        image_grid_thw      = image_grid_thw,
+        labels              = labels,
+        coord_scale         = args.coord_scale,
+        use_coord_loss      = not args.no_coord,
+        use_relative        = args.relative,
+        detach_coord_hidden = True,
+        cam_feat            = cam_feat,
+        compute_reward      = False,
+    )
+    # Coordinate coord backward across ranks: if ANY rank has a coord
+    # loss this step, ALL ranks must backward once (real or dummy).
+    local_has_coord = coord_loss_g is not None
+    any_has_coord   = _any_rank_active(local_has_coord, device)
+    if any_has_coord:
+        if local_has_coord:
             step_loss = args.w_coord * coord_loss_g
             (sft_coef * step_loss).backward(retain_graph=True)
             L_sft_scalar = float(step_loss.item())
-        R_used = R_star.detach()
+        else:
+            _dummy_zero_backward(coord_head_params, scale=sft_coef)
+    R_used = R_star.detach()
 
     _ldict["L_sft"] = L_sft_scalar
+    if R_used is not None:
+        _ldict["R_trace"] = float(R_used.trace().item())
 
-    # ── Stage 4: final backward — reg loss on logits only ────────────────
-    # Discrete: inner PPO loop already ran policy_opt.zero_grad/backward/step
-    # K times, so no outer backward is needed for the policy term. Hybrid:
-    # original single-step pipeline — backward reg_loss into the shared
-    # optimizer's rot_bb/head_cls/head_res groups.
-    if _model.rotation_enc.action_space == "hybrid":
-        reg_loss = (args.rl_weight / grad_accum) * (L_rl + L_ent + L_kl)
-        reg_loss.backward()
+    # ── Stage 4: no extra backward — inner PPO loop already ran
+    # policy_opt.zero_grad/backward/step K times for the RL term.
 
     loss_total_scalar = (
         args.rl_weight * (float(L_rl.item()) + float(L_ent.item()) + float(L_kl.item()))
@@ -703,8 +695,6 @@ def train(args: argparse.Namespace) -> None:
         rot_dim_feedforward = args.rot_dim_feedforward,
         rot_num_layers      = args.rot_num_layers,
         relative            = args.relative,
-        action_space        = args.action_space,
-        residual_clamp      = args.residual_clamp,
     )
     model = model.to(device)
     if local_rank == 0:
@@ -713,10 +703,9 @@ def train(args: argparse.Namespace) -> None:
 
     # -- DDP -------------------------------------------------------------------
     if world_size > 1:
-        # find_unused_parameters=True because:
-        #   (a) different phases freeze different parameter sets
-        #   (b) Phase B RWR: number of correct anchors (K) varies per rank →
-        #       head_res receives grad on some ranks but not others.
+        # find_unused_parameters=True because different phases freeze
+        # different parameter sets (Phase A: rotation_enc frozen;
+        # Phase B: LoRA frozen).
         model  = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
         _model = model.module
     else:
@@ -794,26 +783,20 @@ def train(args: argparse.Namespace) -> None:
             log.warning(f"Failed to load eval dataset '{_ds_name}': {exc}")
 
     # -- parameter groups ------------------------------------------------------
-    # Five mutually-exclusive groups for the phase-aware toggling:
-    #   head_cls     — policy head    (RL-only; strict clip)
-    #   head_res     — residual head  (RWR-only; standard clip)
-    #   rot_bb       — encoder layers + input_proj + cam_token (shared signal)
+    # Mutually-exclusive groups for the phase-aware toggling:
+    #   head_cls     — policy head    (PPO; clipped in inner loop)
+    #   rot_bb       — encoder layers + input_proj + cam_token (PPO, shared)
     #   coord_head   — depth predictor (active in BOTH phases)
     #   lora         — LoRA on SpaModel (Phase A only)
     head_cls_params = [
         p for n, p in model.named_parameters()
         if p.requires_grad and "rotation_enc.head_cls" in n
     ]
-    head_res_params = [
-        p for n, p in model.named_parameters()
-        if p.requires_grad and "rotation_enc.head_res" in n
-    ]
     rot_bb_params = [
         p for n, p in model.named_parameters()
         if p.requires_grad
         and "rotation_enc" in n
         and "head_cls" not in n
-        and "head_res" not in n
     ]
     coord_head_params = [
         p for n, p in model.named_parameters()
@@ -830,58 +813,37 @@ def train(args: argparse.Namespace) -> None:
     lr_phase_b_base    = args.lr_phase_b    if args.lr_phase_b    is not None else args.rotation_enc_lr
     lr_coord_head_base = args.lr_coord_head if args.lr_coord_head is not None else args.lr
 
-    # Split optimizer (discrete only): head_cls + rot_bb live on policy_opt
-    # and are stepped K times per rollout inside _phase_b_grpo_step. Their
-    # base LR is divided by K so effective per-rollout update magnitude
-    # stays comparable to the previous single-step setup.
-    # In hybrid mode policy_opt is None and all five groups share optimizer
-    # with the original grad-accum pipeline.
+    # Split optimizer: head_cls + rot_bb live on policy_opt and are stepped
+    # K times per rollout inside _phase_b_grpo_step. Their base LR is
+    # divided by K so effective per-rollout update magnitude stays
+    # comparable to a single-step setup.
     K_ppo = max(1, int(args.ppo_inner_epochs))
-    if args.action_space == "discrete":
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": lora_params,       "lr": args.lr,            "name": "lora"},
-                {"params": coord_head_params, "lr": args.lr,            "name": "coord_head"},
-                {"params": head_res_params,   "lr": lr_phase_b_base,    "name": "head_res"},
-            ],
-            weight_decay=0.01,
-        )
-        policy_opt = torch.optim.AdamW(
-            [
-                {"params": rot_bb_params,
-                 "lr": lr_phase_b_base / K_ppo,                         "name": "rot_bb"},
-                {"params": head_cls_params,
-                 "lr": lr_phase_b_base * args.head_cls_lr_scale / K_ppo,"name": "head_cls"},
-            ],
-            weight_decay=0.01,
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": lora_params,       "lr": args.lr,                                 "name": "lora"},
-                {"params": coord_head_params, "lr": args.lr,                                 "name": "coord_head"},
-                {"params": rot_bb_params,     "lr": lr_phase_b_base,                         "name": "rot_bb"},
-                {"params": head_cls_params,   "lr": lr_phase_b_base * args.head_cls_lr_scale,"name": "head_cls"},
-                {"params": head_res_params,   "lr": lr_phase_b_base,                         "name": "head_res"},
-            ],
-            weight_decay=0.01,
-        )
-        policy_opt = None
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": lora_params,       "lr": args.lr,            "name": "lora"},
+            {"params": coord_head_params, "lr": args.lr,            "name": "coord_head"},
+        ],
+        weight_decay=0.01,
+    )
+    policy_opt = torch.optim.AdamW(
+        [
+            {"params": rot_bb_params,
+             "lr": lr_phase_b_base / K_ppo,                         "name": "rot_bb"},
+            {"params": head_cls_params,
+             "lr": lr_phase_b_base * args.head_cls_lr_scale / K_ppo,"name": "head_cls"},
+        ],
+        weight_decay=0.01,
+    )
     log.info(
         f"Optim groups: lora={len(lora_params)} "
         f"coord_head={len(coord_head_params)} "
         f"rot_bb={len(rot_bb_params)} "
-        f"head_cls={len(head_cls_params)} "
-        f"head_res={len(head_res_params)}"
-        f"  (policy_opt={'on' if policy_opt is not None else 'off'}, K={K_ppo})"
+        f"head_cls={len(head_cls_params)}"
+        f"  (K_ppo={K_ppo})"
     )
 
     log.info("=" * 72)
-    log.info(f">>> action_space   = {args.action_space}")
-    log.info(f">>> residual_clamp = {args.residual_clamp:.4f} rad "
-             f"({math.degrees(args.residual_clamp):.1f}°)")
     log.info(f">>> group_size     = 24 (exhaustive cube-group enumeration)")
-    log.info(f">>> k_max_grad     = {args.k_max_grad}")
     log.info(f">>> rwr_tau        = {args.rwr_tau}")
     log.info(f">>> entropy_beta   = {args.entropy_beta}")
     log.info(f">>> kl_lambda      = {args.kl_lambda}")
@@ -892,14 +854,13 @@ def train(args: argparse.Namespace) -> None:
     log.info(f">>> no_coord       = {args.no_coord}")
     log.info(f">>> relative       = {args.relative}")
     log.info(f">>> lr_phase_a     = {lr_phase_a_base:.2e}  (LoRA, warm-restart per Phase A)")
-    log.info(f">>> lr_phase_b     = {lr_phase_b_base:.2e}  (rot_bb/head_res, warm-restart per Phase B)")
+    log.info(f">>> lr_phase_b     = {lr_phase_b_base:.2e}  (rot_bb, warm-restart per Phase B)")
     log.info(f">>> head_cls_lr    = {lr_phase_b_base * args.head_cls_lr_scale:.2e}"
              f"  (scale={args.head_cls_lr_scale}, strict clip {args.head_cls_clip})")
-    if args.action_space == "discrete":
-        log.info(f">>> ppo_inner_K    = {K_ppo}  (policy_opt LR divided by K:"
-                 f" rot_bb={lr_phase_b_base / K_ppo:.2e}, "
-                 f"head_cls={lr_phase_b_base * args.head_cls_lr_scale / K_ppo:.2e})")
-        log.info(f">>> ppo_clip_eps   = {args.ppo_clip_eps}")
+    log.info(f">>> ppo_inner_K    = {K_ppo}  (policy_opt LR divided by K:"
+             f" rot_bb={lr_phase_b_base / K_ppo:.2e}, "
+             f"head_cls={lr_phase_b_base * args.head_cls_lr_scale / K_ppo:.2e})")
+    log.info(f">>> ppo_clip_eps   = {args.ppo_clip_eps}")
     log.info(f">>> lr_coord_head  = {lr_coord_head_base:.2e}  (warm-restart every pass)")
     log.info("=" * 72)
 
@@ -958,7 +919,6 @@ def train(args: argparse.Namespace) -> None:
             if new_phase != current_phase:
                 if new_phase == "A":
                     _set_requires_grad(head_cls_params,   False)
-                    _set_requires_grad(head_res_params,   False)
                     _set_requires_grad(rot_bb_params,     False)
                     _set_requires_grad(lora_params,       True)
                     _set_requires_grad(coord_head_params, True)
@@ -966,7 +926,6 @@ def train(args: argparse.Namespace) -> None:
                     coord_head_cycle_step = 0
                 else:
                     _set_requires_grad(head_cls_params,   True)
-                    _set_requires_grad(head_res_params,   True)
                     _set_requires_grad(rot_bb_params,     True)
                     _set_requires_grad(lora_params,       False)
                     _set_requires_grad(coord_head_params, True)
@@ -979,8 +938,7 @@ def train(args: argparse.Namespace) -> None:
                                if epoch == 0
                                else "(train LoRA+coord_head; R from argmax anchor)")
                     else:
-                        msg = (f"(GRPO — action_space={args.action_space}, "
-                               f"G=24, K_max={args.k_max_grad})")
+                        msg = f"(GRPO discrete — G=24, K_ppo={K_ppo})"
                     log.info(f"[epoch {epoch+1:02d} pass {pass_idx}] "
                              f"→ Phase {new_phase} full pass  {msg}")
 
@@ -1017,6 +975,10 @@ def train(args: argparse.Namespace) -> None:
                     "image_xyz":       image_xyz,
                     "image_xyz_hires": image_xyz_hires,
                     "labels":          labels,
+                    # Reward-shaping supervision (present only when dataset
+                    # provides them; default 'C'/-1 means "no k_gt prior").
+                    "bucket":          batch.get("bucket", "C"),
+                    "k_gt":            int(batch.get("k_gt", -1)),
                 }
 
                 if step == 0 and local_rank == 0:
@@ -1035,10 +997,21 @@ def train(args: argparse.Namespace) -> None:
                         _model, batch_tensors, args, use_rot_enc,
                     )
                     if loss is None:
-                        log.warning(f"[rank{local_rank}] step {step}: no signal, skip.")
-                        continue
-                    (loss / args.grad_accum).backward()
-                    running_loss += loss.item()
+                        # Don't `continue` — that would desync DDP bucket
+                        # allreduces with ranks that DO have a loss this step.
+                        # Run a zero-grad backward over Phase-A trainables so
+                        # grad hooks fire and NCCL op count matches peers.
+                        log.warning(
+                            f"[rank{local_rank}] step {step}: no signal, "
+                            f"zero-backward to stay in sync."
+                        )
+                        _dummy_zero_backward(
+                            lora_params + coord_head_params,
+                            scale=1.0 / args.grad_accum,
+                        )
+                    else:
+                        (loss / args.grad_accum).backward()
+                        running_loss += loss.item()
                 else:
                     # Phase B does per-iteration backward internally (see
                     # _phase_b_grpo_step's in-loop backward) and already
@@ -1051,6 +1024,7 @@ def train(args: argparse.Namespace) -> None:
                         policy_opt=policy_opt,
                         head_cls_params=head_cls_params,
                         rot_bb_params=rot_bb_params,
+                        coord_head_params=coord_head_params,
                     )
                     running_loss += loss_scalar
                 if loss_dict:
@@ -1059,24 +1033,9 @@ def train(args: argparse.Namespace) -> None:
 
                 # -- gradient accumulation / step ------------------------
                 if (step + 1) % args.grad_accum == 0:
-                    # Per-group grad clipping. In discrete mode head_cls /
-                    # rot_bb are clipped inside the PPO inner loop and live
-                    # on policy_opt (already stepped) — skip them here.
-                    _skip_policy_clip = (
-                        args.action_space == "discrete" and policy_opt is not None
-                    )
-                    if head_cls_params and not _skip_policy_clip:
-                        torch.nn.utils.clip_grad_norm_(
-                            head_cls_params, max_norm=args.head_cls_clip
-                        )
-                    if head_res_params:
-                        torch.nn.utils.clip_grad_norm_(
-                            head_res_params, max_norm=args.head_res_clip
-                        )
-                    if rot_bb_params and not _skip_policy_clip:
-                        torch.nn.utils.clip_grad_norm_(
-                            rot_bb_params, max_norm=args.rot_bb_clip
-                        )
+                    # Per-group grad clipping. head_cls / rot_bb are clipped
+                    # inside the PPO inner loop and live on policy_opt
+                    # (already stepped) — skip them here.
                     if lora_params or coord_head_params:
                         torch.nn.utils.clip_grad_norm_(
                             lora_params + coord_head_params, max_norm=args.lora_clip
@@ -1084,7 +1043,7 @@ def train(args: argparse.Namespace) -> None:
                     optimizer.step()
 
                     # Cosine warm-restart schedule (coord_head every pass;
-                    # LoRA on Phase A; rot_bb/head_res/head_cls on Phase B).
+                    # LoRA on Phase A; rot_bb/head_cls on Phase B via policy_opt).
                     coord_head_cycle_step += 1
                     _t_ch  = min(coord_head_cycle_step, cycle_optim_steps)
                     _cos_ch = 0.5 * (1 + math.cos(math.pi * _t_ch / cycle_optim_steps))
@@ -1107,23 +1066,15 @@ def train(args: argparse.Namespace) -> None:
                         _cos = 0.5 * (1 + math.cos(math.pi * _t / cycle_optim_steps))
                         _lr_b   = lr_phase_b_base                   * _cos
                         _lr_cls = lr_phase_b_base * args.head_cls_lr_scale * _cos
-                        # In discrete mode head_cls / rot_bb live on policy_opt
-                        # with base LR already divided by K — reapply the same
-                        # division to keep "K inner steps ≈ one big step".
-                        _policy_scale = (1.0 / K_ppo) if args.action_space == "discrete" else 1.0
-                        for _g in optimizer.param_groups:
+                        # head_cls / rot_bb live on policy_opt with base LR
+                        # already divided by K — reapply the same division to
+                        # keep "K inner steps ≈ one big step".
+                        _policy_scale = 1.0 / K_ppo
+                        for _g in policy_opt.param_groups:
                             if _g.get("name") == "rot_bb":
-                                _g["lr"] = _lr_b
-                            elif _g.get("name") == "head_res":
-                                _g["lr"] = _lr_b
+                                _g["lr"] = _lr_b   * _policy_scale
                             elif _g.get("name") == "head_cls":
-                                _g["lr"] = _lr_cls
-                        if policy_opt is not None:
-                            for _g in policy_opt.param_groups:
-                                if _g.get("name") == "rot_bb":
-                                    _g["lr"] = _lr_b   * _policy_scale
-                                elif _g.get("name") == "head_cls":
-                                    _g["lr"] = _lr_cls * _policy_scale
+                                _g["lr"] = _lr_cls * _policy_scale
 
                     optimizer.zero_grad()
                     global_step += 1
@@ -1146,12 +1097,9 @@ def train(args: argparse.Namespace) -> None:
                         if current_phase == "A":
                             _active_group = "lora"
                         else:
-                            _active_group = "head_res" \
-                                if args.action_space == "hybrid" else "head_cls"
-                        # In discrete mode head_cls lives on policy_opt.
-                        _lr_sources = [optimizer]
-                        if policy_opt is not None:
-                            _lr_sources.append(policy_opt)
+                            _active_group = "head_cls"
+                        # head_cls lives on policy_opt.
+                        _lr_sources = [optimizer, policy_opt]
                         current_lr = next(
                             g["lr"] for opt in _lr_sources
                             for g in opt.param_groups
@@ -1174,6 +1122,7 @@ def train(args: argparse.Namespace) -> None:
                             f"{'s' if world_size > 1 else ''})"
                         )
                         if use_wandb:
+                            _shared_train_keys = {"lm_loss", "coord_loss", "R_trace"}
                             wandb.log(
                                 {
                                     "train/loss":          avg_loss,
@@ -1181,7 +1130,10 @@ def train(args: argparse.Namespace) -> None:
                                     "train/coord_head_lr": coord_head_lr,
                                     "train/phase":         0 if current_phase == "A" else 1,
                                     "epoch":               epoch + 1,
-                                    **{f"train/{k}": v for k, v in avg_loss_dict.items()},
+                                    **{f"train/{k}": v for k, v in avg_loss_dict.items()
+                                       if k in _shared_train_keys},
+                                    **{f"train_rl/{k}": v for k, v in avg_loss_dict.items()
+                                       if k not in _shared_train_keys},
                                 },
                                 step=global_step,
                             )
@@ -1210,7 +1162,7 @@ def _run_eval(
     model, _model, test_loaders, test_samplers,
     args, device, global_step, use_wandb,
 ):
-    """Deterministic eval using argmax anchor + (hybrid) argmax residual."""
+    """Deterministic eval using argmax anchor."""
     model.eval()
     _spa    = _model.spa_model
     _spa_gc = getattr(_spa, "gradient_checkpointing", False)
@@ -1221,8 +1173,7 @@ def _run_eval(
     if _lm and _lm_gc:
         _lm.gradient_checkpointing = False
 
-    _is_hybrid = _model.rotation_enc.action_space == "hybrid"
-    _topk      = max(1, min(int(args.eval_topk), 24))
+    _topk = max(1, min(int(args.eval_topk), 24))
 
     for ds_name, loader in test_loaders.items():
         if ds_name in test_samplers and test_samplers[ds_name] is not None:
@@ -1234,7 +1185,6 @@ def _run_eval(
         local_entropies:  list[float] = []
         local_k_stars:    list[int]   = []
         local_topk_hits:  list[float] = []
-        local_delta_xyz:  list[list[float]] = []   # hybrid only: (3,) per sample
 
         for batch in loader:
             t_ids   = batch["input_ids"].to(device)
@@ -1316,6 +1266,10 @@ def _run_eval(
             if lm_loss is None and coord_loss is None:
                 continue
             local_count += 1
+            if _ldict is None:
+                _ldict = {}
+            if R is not None:
+                _ldict["R_trace"] = float(R.trace().item())
             if _ldict:
                 for k, v in _ldict.items():
                     local_loss_sums[k] = local_loss_sums.get(k, 0.0) + float(v)
@@ -1328,14 +1282,6 @@ def _run_eval(
             local_entropies.append(entropy)
             local_k_stars.append(k_star)
             local_topk_hits.append(topk_hit)
-
-            if _is_hybrid and residual_all is not None:
-                # Effective axis-angle actually applied to rotation for k_star.
-                _delta = (args.residual_clamp
-                          * torch.tanh(residual_all[k_star].float())).tolist()
-                local_delta_xyz.append([float(_delta[0]),
-                                        float(_delta[1]),
-                                        float(_delta[2])])
 
         _keys = sorted(local_loss_sums.keys())
         if world_size > 1:
@@ -1357,7 +1303,7 @@ def _run_eval(
                      + f"  (n={total_count}, {world_size} GPU"
                      f"{'s' if world_size > 1 else ''})")
             if use_wandb:
-                _main = {"coord_loss", "lm_loss", "acc"}
+                _main = {"coord_loss", "lm_loss"}
                 wandb.log(
                     {
                         **{f"eval/{ds_name}_{k}": agg_sums[k] / total_count
@@ -1442,46 +1388,6 @@ def _run_eval(
                 }
                 wandb.log(_log, step=global_step)
 
-        # -- Residual analytics (hybrid only): per-DoF + magnitude -------------
-        if _is_hybrid:
-            if world_size > 1:
-                _g_d: list = [None] * world_size
-                dist.all_gather_object(_g_d, local_delta_xyz)
-                all_deltas = [v for lst in _g_d for v in (lst or [])]
-            else:
-                all_deltas = list(local_delta_xyz)
-
-            if all_deltas and local_rank == 0:
-                _dt  = torch.tensor(all_deltas, dtype=torch.float32)    # (N,3)
-                _mag = _dt.norm(dim=-1)                                 # (N,)
-                _per_dof_mean = _dt.mean(dim=0).tolist()
-                _per_dof_std  = _dt.std(dim=0, unbiased=False).tolist()
-                _mag_mean = float(_mag.mean().item())
-                _mag_std  = float(_mag.std(unbiased=False).item())
-                log.info(
-                    f"[eval-res] global_step={global_step:05d}  {ds_name}  "
-                    f"|delta|: mean={_mag_mean:.4f}  std={_mag_std:.4f}  "
-                    f"delta_xyz_mean=({_per_dof_mean[0]:+.4f},"
-                    f"{_per_dof_mean[1]:+.4f},{_per_dof_mean[2]:+.4f})  "
-                    f"(n={_dt.shape[0]})"
-                )
-                if use_wandb:
-                    wandb.log(
-                        {
-                            f"eval_res/{ds_name}_delta_x_mean": _per_dof_mean[0],
-                            f"eval_res/{ds_name}_delta_y_mean": _per_dof_mean[1],
-                            f"eval_res/{ds_name}_delta_z_mean": _per_dof_mean[2],
-                            f"eval_res/{ds_name}_delta_x_std":  _per_dof_std[0],
-                            f"eval_res/{ds_name}_delta_y_std":  _per_dof_std[1],
-                            f"eval_res/{ds_name}_delta_z_std":  _per_dof_std[2],
-                            f"eval_res/{ds_name}_delta_mag_mean": _mag_mean,
-                            f"eval_res/{ds_name}_delta_mag_std":  _mag_std,
-                            f"eval_res/{ds_name}_delta_mag_hist":
-                                wandb.Histogram(_mag.tolist()),
-                        },
-                        step=global_step,
-                    )
-
     if _spa_gc:
         _spa.gradient_checkpointing = True
     if _lm and _lm_gc:
@@ -1530,7 +1436,7 @@ def parse_args() -> argparse.Namespace:
         default=os.path.join(_ROOT, "checkpoints/spa_rotation_rl"))
     p.add_argument("--epochs",         type=int,   default=3)
     p.add_argument("--lr",             type=float, default=2e-4)
-    p.add_argument("--rotation_enc_lr",type=float, default=5e-5)
+    p.add_argument("--rotation_enc_lr",type=float, default=2e-4)
     p.add_argument("--lr_phase_a",     type=float, default=None)
     p.add_argument("--lr_phase_b",     type=float, default=None)
     p.add_argument("--lr_coord_head",  type=float, default=None)
@@ -1538,7 +1444,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora_clip",      type=float, default=1.0)
     p.add_argument("--rot_bb_clip",    type=float, default=0.3)
     p.add_argument("--head_cls_clip",  type=float, default=0.3)
-    p.add_argument("--head_res_clip",  type=float, default=1.0)
     p.add_argument("--head_cls_lr_scale", type=float, default=0.5,
                    help="Multiplier on lr_phase_b for head_cls (policy head).")
 
@@ -1567,16 +1472,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rot_num_layers",      type=int, default=2)
 
     # RL-specific args
-    p.add_argument("--action_space",   choices=["discrete", "hybrid"], default="hybrid",
-                   help="'discrete' = head_cls only; 'hybrid' = head_cls + head_res.")
-    p.add_argument("--residual_clamp", type=float, default=math.pi / 6,
-                   help="Max axis-angle magnitude (rad) per DoF in head_res. "
-                        "Default π/6 ≈ 0.5236 rad ≈ 30°.")
-    p.add_argument("--k_max_grad",     type=int,   default=4,
-                   help="Max number of correct anchors to run grad forward in "
-                        "RWR (top-K by lowest lm_loss). Bounds backward cost.")
     p.add_argument("--rwr_tau",        type=float, default=1.0,
-                   help="Temperature for RWR softmax weights over -lm_loss.")
+                   help="Temperature for the softmax(-lm_loss/τ) reward-shaping "
+                        "perturbation added within each outcome group.")
     p.add_argument("--entropy_beta",   type=float, default=0.01,
                    help="Coefficient for entropy bonus (-β·H).")
     p.add_argument("--kl_lambda",      type=float, default=0.001,
@@ -1593,11 +1491,44 @@ def parse_args() -> argparse.Namespace:
                         "head_cls/rot_bb is divided by K so effective per-"
                         "rollout update magnitude stays comparable.")
     p.add_argument("--sft_weight",     type=float, default=1.0,
-                   help="Scalar on the differentiable-SFT (RWR / argmax coord) term.")
+                   help="Scalar on the differentiable-SFT (argmax coord) term.")
     p.add_argument("--w_lm",           type=float, default=1.0,
-                   help="Weight on lm_loss inside each per-anchor SFT step.")
+                   help="Scale on the reward-shaping perturbation "
+                        "(softmax(-lm_loss/τ) - 1/n).")
+
+    # --- Bucket-aware anchor-prior shaping (see MindCube viewpoint buckets)
+    # Applied on rewards (shape (24,)) per sample: shape[k_gt] = +w*(1-1/24),
+    # shape[other] = -w/24, strictly zero-mean. Effective weight per bucket:
+    #   A: w_anchor_prior * w_trans    (motion query; identity prior k_gt=0)
+    #   B: w_anchor_prior * w_rot_hi   (title-regex k_gt — most reliable)
+    #   D: w_anchor_prior * w_rot_mid  (viewpoint anchor: pose(image N))
+    #   E: w_anchor_prior * w_rot_mid  (multi-view same-spot: pose(image N))
+    #   H: w_anchor_prior * w_hypo     (hypothetical action: pose(image N) ∘ 90° turn)
+    #   C / k_gt<0: no shaping (E-pos-obj residue: ~5.7% of MindCube train,
+    #                           anchored to an object — no pose-derivable frame)
+    p.add_argument("--w_anchor_prior", type=float, default=1.0,
+                   help="Master switch for bucket-aware anchor-prior shaping "
+                        "(set 0 to disable).")
+    p.add_argument("--w_rot_hi",       type=float, default=0.8,
+                   help="Shaping weight for Bucket B (title-regex k_gt).")
+    p.add_argument("--w_hypo",         type=float, default=0.5,
+                   help="Shaping weight for Bucket H (hypothetical action: "
+                        "anchor(image N) composed with ±90° local yaw). "
+                        "Lower than w_rot_hi because the turn axis convention "
+                        "is empirically derived; set 0 to disable.")
+    p.add_argument("--w_rot_mid",      type=float, default=0.0,
+                   help="Shaping weight for Buckets D/E (pose-derived k_gt "
+                        "from image-N viewpoint / same-spot anchor). Default "
+                        "0 — set >0 to enable.")
+    p.add_argument("--w_trans",        type=float, default=0.0,
+                   help="Shaping weight for Bucket A (motion query; identity "
+                        "prior k_gt=0 because the reasoning frame is view 0). "
+                        "Default 0 — set >0 to enable.")
+    p.add_argument("--rot_tau",        type=float, default=1.0,
+                   help="(reserved) softmax temperature for a future soft-prior "
+                        "variant of anchor-prior shaping.")
     p.add_argument("--w_coord",        type=float, default=1.0,
-                   help="Weight on coord_loss inside each per-anchor SFT step.")
+                   help="Weight on coord_loss for the argmax-anchor SFT step.")
 
     p.add_argument("--wandb_project",  default="")
     p.add_argument("--wandb_entity",   default="")

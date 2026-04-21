@@ -2,43 +2,49 @@
 # =============================================================================
 # train_rl.sh
 #
-# Alternating two-phase training with GRPO-based RL in Phase B.
+# Alternating two-phase training, discrete-action PPO/GRPO in Phase B.
 #   Phase A (SFT)  : LoRA + coord_head trainable; encoder frozen at argmax anchor.
 #   Phase B (GRPO) : LoRA frozen; encoder heads + coord_head trainable.
-#     - head_cls  ← policy gradient   (REINFORCE, reward = 0/1 MCQ accuracy)
-#     - head_res  ← RWR weighted SFT  (softmax(-lm_loss/τ) over correct anchors)
-#     - coord_head ← standard SFT     (R detached, hidden detached)
-#
-# Action space
-#   --action_space discrete → head_cls only (24 chiral cube anchors, no residual)
-#   --action_space hybrid   → head_cls + head_res (24 anchors + ±30° refinement)
+#     - head_cls / rot_bb ← PPO (K inner epochs, clipped surrogate + entropy + KL)
+#                           over 24 chiral-cube anchors; reward = 0/1 MCQ accuracy
+#                           with intra-group lm_loss shaping (softmax(-lm_loss/τ)).
+#     - coord_head        ← standard SFT at argmax anchor (hidden detached).
 #
 # Multi-GPU via torchrun (DDP).
 #
 # Usage:
 #   bash scripts/train_rl.sh [num_gpus] [options]
 #
-#   --train_data NAME       mindcube | sat    (default: mindcube)
-#   --max_samples N         truncate dataset to N
-#   --coord_weight W        weight for coordinate L1 loss (default: 1.0)
-#   --coord_scale S         XYZ discretization multiplier (default: 100.0)
-#   --no_coord              disable coord loss entirely
-#   --relative              coord_head predicts original xyz
-#   --action_space {discrete, hybrid}    default: hybrid
-#   --lr_phase_a LR         Phase A base LR
-#   --lr_phase_b LR         Phase B base LR (head_res + rot_bb; head_cls = this × scale)
-#   --k_max_grad K          top-K correct anchors for RWR grad forward (default: 4)
-#   --rwr_tau T             RWR softmax temperature (default: 1.0)
-#   --entropy_beta B        entropy bonus coeff (default: 0.01)
-#   --kl_lambda L           KL-to-uniform coeff (default: 0.001)
-#   --rl_weight W           scale on (L_rl + L_ent + L_kl) (default: 1.0)
-#   --sft_weight W          scale on differentiable SFT (default: 1.0)
+#   --train_data NAME        mindcube | sat    (default: mindcube)
+#   --max_samples N          truncate dataset to N
+#   --coord_weight W         weight for coordinate L1 loss (default: 1.0)
+#   --coord_scale S          XYZ discretization multiplier (default: 100.0)
+#   --no_coord               disable coord loss entirely
+#   --relative               coord_head predicts original xyz
+#   --lr_phase_a LR          Phase A base LR
+#   --lr_phase_b LR          Phase B base LR (rot_bb; head_cls = this × scale / K)
+#   --rwr_tau T              reward-shape softmax temperature (default: 1.0)
+#   --w_lm W                 reward-shape lm_loss perturbation scale (default: 1.0)
+#   --entropy_beta B         entropy bonus coeff (default: 0.01)
+#   --kl_lambda L            KL-to-uniform coeff (default: 0.001)
+#   --rl_weight W            scale on (L_rl + L_ent + L_kl) (default: 1.0)
+#   --sft_weight W           scale on differentiable SFT (default: 1.0)
+#   --ppo_inner_epochs K     PPO inner-loop steps per rollout (default: 3)
+#   --ppo_clip_eps E         PPO clipping epsilon (default: 0.2)
+#
+#   Bucket-aware anchor-prior shaping (MindCube 5-bucket taxonomy A/B/D/E/H;
+#   C residue = 571 E-pos-obj samples with no pose-derivable frame):
+#   --w_anchor_prior W       master switch (default: 1.0; 0 disables shaping)
+#   --w_rot_hi W             Bucket B weight  (default: 0.8, title-regex k_gt)
+#   --w_hypo W               Bucket H weight  (default: 0.5, pose∘±90° yaw)
+#   --w_rot_mid W            Buckets D/E     (default: 0.0; pose-derived k_gt)
+#   --w_trans W              Bucket A weight  (default: 0.0; identity prior)
 #
 # Examples:
 #   bash scripts/train_rl.sh                   # all GPUs
 #   bash scripts/train_rl.sh 4                 # 4 GPUs
-#   bash scripts/train_rl.sh 4 --action_space discrete
 #   bash scripts/train_rl.sh 4 --lr_phase_a 2e-4 --lr_phase_b 5e-5
+#   bash scripts/train_rl.sh 4 --ppo_inner_epochs 5 --ppo_clip_eps 0.1
 # =============================================================================
 
 set -euo pipefail
@@ -59,34 +65,46 @@ COORD_WEIGHT=""
 COORD_SCALE=""
 NO_COORD_CLI=false
 RELATIVE_CLI=false
-ACTION_SPACE_CLI=""
 LR_PHASE_A_CLI=""
 LR_PHASE_B_CLI=""
-K_MAX_GRAD_CLI=""
 RWR_TAU_CLI=""
+W_LM_CLI=""
 ENTROPY_BETA_CLI=""
 KL_LAMBDA_CLI=""
 RL_WEIGHT_CLI=""
 SFT_WEIGHT_CLI=""
+PPO_INNER_EPOCHS_CLI=""
+PPO_CLIP_EPS_CLI=""
+W_ANCHOR_PRIOR_CLI=""
+W_ROT_HI_CLI=""
+W_HYPO_CLI=""
+W_ROT_MID_CLI=""
+W_TRANS_CLI=""
 _positional=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --train_data)    TRAIN_DATA_CLI="$2";    shift 2 ;;
-        --max_samples)   MAX_SAMPLES="$2";       shift 2 ;;
-        --coord_weight)  COORD_WEIGHT="$2";      shift 2 ;;
-        --coord_scale)   COORD_SCALE="$2";       shift 2 ;;
-        --no_coord)      NO_COORD_CLI=true;      shift   ;;
-        --relative)      RELATIVE_CLI=true;      shift   ;;
-        --action_space)  ACTION_SPACE_CLI="$2";  shift 2 ;;
-        --lr_phase_a)    LR_PHASE_A_CLI="$2";    shift 2 ;;
-        --lr_phase_b)    LR_PHASE_B_CLI="$2";    shift 2 ;;
-        --k_max_grad)    K_MAX_GRAD_CLI="$2";    shift 2 ;;
-        --rwr_tau)       RWR_TAU_CLI="$2";       shift 2 ;;
-        --entropy_beta)  ENTROPY_BETA_CLI="$2";  shift 2 ;;
-        --kl_lambda)     KL_LAMBDA_CLI="$2";     shift 2 ;;
-        --rl_weight)     RL_WEIGHT_CLI="$2";     shift 2 ;;
-        --sft_weight)    SFT_WEIGHT_CLI="$2";    shift 2 ;;
+        --train_data)        TRAIN_DATA_CLI="$2";        shift 2 ;;
+        --max_samples)       MAX_SAMPLES="$2";           shift 2 ;;
+        --coord_weight)      COORD_WEIGHT="$2";          shift 2 ;;
+        --coord_scale)       COORD_SCALE="$2";           shift 2 ;;
+        --no_coord)          NO_COORD_CLI=true;          shift   ;;
+        --relative)          RELATIVE_CLI=true;          shift   ;;
+        --lr_phase_a)        LR_PHASE_A_CLI="$2";        shift 2 ;;
+        --lr_phase_b)        LR_PHASE_B_CLI="$2";        shift 2 ;;
+        --rwr_tau)           RWR_TAU_CLI="$2";           shift 2 ;;
+        --w_lm)              W_LM_CLI="$2";              shift 2 ;;
+        --entropy_beta)      ENTROPY_BETA_CLI="$2";      shift 2 ;;
+        --kl_lambda)         KL_LAMBDA_CLI="$2";         shift 2 ;;
+        --rl_weight)         RL_WEIGHT_CLI="$2";         shift 2 ;;
+        --sft_weight)        SFT_WEIGHT_CLI="$2";        shift 2 ;;
+        --ppo_inner_epochs)  PPO_INNER_EPOCHS_CLI="$2";  shift 2 ;;
+        --ppo_clip_eps)      PPO_CLIP_EPS_CLI="$2";      shift 2 ;;
+        --w_anchor_prior)    W_ANCHOR_PRIOR_CLI="$2";    shift 2 ;;
+        --w_rot_hi)          W_ROT_HI_CLI="$2";          shift 2 ;;
+        --w_hypo)            W_HYPO_CLI="$2";            shift 2 ;;
+        --w_rot_mid)         W_ROT_MID_CLI="$2";         shift 2 ;;
+        --w_trans)           W_TRANS_CLI="$2";           shift 2 ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -130,10 +148,9 @@ esac
 EPOCHS=6
 NO_COORD=$NO_COORD_CLI
 RELATIVE=$RELATIVE_CLI
-ACTION_SPACE="${ACTION_SPACE_CLI:-hybrid}"     # hybrid | discrete
 
 LR=2e-4                   # Phase A fallback
-ROTATION_ENC_LR=5e-5      # Phase B fallback (head_res + rot_bb)
+ROTATION_ENC_LR=2e-4      # Phase B fallback (rot_bb)
 LR_PHASE_A="$LR_PHASE_A_CLI"
 LR_PHASE_B="$LR_PHASE_B_CLI"
 
@@ -141,8 +158,7 @@ LR_PHASE_B="$LR_PHASE_B_CLI"
 LORA_CLIP=1.0
 ROT_BB_CLIP=0.3
 HEAD_CLS_CLIP=0.3
-HEAD_RES_CLIP=1.0
-HEAD_CLS_LR_SCALE=0.5     # head_cls LR = lr_phase_b × 0.5
+HEAD_CLS_LR_SCALE=1.0     # head_cls LR = lr_phase_b × 1.0 (no discount)
 
 LORA_RANK=16
 MAX_IMAGES=4
@@ -157,14 +173,24 @@ ROT_NHEAD=4
 ROT_DIM_FEEDFORWARD=2048
 ROT_NUM_LAYERS=2
 
-# RL hyperparameters
-K_MAX_GRAD="${K_MAX_GRAD_CLI:-4}"
+# RL / PPO hyperparameters
 RWR_TAU="${RWR_TAU_CLI:-1.0}"
+W_LM="${W_LM_CLI:-1.0}"
 ENTROPY_BETA="${ENTROPY_BETA_CLI:-0.01}"
 KL_LAMBDA="${KL_LAMBDA_CLI:-0.001}"
 RL_WEIGHT="${RL_WEIGHT_CLI:-1.0}"
 SFT_WEIGHT="${SFT_WEIGHT_CLI:-1.0}"
-RESIDUAL_CLAMP=0.5235987755982988   # π/6 rad ≈ 30°
+PPO_INNER_EPOCHS="${PPO_INNER_EPOCHS_CLI:-3}"
+PPO_CLIP_EPS="${PPO_CLIP_EPS_CLI:-0.2}"
+
+# Bucket-aware anchor-prior shaping (defaults match train_rl.py argparse).
+# D/E/A weights default to 0 so baseline runs are unchanged until explicitly
+# enabled; B/H weights preserve the existing shaping regime.
+W_ANCHOR_PRIOR="${W_ANCHOR_PRIOR_CLI:-1.0}"
+W_ROT_HI="${W_ROT_HI_CLI:-0.8}"
+W_HYPO="${W_HYPO_CLI:-0.5}"
+W_ROT_MID="${W_ROT_MID_CLI:-0.0}"
+W_TRANS="${W_TRANS_CLI:-0.0}"
 
 # Loss weights
 _COORD_WEIGHT="${COORD_WEIGHT:-1.0}"
@@ -177,7 +203,7 @@ WANDB_ENTITY="actmrv"
 # Run name / output dir
 # =============================================================================
 
-_METHOD="rotation_rl_${ACTION_SPACE}"
+_METHOD="rotation_rl_discrete"
 if [ "$NO_COORD" = "true" ]; then
     _METHOD="${_METHOD}_no_coord"
 fi
@@ -207,18 +233,24 @@ echo "[INFO] JSON_PATH            = $JSON_PATH"
 echo "[INFO] RESULTS_DIR          = $RESULTS_DIR"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EPOCHS               = $EPOCHS"
-echo "[INFO] ACTION_SPACE         = $ACTION_SPACE"
 echo "[INFO] NO_COORD             = $NO_COORD"
 echo "[INFO] RELATIVE             = $RELATIVE"
 echo "[INFO] LR_PHASE_A           = ${LR_PHASE_A:-<fallback to \$LR=$LR>}"
 echo "[INFO] LR_PHASE_B           = ${LR_PHASE_B:-<fallback to \$ROTATION_ENC_LR=$ROTATION_ENC_LR>}"
 echo "[INFO] HEAD_CLS_LR_SCALE    = $HEAD_CLS_LR_SCALE"
-echo "[INFO] K_MAX_GRAD           = $K_MAX_GRAD"
 echo "[INFO] RWR_TAU              = $RWR_TAU"
+echo "[INFO] W_LM                 = $W_LM"
 echo "[INFO] ENTROPY_BETA         = $ENTROPY_BETA"
 echo "[INFO] KL_LAMBDA            = $KL_LAMBDA"
 echo "[INFO] RL_WEIGHT            = $RL_WEIGHT"
 echo "[INFO] SFT_WEIGHT           = $SFT_WEIGHT"
+echo "[INFO] PPO_INNER_EPOCHS     = $PPO_INNER_EPOCHS"
+echo "[INFO] PPO_CLIP_EPS         = $PPO_CLIP_EPS"
+echo "[INFO] W_ANCHOR_PRIOR       = $W_ANCHOR_PRIOR"
+echo "[INFO] W_ROT_HI   (B)       = $W_ROT_HI"
+echo "[INFO] W_HYPO     (H)       = $W_HYPO"
+echo "[INFO] W_ROT_MID  (D/E)     = $W_ROT_MID"
+echo "[INFO] W_TRANS    (A)       = $W_TRANS"
 echo "[INFO] EVAL_TOPK            = $EVAL_TOPK"
 echo "[INFO] coord_weight         = $_COORD_WEIGHT"
 echo "[INFO] coord_scale          = $_COORD_SCALE"
@@ -275,7 +307,6 @@ $TORCHRUN \
     --lora_clip              "$LORA_CLIP"              \
     --rot_bb_clip            "$ROT_BB_CLIP"            \
     --head_cls_clip          "$HEAD_CLS_CLIP"          \
-    --head_res_clip          "$HEAD_RES_CLIP"          \
     --head_cls_lr_scale      "$HEAD_CLS_LR_SCALE"      \
     --lora_rank              "$LORA_RANK"              \
     --max_images             "$MAX_IMAGES"             \
@@ -289,14 +320,19 @@ $TORCHRUN \
     --rot_nhead              "$ROT_NHEAD"              \
     --rot_dim_feedforward    "$ROT_DIM_FEEDFORWARD"    \
     --rot_num_layers         "$ROT_NUM_LAYERS"         \
-    --action_space           "$ACTION_SPACE"           \
-    --residual_clamp         "$RESIDUAL_CLAMP"         \
-    --k_max_grad             "$K_MAX_GRAD"             \
     --rwr_tau                "$RWR_TAU"                \
+    --w_lm                   "$W_LM"                   \
     --entropy_beta           "$ENTROPY_BETA"           \
     --kl_lambda              "$KL_LAMBDA"              \
     --rl_weight              "$RL_WEIGHT"              \
     --sft_weight             "$SFT_WEIGHT"             \
+    --ppo_inner_epochs       "$PPO_INNER_EPOCHS"       \
+    --ppo_clip_eps           "$PPO_CLIP_EPS"           \
+    --w_anchor_prior         "$W_ANCHOR_PRIOR"         \
+    --w_rot_hi               "$W_ROT_HI"               \
+    --w_hypo                 "$W_HYPO"                 \
+    --w_rot_mid              "$W_ROT_MID"              \
+    --w_trans                "$W_TRANS"                \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \

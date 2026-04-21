@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import logging
 from PIL import Image
@@ -663,6 +664,268 @@ class MindCube_Train_Dataset_Relative(Dataset):
         }
 
 
+# ── Bucket classification + k_gt extraction ─────────────────────────────────
+# Buckets (see reward-shaping design):
+#   'A' motion_query           — "in which direction did I move from the
+#                                first view to the second view?"  Reasoning
+#                                frame is view 0, so identity prior (k_gt=0).
+#   'B' rotation_described     — title regex, 90°-multiple setup (pose-derived)
+#   'C' other / unknown        — no k_gt supervision    (k_gt = -1)
+#                                Remaining C = E-pos-obj ("positioned where
+#                                X is"): anchors to an object, no pose-
+#                                derivable frame.
+#   'D' viewpoint_anchor       — "from the viewpoint (presented) in image N"
+#                                (pose-derived: anchor(view N))
+#   'E' multi_view_scene       — "standing at the same spot … as shown in
+#                                image N" without turn verb (pose-derived:
+#                                anchor(view N)).
+#   'H' hypothetical-action    — anchor(image N) ∘ ±90° yaw (pose + regex)
+_BUCKET_B_TYPES = {
+    "four_view", "three_view",
+    "two_view_clockwise", "two_view_counterclockwise", "two_view_opposite",
+}
+_RE_IMG_REF = re.compile(
+    r"same direction as shown in image\s+(\d+)", re.IGNORECASE
+)
+# Bucket H (hypothetical-action): "... as shown in image N, then I turn
+# {left|right} and {go|move|walk} ...".  The explicit image-anchor + turn
+# direction lets us derive k_gt = anchor(image N) ∘ ±90° local yaw.
+_RE_TURN = re.compile(
+    r"(?:then\s+i|,\s*i)\s+turn(?:ed)?\s+(left|right)",
+    re.IGNORECASE,
+)
+# Empirically derived (see docs): in MindCube 3d_results' camera convention,
+# R_bins[6] ≈ Ry(+90°) = local yaw right; R_bins[5] ≈ Ry(-90°) = local yaw
+# left. Verified on 50 two_view_clockwise / 50 two_view_counterclockwise
+# samples — majority vote matches these indices.
+_K_TURN_RIGHT = 6
+_K_TURN_LEFT  = 5
+
+# Bucket D (viewpoint_anchor): natural multi-view scenes where the question
+# instructs the model to reason from a specific image's viewpoint — e.g.
+# "From the viewpoint presented in image 2, what is to the left of X?".
+# k_gt = quantize(C2W[0]ᵀ @ C2W[N]); same pose derivation as B but without
+# the type-field filter (B's types are the synthetic 90°-turn layouts).
+_RE_VIEWPOINT_IMG = re.compile(
+    r"from\s+the\s+viewpoint(?:\s+presented)?\s+in\s+image\s+(\d+)",
+    re.IGNORECASE,
+)
+
+# Bucket A (motion_query): "in which direction did I move from the first
+# view to the second view?" — 4-option MCQ over translation directions.
+# The question is framed from view 0's camera frame, so the rotation
+# anchor prior is identity (k_gt = 0). The GT direction answer itself
+# is not used for rotation shaping.
+_RE_DIR_MOVE = re.compile(
+    r"in which direction did i move", re.IGNORECASE
+)
+
+# Cached R_bins (24, 3, 3) — matches rotation_rope_llm._build_chiral_cube_group
+# (sorted descending by trace, R_bins[0] = I). Computed lazily on first use so
+# the dataset module stays importable without pulling the model dependency.
+_R_BINS_CACHE: torch.Tensor | None = None
+
+
+def _get_r_bins() -> torch.Tensor:
+    global _R_BINS_CACHE
+    if _R_BINS_CACHE is None:
+        from src.models.rotation_rope_llm import _build_chiral_cube_group
+        _R_BINS_CACHE = _build_chiral_cube_group().float()     # (24, 3, 3)
+    return _R_BINS_CACHE
+
+
+def _quantize_to_anchor(R: np.ndarray) -> int:
+    """Closest R_bins index by Frobenius distance. R: (3, 3) float."""
+    R_bins = _get_r_bins().numpy()                             # (24, 3, 3)
+    d = ((R_bins - R[None]) ** 2).reshape(24, -1).sum(axis=1)
+    return int(np.argmin(d))
+
+
+def _extract_kgt_bucket_b(
+    entry:      dict,
+    sample_dir: str,
+) -> tuple[str, int]:
+    """Return (bucket_tag, k_gt) for Bucket B; ('C', -1) if not Bucket B or
+    if the required data is missing.
+
+    Bucket B uses entry['type'] to confirm the layout (synthetic 90°-multiple
+    turns) and regex '(same direction as shown in) image N' to locate the
+    anchor view. k_gt = quantize(C2W[0]ᵀ @ C2W[N]) to R_bins.
+    """
+    if entry.get("type") not in _BUCKET_B_TYPES:
+        return "C", -1
+    m = _RE_IMG_REF.search(entry.get("question", ""))
+    if m is None:
+        return "C", -1
+    n = int(m.group(1)) - 1                                   # 1-indexed → 0-idx
+    if n == 0:
+        return "B", 0                                          # identity anchor
+
+    view_dirs = sorted(
+        d for d in os.listdir(sample_dir) if d.startswith("view_")
+    )
+    if n >= len(view_dirs):
+        return "C", -1
+    p0 = os.path.join(sample_dir, view_dirs[0], "camera_pose.npy")
+    pN = os.path.join(sample_dir, view_dirs[n], "camera_pose.npy")
+    if not (os.path.exists(p0) and os.path.exists(pN)):
+        return "C", -1
+    try:
+        C0 = np.load(p0).astype(np.float32)[:3, :3]
+        CN = np.load(pN).astype(np.float32)[:3, :3]
+        # Relative rotation from frame 0 to frame N (camera-frame convention).
+        R_rel = C0.T @ CN
+        return "B", _quantize_to_anchor(R_rel)
+    except Exception:
+        return "C", -1
+
+
+def _extract_kgt_bucket_h(
+    entry:      dict,
+    sample_dir: str,
+) -> tuple[str, int] | None:
+    """Return ('H', k_gt) for hypothetical-action samples that specify both an
+    image anchor N and an explicit turn direction; None if the pattern does
+    not match so the caller can fall through.
+
+    Derivation: k_gt = group_compose(anchor(view_N), turn_local), where
+      anchor(view_N) = quantize(C2W[0]ᵀ @ C2W[N])
+      turn_local     = R_bins[6] (right) or R_bins[5] (left)
+    Group composition of two cube anchors stays inside the 24-element group,
+    so the result is re-quantized via Frobenius distance for safety.
+    """
+    if entry.get("type") in _BUCKET_B_TYPES:
+        return None
+    q = entry.get("question", "")
+    m_img  = _RE_IMG_REF.search(q)
+    m_turn = _RE_TURN.search(q)
+    if m_img is None or m_turn is None:
+        return None
+    n = int(m_img.group(1)) - 1
+    direction = m_turn.group(1).lower()
+    k_turn = _K_TURN_RIGHT if direction == "right" else _K_TURN_LEFT
+
+    view_dirs = sorted(
+        d for d in os.listdir(sample_dir) if d.startswith("view_")
+    )
+    if n < 0 or n >= len(view_dirs):
+        return None
+    p0 = os.path.join(sample_dir, view_dirs[0], "camera_pose.npy")
+    pN = os.path.join(sample_dir, view_dirs[n], "camera_pose.npy")
+    if not (os.path.exists(p0) and os.path.exists(pN)):
+        return None
+    try:
+        C0 = np.load(p0).astype(np.float32)[:3, :3]
+        CN = np.load(pN).astype(np.float32)[:3, :3]
+        R_anchor = C0.T @ CN
+        k_anchor = _quantize_to_anchor(R_anchor)
+        R_bins   = _get_r_bins().numpy()
+        R_final  = R_bins[k_anchor] @ R_bins[k_turn]
+        return "H", _quantize_to_anchor(R_final)
+    except Exception:
+        return None
+
+
+def _extract_kgt_bucket_d(
+    entry:      dict,
+    sample_dir: str,
+) -> tuple[str, int] | None:
+    """Return ('D', k_gt) for viewpoint-anchor samples ("From the viewpoint
+    (presented) in image N, …"); None if the pattern does not match so the
+    caller can fall through.
+
+    k_gt = quantize(C2W[0]ᵀ @ C2W[N]) — the anchor rotation that takes the
+    model from the current (view 0) frame into view N's camera frame.
+    """
+    q = entry.get("question", "")
+    m = _RE_VIEWPOINT_IMG.search(q)
+    if m is None:
+        return None
+    n = int(m.group(1)) - 1                                   # 1-indexed → 0-idx
+    if n == 0:
+        return "D", 0                                          # identity anchor
+
+    view_dirs = sorted(
+        d for d in os.listdir(sample_dir) if d.startswith("view_")
+    )
+    if n < 0 or n >= len(view_dirs):
+        return None
+    p0 = os.path.join(sample_dir, view_dirs[0], "camera_pose.npy")
+    pN = os.path.join(sample_dir, view_dirs[n], "camera_pose.npy")
+    if not (os.path.exists(p0) and os.path.exists(pN)):
+        return None
+    try:
+        C0 = np.load(p0).astype(np.float32)[:3, :3]
+        CN = np.load(pN).astype(np.float32)[:3, :3]
+        R_rel = C0.T @ CN
+        return "D", _quantize_to_anchor(R_rel)
+    except Exception:
+        return None
+
+
+def _extract_kgt_bucket_a(
+    entry:      dict,
+    sample_dir: str,
+) -> tuple[str, int] | None:
+    """Return ('A', 0) for motion_query samples ("in which direction did I
+    move from the first view to the second view?"); None otherwise.
+
+    k_gt = 0 (identity anchor): the question is framed from view 0's frame,
+    so the rotation-side prior is identity. The translation-direction MCQ
+    answer is supervised via the ordinary answer-correctness reward, not by
+    anchor shaping.
+
+    sample_dir is accepted for signature consistency but unused here (no
+    pose read needed for the identity anchor).
+    """
+    if _RE_DIR_MOVE.search(entry.get("question", "")) is None:
+        return None
+    return "A", 0
+
+
+def _extract_kgt_bucket_e(
+    entry:      dict,
+    sample_dir: str,
+) -> tuple[str, int] | None:
+    """Return ('E', k_gt) for multi-view-scene samples that fix an image
+    anchor without a turn verb — pattern "standing at the same spot and
+    facing the same direction as shown in image N"; None otherwise.
+
+    Must be called AFTER B and H in the chain:
+      • B catches the same image-ref regex when type ∈ _BUCKET_B_TYPES.
+      • H catches image-ref + turn-verb combos.
+    So by the time this runs, any remaining image-ref match is E (scene is
+    anchored to image N without hypothetical rotation). "positioned where X"
+    samples (571 in training set) have no image anchor and fall through.
+
+    k_gt = quantize(C2W[0]ᵀ @ C2W[N]) — same pose derivation as D.
+    """
+    q = entry.get("question", "")
+    m = _RE_IMG_REF.search(q)
+    if m is None:
+        return None
+    n = int(m.group(1)) - 1                                   # 1-indexed → 0-idx
+    if n == 0:
+        return "E", 0                                          # identity anchor
+
+    view_dirs = sorted(
+        d for d in os.listdir(sample_dir) if d.startswith("view_")
+    )
+    if n < 0 or n >= len(view_dirs):
+        return None
+    p0 = os.path.join(sample_dir, view_dirs[0], "camera_pose.npy")
+    pN = os.path.join(sample_dir, view_dirs[n], "camera_pose.npy")
+    if not (os.path.exists(p0) and os.path.exists(pN)):
+        return None
+    try:
+        C0 = np.load(p0).astype(np.float32)[:3, :3]
+        CN = np.load(pN).astype(np.float32)[:3, :3]
+        R_rel = C0.T @ CN
+        return "E", _quantize_to_anchor(R_rel)
+    except Exception:
+        return None
+
+
 class MindCube_Train_Dataset_Rotation(MindCube_Train_Dataset_Coord):
     """
     Extends MindCube_Train_Dataset_Coord with camera-pose data.
@@ -714,6 +977,24 @@ class MindCube_Train_Dataset_Rotation(MindCube_Train_Dataset_Coord):
 
         batch["cam_pos_frame0"] = cam_pos_frame0
         batch["gt_rotation"]    = gt_rotation
+
+        # ── Reward-shaping supervision: bucket + k_gt anchor index ───────
+        # Priority: B (title regex) > H (anchor + turn) > D (viewpoint anchor)
+        #         > E (same-spot anchor) > A (motion_query) > default ('C', -1).
+        bucket, k_gt = _extract_kgt_bucket_b(entry, sample_dir)
+        if bucket != "B":
+            for extractor in (
+                _extract_kgt_bucket_h,
+                _extract_kgt_bucket_d,
+                _extract_kgt_bucket_e,
+                _extract_kgt_bucket_a,
+            ):
+                res = extractor(entry, sample_dir)
+                if res is not None:
+                    bucket, k_gt = res
+                    break
+        batch["bucket"] = bucket                          # 'A'/'B'/'C'/'D'/'E'/'H'
+        batch["k_gt"]   = int(k_gt)                       # 0..23 or -1
         return batch
 
 
