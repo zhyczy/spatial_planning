@@ -6,8 +6,10 @@
 #   Phase A (SFT)  : LoRA + coord_head trainable; encoder frozen at argmax anchor.
 #   Phase B (GRPO) : LoRA frozen; encoder heads + coord_head trainable.
 #     - head_cls / rot_bb ← PPO (K inner epochs, clipped surrogate + entropy + KL)
-#                           over 24 chiral-cube anchors; reward = 0/1 MCQ accuracy
-#                           with intra-group lm_loss shaping (softmax(-lm_loss/τ)).
+#                           over 24 chiral-cube anchors; dense reward
+#                           R(k) = -w_lm·lm_loss(k) − α·dist(R_k, R_gt) where
+#                           dist is a w_yaw/w_pitch/w_roll-weighted cos-distance
+#                           over decoupled ZYX Tait-Bryan Euler errors.
 #     - coord_head        ← standard SFT at argmax anchor (hidden detached).
 #
 # Multi-GPU via torchrun (DDP).
@@ -23,8 +25,12 @@
 #   --relative               coord_head predicts original xyz
 #   --lr_phase_a LR          Phase A base LR
 #   --lr_phase_b LR          Phase B base LR (rot_bb; head_cls = this × scale / K)
-#   --rwr_tau T              reward-shape softmax temperature (default: 1.0)
-#   --w_lm W                 reward-shape lm_loss perturbation scale (default: 1.0)
+#   --w_lm W                 scale on -lm_loss dense reward (default: 1.0)
+#   --alpha_dist A           Axis-decoupled cos-distance penalty coeff
+#                            (default: 0.8; set 0 to disable rotation discriminability)
+#   --w_yaw W                yaw weight in axis-decoupled distance (default: 1.0)
+#   --w_pitch W              pitch weight in axis-decoupled distance (default: 0.8)
+#   --w_roll W               roll weight in axis-decoupled distance (default: 0.05)
 #   --entropy_beta B         entropy bonus coeff (default: 0.01)
 #   --kl_lambda L            KL-to-uniform coeff (default: 0.001)
 #   --rl_weight W            scale on (L_rl + L_ent + L_kl) (default: 1.0)
@@ -35,10 +41,9 @@
 #   Bucket-aware anchor-prior shaping (MindCube 5-bucket taxonomy A/B/D/E/H;
 #   C residue = 571 E-pos-obj samples with no pose-derivable frame):
 #   --w_anchor_prior W       master switch (default: 1.0; 0 disables shaping)
-#   --w_rot_hi W             Bucket B weight  (default: 0.8, title-regex k_gt)
-#   --w_hypo W               Bucket H weight  (default: 0.5, pose∘±90° yaw)
-#   --w_rot_mid W            Buckets D/E     (default: 0.0; pose-derived k_gt)
-#   --w_trans W              Bucket A weight  (default: 0.0; identity prior)
+#   --w_rot W                Buckets B/H/D/E (default: 0.8; pose-derived R_gt,
+#                            geodesic θ handles anchor-reliability implicitly)
+#   --w_trans W              Bucket A weight  (default: 0.8; identity prior)
 #
 # Examples:
 #   bash scripts/train_rl.sh                   # all GPUs
@@ -67,8 +72,11 @@ NO_COORD_CLI=false
 RELATIVE_CLI=false
 LR_PHASE_A_CLI=""
 LR_PHASE_B_CLI=""
-RWR_TAU_CLI=""
 W_LM_CLI=""
+ALPHA_DIST_CLI=""
+W_YAW_CLI=""
+W_PITCH_CLI=""
+W_ROLL_CLI=""
 ENTROPY_BETA_CLI=""
 KL_LAMBDA_CLI=""
 RL_WEIGHT_CLI=""
@@ -76,9 +84,7 @@ SFT_WEIGHT_CLI=""
 PPO_INNER_EPOCHS_CLI=""
 PPO_CLIP_EPS_CLI=""
 W_ANCHOR_PRIOR_CLI=""
-W_ROT_HI_CLI=""
-W_HYPO_CLI=""
-W_ROT_MID_CLI=""
+W_ROT_CLI=""
 W_TRANS_CLI=""
 _positional=0
 
@@ -92,8 +98,11 @@ while [ $# -gt 0 ]; do
         --relative)          RELATIVE_CLI=true;          shift   ;;
         --lr_phase_a)        LR_PHASE_A_CLI="$2";        shift 2 ;;
         --lr_phase_b)        LR_PHASE_B_CLI="$2";        shift 2 ;;
-        --rwr_tau)           RWR_TAU_CLI="$2";           shift 2 ;;
         --w_lm)              W_LM_CLI="$2";              shift 2 ;;
+        --alpha_dist)        ALPHA_DIST_CLI="$2";        shift 2 ;;
+        --w_yaw)             W_YAW_CLI="$2";             shift 2 ;;
+        --w_pitch)           W_PITCH_CLI="$2";           shift 2 ;;
+        --w_roll)            W_ROLL_CLI="$2";            shift 2 ;;
         --entropy_beta)      ENTROPY_BETA_CLI="$2";      shift 2 ;;
         --kl_lambda)         KL_LAMBDA_CLI="$2";         shift 2 ;;
         --rl_weight)         RL_WEIGHT_CLI="$2";         shift 2 ;;
@@ -101,9 +110,7 @@ while [ $# -gt 0 ]; do
         --ppo_inner_epochs)  PPO_INNER_EPOCHS_CLI="$2";  shift 2 ;;
         --ppo_clip_eps)      PPO_CLIP_EPS_CLI="$2";      shift 2 ;;
         --w_anchor_prior)    W_ANCHOR_PRIOR_CLI="$2";    shift 2 ;;
-        --w_rot_hi)          W_ROT_HI_CLI="$2";          shift 2 ;;
-        --w_hypo)            W_HYPO_CLI="$2";            shift 2 ;;
-        --w_rot_mid)         W_ROT_MID_CLI="$2";         shift 2 ;;
+        --w_rot)             W_ROT_CLI="$2";             shift 2 ;;
         --w_trans)           W_TRANS_CLI="$2";           shift 2 ;;
         *)
             if [ $_positional -eq 0 ]; then
@@ -174,8 +181,13 @@ ROT_DIM_FEEDFORWARD=2048
 ROT_NUM_LAYERS=2
 
 # RL / PPO hyperparameters
-RWR_TAU="${RWR_TAU_CLI:-1.0}"
 W_LM="${W_LM_CLI:-1.0}"
+ALPHA_DIST="${ALPHA_DIST_CLI:-0.8}"
+# Axis-decoupled rotation-distance weights (defaults match train_rl.py argparse).
+# Indoor viewpoint QA: yaw dominates, pitch secondary (up/down gaze), roll residual.
+W_YAW="${W_YAW_CLI:-1.0}"
+W_PITCH="${W_PITCH_CLI:-0.8}"
+W_ROLL="${W_ROLL_CLI:-0.05}"
 ENTROPY_BETA="${ENTROPY_BETA_CLI:-0.01}"
 KL_LAMBDA="${KL_LAMBDA_CLI:-0.001}"
 RL_WEIGHT="${RL_WEIGHT_CLI:-1.0}"
@@ -184,13 +196,13 @@ PPO_INNER_EPOCHS="${PPO_INNER_EPOCHS_CLI:-3}"
 PPO_CLIP_EPS="${PPO_CLIP_EPS_CLI:-0.2}"
 
 # Bucket-aware anchor-prior shaping (defaults match train_rl.py argparse).
-# D/E/A weights default to 0 so baseline runs are unchanged until explicitly
-# enabled; B/H weights preserve the existing shaping regime.
+# Single w_rot weight for all pose-derived buckets (B/H/D/E); the continuous
+# geodesic θ already differentiates anchor reliability implicitly. w_trans
+# stays separate because Bucket A uses an identity R_gt (semantically distinct
+# from pose-derived rotations).
 W_ANCHOR_PRIOR="${W_ANCHOR_PRIOR_CLI:-1.0}"
-W_ROT_HI="${W_ROT_HI_CLI:-0.8}"
-W_HYPO="${W_HYPO_CLI:-0.5}"
-W_ROT_MID="${W_ROT_MID_CLI:-0.0}"
-W_TRANS="${W_TRANS_CLI:-0.0}"
+W_ROT="${W_ROT_CLI:-0.8}"
+W_TRANS="${W_TRANS_CLI:-0.8}"
 
 # Loss weights
 _COORD_WEIGHT="${COORD_WEIGHT:-1.0}"
@@ -238,8 +250,9 @@ echo "[INFO] RELATIVE             = $RELATIVE"
 echo "[INFO] LR_PHASE_A           = ${LR_PHASE_A:-<fallback to \$LR=$LR>}"
 echo "[INFO] LR_PHASE_B           = ${LR_PHASE_B:-<fallback to \$ROTATION_ENC_LR=$ROTATION_ENC_LR>}"
 echo "[INFO] HEAD_CLS_LR_SCALE    = $HEAD_CLS_LR_SCALE"
-echo "[INFO] RWR_TAU              = $RWR_TAU"
 echo "[INFO] W_LM                 = $W_LM"
+echo "[INFO] ALPHA_DIST           = $ALPHA_DIST"
+echo "[INFO] W_YAW / W_PITCH / W_ROLL = $W_YAW / $W_PITCH / $W_ROLL"
 echo "[INFO] ENTROPY_BETA         = $ENTROPY_BETA"
 echo "[INFO] KL_LAMBDA            = $KL_LAMBDA"
 echo "[INFO] RL_WEIGHT            = $RL_WEIGHT"
@@ -247,10 +260,8 @@ echo "[INFO] SFT_WEIGHT           = $SFT_WEIGHT"
 echo "[INFO] PPO_INNER_EPOCHS     = $PPO_INNER_EPOCHS"
 echo "[INFO] PPO_CLIP_EPS         = $PPO_CLIP_EPS"
 echo "[INFO] W_ANCHOR_PRIOR       = $W_ANCHOR_PRIOR"
-echo "[INFO] W_ROT_HI   (B)       = $W_ROT_HI"
-echo "[INFO] W_HYPO     (H)       = $W_HYPO"
-echo "[INFO] W_ROT_MID  (D/E)     = $W_ROT_MID"
-echo "[INFO] W_TRANS    (A)       = $W_TRANS"
+echo "[INFO] W_ROT    (B/H/D/E)   = $W_ROT"
+echo "[INFO] W_TRANS  (A)         = $W_TRANS"
 echo "[INFO] EVAL_TOPK            = $EVAL_TOPK"
 echo "[INFO] coord_weight         = $_COORD_WEIGHT"
 echo "[INFO] coord_scale          = $_COORD_SCALE"
@@ -320,8 +331,11 @@ $TORCHRUN \
     --rot_nhead              "$ROT_NHEAD"              \
     --rot_dim_feedforward    "$ROT_DIM_FEEDFORWARD"    \
     --rot_num_layers         "$ROT_NUM_LAYERS"         \
-    --rwr_tau                "$RWR_TAU"                \
     --w_lm                   "$W_LM"                   \
+    --alpha_dist             "$ALPHA_DIST"             \
+    --w_yaw                  "$W_YAW"                  \
+    --w_pitch                "$W_PITCH"                \
+    --w_roll                 "$W_ROLL"                 \
     --entropy_beta           "$ENTROPY_BETA"           \
     --kl_lambda              "$KL_LAMBDA"              \
     --rl_weight              "$RL_WEIGHT"              \
@@ -329,9 +343,7 @@ $TORCHRUN \
     --ppo_inner_epochs       "$PPO_INNER_EPOCHS"       \
     --ppo_clip_eps           "$PPO_CLIP_EPS"           \
     --w_anchor_prior         "$W_ANCHOR_PRIOR"         \
-    --w_rot_hi               "$W_ROT_HI"               \
-    --w_hypo                 "$W_HYPO"                 \
-    --w_rot_mid              "$W_ROT_MID"              \
+    --w_rot                  "$W_ROT"                  \
     --w_trans                "$W_TRANS"                \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \

@@ -45,6 +45,14 @@ Multi-method QA evaluation:
       are loaded but currently unused in forward (matches training).
       Ckpt  : coord_head.pt MUST contain cam_proj.* weights.
 
+  rotation_rl
+      Same architecture as `rotation` at inference time, but rotation_enc is a
+      CameraTokenRotationEncoderRL trained by train_rl.py (without --relative).
+      Inference picks R via anchor argmax + residual:
+          k = argmax(logits), R = R_bins[k] @ exp(hat(clamp·tanh(residual[k])))
+      Ckpt  : rotation_enc.pt contains head_cls.* / head_res.* (NOT rot_head.*).
+              coord_head.pt must NOT contain cam_proj.*.
+
   both   → baseline + coordinate  (primary comparison)
 
 Usage
@@ -108,6 +116,7 @@ from src.models import (
     SpaForConditionalGeneration,
     DepthPredictionTransformer,
     CameraTokenRotationEncoder,
+    CameraTokenRotationEncoderRL,
 )
 from src.models.rotation_rope_llm import (
     _build_token_txyz_int,
@@ -473,13 +482,22 @@ def _load_rotation_enc(
     ckpt_path: str,
     spa_model: Any,
     device: str,
-) -> Optional[CameraTokenRotationEncoder]:
-    """Load CameraTokenRotationEncoder from checkpoint directory.
+    expect_rl: Optional[bool] = None,
+) -> Optional[torch.nn.Module]:
+    """Load rotation encoder (RL or non-RL) from checkpoint directory.
+
+    Auto-detects the architecture from state-dict keys:
+      - non-RL (train_rotation.py) → CameraTokenRotationEncoder (has rot_head.*)
+      - RL     (train_rl.py)       → CameraTokenRotationEncoderRL (has head_cls.* / head_res.*)
 
     Infers architecture (hidden_dim, d_model, dim_feedforward, num_layers) from
     the saved weight shapes. `nhead` is derived from d_model / mllm_head_dim.
     Reuses the merged SPA model's SpaTextRotaryEmbedding so inv_freq and
     mrope_section are byte-identical to training.
+
+    Args:
+        expect_rl: if True, require an RL ckpt; if False, require a non-RL ckpt;
+                   if None, accept either. Mismatch raises RuntimeError.
     """
     logger = logging.getLogger(__name__)
     ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=False)
@@ -489,6 +507,20 @@ def _load_rotation_enc(
         return None
 
     state = torch.load(str(rot_path), map_location="cpu", weights_only=True)
+
+    # Detect RL vs non-RL from state-dict keys
+    is_rl = "head_cls.weight" in state
+    if expect_rl is True and not is_rl:
+        raise RuntimeError(
+            f"[rotation_rl] {rot_path} has no head_cls.* — this is a non-RL rotation "
+            "encoder (trained by train_rotation.py). Use --method rotation (or "
+            "rotation_relative) instead, or retrain with train_rl.py."
+        )
+    if expect_rl is False and is_rl:
+        raise RuntimeError(
+            f"[rotation] {rot_path} contains head_cls.* — this is an RL rotation "
+            "encoder (trained by train_rl.py). Use --method rotation_rl instead."
+        )
 
     # Infer architecture from state dict shapes
     d_model = int(state["cam_token"].shape[1])
@@ -509,14 +541,30 @@ def _load_rotation_enc(
         )
     nhead = d_model // mllm_head_dim
 
-    rotation_enc = CameraTokenRotationEncoder(
-        hidden_dim=hidden_dim,
-        mllm_head_dim=mllm_head_dim,
-        rope_emb=rotary_emb,
-        nhead=nhead,
-        dim_feedforward=dim_feedforward,
-        num_layers=num_layers,
-    )
+    if is_rl:
+        # RL: action_space is "hybrid" iff head_res.* is present, else "discrete".
+        action_space = "hybrid" if "head_res.weight" in state else "discrete"
+        rotation_enc = CameraTokenRotationEncoderRL(
+            hidden_dim=hidden_dim,
+            mllm_head_dim=mllm_head_dim,
+            rope_emb=rotary_emb,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            num_layers=num_layers,
+            action_space=action_space,
+        )
+        cls_name = f"CameraTokenRotationEncoderRL(action_space={action_space})"
+    else:
+        rotation_enc = CameraTokenRotationEncoder(
+            hidden_dim=hidden_dim,
+            mllm_head_dim=mllm_head_dim,
+            rope_emb=rotary_emb,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            num_layers=num_layers,
+        )
+        cls_name = "CameraTokenRotationEncoder"
+
     # rope_emb's inv_freq is a non-persistent buffer shared with the MLLM;
     # allow strict=False so the missing inv_freq keys don't fail the load.
     missing, unexpected = rotation_enc.load_state_dict(state, strict=False)
@@ -524,7 +572,7 @@ def _load_rotation_enc(
         logger.warning(f"[rotation] unexpected keys when loading rotation_enc: {unexpected}")
     rotation_enc = rotation_enc.to(device).to(torch.bfloat16).eval()
     logger.info(
-        f"[rotation] CameraTokenRotationEncoder loaded from {rot_path} "
+        f"[rotation] {cls_name} loaded from {rot_path} "
         f"(hidden_dim={hidden_dim}, d_model={d_model}, nhead={nhead}, "
         f"dim_ff={dim_feedforward}, num_layers={num_layers})"
     )
@@ -533,7 +581,7 @@ def _load_rotation_enc(
 
 def _compute_rotation_R(
     spa_model: Any,
-    rotation_enc: CameraTokenRotationEncoder,
+    rotation_enc: torch.nn.Module,
     inputs: Dict[str, Any],
     image_xyz: List[torch.Tensor],
     image_token_id: int,
@@ -543,6 +591,10 @@ def _compute_rotation_R(
     """Compute rotation R (and cam_feat) via a partial forward.
 
     Mirrors RotationRoPEModel.forward Steps 1-2 without gradients.
+    Dispatches on encoder type:
+      - CameraTokenRotationEncoder  → R = rot6d head output
+      - CameraTokenRotationEncoderRL → R = compose_R(argmax logits, residual)
+
     Returns (R (3,3), cam_feat (d_model,)) or (None, None) on missing inputs.
     cam_feat is needed by DepthPredictionTransformer when the ckpt was trained
     with train_rotation.py --relative (method='rotation_relative').
@@ -583,7 +635,15 @@ def _compute_rotation_R(
             spatial_merge_size,
             coord_scale,
         )
-        R, cam_feat = rotation_enc(inputs_embeds, token_txyz_int)
+        if isinstance(rotation_enc, CameraTokenRotationEncoderRL):
+            # RL: pick argmax anchor, compose final R with residual correction
+            logits, residual_all, cam_feat = rotation_enc(
+                inputs_embeds, token_txyz_int
+            )
+            k = int(torch.argmax(logits).item())
+            R = rotation_enc.compose_R(k, residual_all)
+        else:
+            R, cam_feat = rotation_enc(inputs_embeds, token_txyz_int)
 
     return R, cam_feat
 
@@ -1452,6 +1512,9 @@ def evaluate(
                        matches train_rotation.py (no --relative)
       rotation_relative  — same as rotation, but paired with a --relative
                        checkpoint (coord head has extra cam_proj; cam_dim>0)
+      rotation_rl        — same as rotation, but with an RL-trained
+                       CameraTokenRotationEncoderRL (train_rl.py, no --relative);
+                       R = compose_R(argmax(head_cls), head_res)
       both               — baseline + coordinate
 
     Returns dict mapping method name → list of result dicts.
@@ -1465,7 +1528,8 @@ def evaluate(
     run_polar = method == "polar"
     run_rotation = method == "rotation"
     run_rotation_relative = method == "rotation_relative"
-    run_any_rotation = run_rotation or run_rotation_relative
+    run_rotation_rl = method == "rotation_rl"
+    run_any_rotation = run_rotation or run_rotation_relative or run_rotation_rl
     run_spa = (
         run_vanilla or run_position_embedding or run_coordinate
         or run_polar or run_any_rotation
@@ -1481,7 +1545,7 @@ def evaluate(
 
     image_token_id_val: Optional[int] = None
     spa_coord_head: Optional[DepthPredictionTransformer] = None
-    spa_rotation_enc: Optional[CameraTokenRotationEncoder] = None
+    spa_rotation_enc: Optional[torch.nn.Module] = None
 
     if run_spa:
         if correspondence_ckpt is None:
@@ -1509,8 +1573,9 @@ def evaluate(
         if run_coordinate or run_any_rotation:
             # rotation          → expect no cam_proj (strict)
             # rotation_relative → expect cam_proj (strict)
+            # rotation_rl       → expect no cam_proj (strict)
             # coordinate        → auto (no constraint)
-            if run_rotation:
+            if run_rotation or run_rotation_rl:
                 _expect_rel = False
             elif run_rotation_relative:
                 _expect_rel = True
@@ -1520,9 +1585,14 @@ def evaluate(
                 correspondence_ckpt, device, expect_relative=_expect_rel,
             )
 
-        # Load CameraTokenRotationEncoder for rotation checkpoint
+        # Load rotation encoder (RL or non-RL) for rotation checkpoint
         if run_any_rotation:
-            spa_rotation_enc = _load_rotation_enc(correspondence_ckpt, spa_model, device)
+            # rotation / rotation_relative → non-RL encoder (has rot_head.*)
+            # rotation_rl                  → RL encoder      (has head_cls.*)
+            _expect_rl = True if run_rotation_rl else False
+            spa_rotation_enc = _load_rotation_enc(
+                correspondence_ckpt, spa_model, device, expect_rl=_expect_rl,
+            )
 
     # Determine which SPA variants to run.
     # Tuple: (method_name, use_coord, is_polar, is_rotation)
@@ -1544,6 +1614,8 @@ def evaluate(
         spa_variants.append(("rotation", False, False, True))
     if run_rotation_relative:
         spa_variants.append(("rotation_relative", False, False, True))
+    if run_rotation_rl:
+        spa_variants.append(("rotation_rl", False, False, True))
 
     active_methods = (
         (["baseline"] if run_baseline else [])
@@ -1808,7 +1880,7 @@ def main() -> None:
     parser.add_argument(
         "--method", type=str, default="both",
         choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
-                 "rotation", "rotation_relative", "both"],
+                 "rotation", "rotation_relative", "rotation_rl", "both"],
         help=(
             "Which method(s) to run. "
             "baseline=stock Qwen3.5-VL; "
@@ -1818,6 +1890,7 @@ def main() -> None:
             "polar=SPA LoRA + 4D M-RoPE, XYZ→spherical for RoPE, prompt has no <coord> tokens; "
             "rotation=SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder (canonical R) + coord head (cam_dim=0, non-relative ckpt); "
             "rotation_relative=same as rotation but for --relative ckpts (coord head has cam_proj, cam_dim>0); "
+            "rotation_rl=same as rotation but for RL-trained ckpts (rotation_enc has head_cls/head_res; non-relative coord head); "
             "both=baseline + coordinate."
         ),
     )
@@ -1988,6 +2061,7 @@ def main() -> None:
         "polar":              args.method == "polar",
         "rotation":           args.method == "rotation",
         "rotation_relative":  args.method == "rotation_relative",
+        "rotation_rl":        args.method == "rotation_rl",
     }
     all_results: Dict[str, List[Dict]] = {}
     for mname, active in _method_names.items():
@@ -2003,6 +2077,7 @@ def main() -> None:
         "polar":              "polar              (SPA LoRA + 4D M-RoPE, XYZ→spherical, no <coord>)",
         "rotation":           "rotation           (SPA LoRA + 4D M-RoPE + rotation_enc + coord head, cam_dim=0)",
         "rotation_relative":  "rotation_relative  (SPA LoRA + 4D M-RoPE + rotation_enc + coord head, --relative ckpt)",
+        "rotation_rl":        "rotation_rl        (SPA LoRA + 4D M-RoPE + rotation_enc_rl + coord head, cam_dim=0)",
     }
     _metrics_fn = compute_metrics_robospatial if args.dataset == "robospatial" else compute_metrics
     for mname, mresults in all_results.items():
@@ -2025,6 +2100,7 @@ def main() -> None:
         ("baseline", "polar"),
         ("baseline", "rotation"),
         ("baseline", "rotation_relative"),
+        ("baseline", "rotation_rl"),
         ("baseline", "position_embedding"),
         ("baseline", "vanilla"),
     ]

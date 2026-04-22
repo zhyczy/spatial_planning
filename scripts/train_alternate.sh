@@ -47,12 +47,28 @@
 #   --lr_phase_b LR  — base LR for Phase B (rotation_enc + coord_head);
 #                      independent cosine decay over Phase B optim steps.
 #                      Defaults to $ROTATION_ENC_LR.
+#   --reg            — replace Phase A lm_loss with composite regularized loss:
+#                        L = L_CE(R_opt) + (λ1/N) Σ_{k∈S} L_CE(R_k)
+#                              + (λ2/N) Σ_{k∈S} max(0, L_opt − L_k + α·d_k)
+#                      S is a rank-stratified sample of N=6 anchors from the
+#                      24 chiral-cube rotations (2 each from near/middle/far
+#                      d_k tiers of 8), resampled every step.  R_opt = I in
+#                      epoch 0 (rotation_enc untrained), R_opt = rotation_enc
+#                      prediction in epoch ≥ 1.  Per step: 1 + N no_grad +
+#                      up to 1 + N grad LLM forwards (inactive anchors fold
+#                      into w_k=0 and are skipped when λ1=λ2).  Slower than
+#                      baseline — expect ~2× on early steps, ~6× later.
+#   --reg_lambda1 λ1 — weight for the full-view CE prior (default: 0.3)
+#   --reg_lambda2 λ2 — weight for the distance-aware hinge term (default: 0.3)
+#   --reg_alpha   α  — margin coefficient on SO(3) geodesic distance in radians
+#                      (default: 0.8 ≈ 45.8°)
 #
 # Examples:
 #   bash scripts/train_alternate.sh                   # all GPUs
 #   bash scripts/train_alternate.sh 4                 # 4 GPUs
 #   bash scripts/train_alternate.sh 4 --train_data sat
 #   bash scripts/train_alternate.sh 4 --lr_phase_a 2e-4 --lr_phase_b 5e-5
+#   bash scripts/train_alternate.sh 4 --reg --reg_lambda1 0.3 --reg_lambda2 0.3
 # =============================================================================
 
 set -euo pipefail
@@ -75,6 +91,10 @@ NO_COORD_CLI=false
 RELATIVE_CLI=false
 LR_PHASE_A_CLI=""
 LR_PHASE_B_CLI=""
+REG_CLI=false
+REG_LAMBDA1_CLI=""
+REG_LAMBDA2_CLI=""
+REG_ALPHA_CLI=""
 _positional=0
 
 while [ $# -gt 0 ]; do
@@ -95,6 +115,14 @@ while [ $# -gt 0 ]; do
             LR_PHASE_A_CLI="$2"; shift 2 ;;
         --lr_phase_b)
             LR_PHASE_B_CLI="$2"; shift 2 ;;
+        --reg)
+            REG_CLI=true; shift ;;
+        --reg_lambda1)
+            REG_LAMBDA1_CLI="$2"; shift 2 ;;
+        --reg_lambda2)
+            REG_LAMBDA2_CLI="$2"; shift 2 ;;
+        --reg_alpha)
+            REG_ALPHA_CLI="$2"; shift 2 ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -141,6 +169,13 @@ NO_COORD=$NO_COORD_CLI  # true → disable coord loss / coord_head entirely
                         # toggle via `--no_coord` CLI flag
 RELATIVE=$RELATIVE_CLI  # true → coord_head predicts original (un-rotated) xyz
                         # with detached cam_feat conditioning; toggle via `--relative`
+REG=$REG_CLI            # true → Phase A lm_loss replaced by composite loss
+                        # over R_opt + 24 chiral-cube anchors + dist-aware hinge
+                        # (toggle via `--reg`, tune via --reg_lambda1/2/--reg_alpha)
+REG_LAMBDA1="${REG_LAMBDA1_CLI:-0.3}"   # full-view CE prior weight
+REG_LAMBDA2="${REG_LAMBDA2_CLI:-0.3}"   # distance-aware hinge weight
+REG_ALPHA="${REG_ALPHA_CLI:-0.8}"       # hinge margin coefficient on SO(3) angle
+                                        # in radians (0.8 ≈ 45.8°)
 LR=2e-4                 # Phase A base LR fallback (LoRA + coord_head)
                         # used when --lr_phase_a is not given.
 ROTATION_ENC_LR=2e-4    # Phase B base LR fallback (rotation_enc + coord_head)
@@ -184,11 +219,17 @@ fi
 if [ "$RELATIVE" = "true" ]; then
     _METHOD="${_METHOD}_relative"
 fi
+if [ "$REG" = "true" ]; then
+    _METHOD="${_METHOD}_reg"
+fi
 RUN_NAME="${_METHOD}_${TRAINING_DATASET}"
 if [ "$NO_COORD" = "true" ]; then
     WANDB_RUN_NAME="${_METHOD}_${TRAINING_DATASET}_r${LORA_RANK}_ep${EPOCHS}"
 else
     WANDB_RUN_NAME="${_METHOD}_${TRAINING_DATASET}_r${LORA_RANK}_ep${EPOCHS}_cw${_COORD_WEIGHT}"
+fi
+if [ "$REG" = "true" ]; then
+    WANDB_RUN_NAME="${WANDB_RUN_NAME}_l1${REG_LAMBDA1}_l2${REG_LAMBDA2}_a${REG_ALPHA}"
 fi
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
@@ -213,6 +254,12 @@ echo "[INFO] LR_PHASE_A           = ${LR_PHASE_A:-<fallback to \$LR=$LR>}"
 echo "[INFO] LR_PHASE_B           = ${LR_PHASE_B:-<fallback to \$ROTATION_ENC_LR=$ROTATION_ENC_LR>}"
 echo "[INFO] coord_weight         = $_COORD_WEIGHT"
 echo "[INFO] coord_scale          = $_COORD_SCALE"
+echo "[INFO] REG (phase-A)        = $REG"
+if [ "$REG" = "true" ]; then
+    echo "[INFO]   reg_lambda1        = $REG_LAMBDA1"
+    echo "[INFO]   reg_lambda2        = $REG_LAMBDA2"
+    echo "[INFO]   reg_alpha (rad)    = $REG_ALPHA"
+fi
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -243,6 +290,11 @@ fi
 LR_PHASE_B_FLAG=""
 if [ -n "$LR_PHASE_B" ]; then
     LR_PHASE_B_FLAG="--lr_phase_b $LR_PHASE_B"
+fi
+
+REG_FLAG=""
+if [ "$REG" = "true" ]; then
+    REG_FLAG="--reg --reg_lambda1 $REG_LAMBDA1 --reg_lambda2 $REG_LAMBDA2 --reg_alpha $REG_ALPHA"
 fi
 
 # =============================================================================
@@ -283,6 +335,7 @@ $TORCHRUN \
     $NO_COORD_FLAG \
     $RELATIVE_FLAG \
     $LR_PHASE_A_FLAG \
-    $LR_PHASE_B_FLAG
+    $LR_PHASE_B_FLAG \
+    $REG_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

@@ -96,6 +96,10 @@ from src.models import (
     RotationRoPEModel,
     SpaForConditionalGeneration,
 )
+from src.models.rotation_rope_llm import (
+    _build_chiral_cube_group,
+    _build_token_txyz_int,
+)
 from src.models.spa_emb import SpaTextRotaryEmbedding
 from src.dataset import (
     MindCube_Train_Dataset_Rotation,
@@ -244,6 +248,264 @@ def _set_requires_grad(params, flag: bool) -> None:
         p.requires_grad_(flag)
 
 
+def _phase_a_reg_step(
+    _model:         RotationRoPEModel,
+    batch_tensors:  dict,
+    args:           argparse.Namespace,
+    R_bins:         torch.Tensor,
+    grad_accum:     int,
+    device:         torch.device,
+    use_rot_enc:    bool = True,
+):
+    """Phase A composite regularized loss (replaces plain lm_loss).
+
+        L_total = L_CE(R_opt)
+                + (λ1/N) · Σ_{k∈S}  L_CE(R_k)
+                + (λ2/N) · Σ_{k∈S} max(0, L_opt − L_k + α · dist(R_k, R_opt))
+
+    where L_x = L_CE(R_x), S is a stratified sample of N=6 anchors drawn
+    from the 24 chiral-cube rotations (R_bins from train_rl's group), and
+    dist is the SO(3) geodesic angle θ = acos((tr(R_k^T · R_opt) − 1) / 2).
+
+    Stratified sampling
+    ~~~~~~~~~~~~~~~~~~~
+    Per step, all 24 distances d_k = dist(R_bins[k], R_opt) are computed
+    (24 cheap 3×3 matmuls — no LLM forward), argsort'd, and partitioned
+    into three equal tiers of 8 (near / middle / far by rank).  Two
+    anchors are drawn uniformly at random from each tier, giving N=6
+    per step.  Every call resamples — no forced-include anchor, no
+    cross-step memoization.  Proportional allocation (tier sizes 8,8,8
+    × equal picks 2,2,2) makes (1/N)Σ_{k∈S} an unbiased estimator of
+    (1/24)Σ_{k=0..23}, so the 1/N normalization preserves the λ1/λ2
+    scales you'd get from summing over all 24 anchors.
+
+    When ``use_rot_enc=False`` (epoch 0, before rotation_enc has been
+    trained), R_opt is pinned to R_bins[0] = I.  The rotation_enc call
+    and token_txyz_int construction are both skipped — the regularizer
+    still runs, but its "optimal" anchor is identity, matching what R
+    would be in the plain lm_loss path at this stage.
+
+    Memory: 1 + N grad LLM forwards per step would still be heavy if
+    all graphs were kept alive for a single combined backward.  Instead:
+        • Pass 1 (no_grad): 1 + N cheap forwards → scalar L values to
+          decide the hinge-active set and per-term weights.
+        • Pass 2 (grad, in-loop backward): re-forward each R with its
+          closed-form per-term weight and ``backward()`` immediately so
+          that iteration's activations are released before the next.
+
+    All backwards are pre-scaled by ``1/grad_accum`` — the caller must
+    NOT re-apply that factor.
+    """
+    input_ids       = batch_tensors["input_ids"]
+    attention_mask  = batch_tensors["attention_mask"]
+    pixel_values    = batch_tensors["pixel_values"]
+    image_grid_thw  = batch_tensors["image_grid_thw"]
+    labels          = batch_tensors["labels"]
+    image_xyz       = batch_tensors["image_xyz"]
+    image_xyz_hires = batch_tensors["image_xyz_hires"]
+
+    lam1  = float(args.reg_lambda1)
+    lam2  = float(args.reg_lambda2)
+    alpha = float(args.reg_alpha)
+
+    ldict: dict = {}
+
+    # ── Pass 1: no_grad — shared encode, R_opt, full-24 distances, then
+    #           rank-stratified sample S of N=6 anchors, then L_k on S only.
+    with torch.no_grad():
+        inputs_embeds = _model.encode_inputs(
+            input_ids, pixel_values, image_grid_thw,
+        )
+        if use_rot_enc:
+            token_txyz_int = _build_token_txyz_int(
+                input_ids, _model.image_token_id,
+                image_xyz, image_grid_thw, _model.spatial_merge_size,
+                args.coord_scale,
+            )
+            R_opt, _ = _model.rotation_enc(inputs_embeds, token_txyz_int)
+            R_opt = R_opt.float().detach()
+        else:
+            # Epoch-0 bootstrap: rotation_enc is untrained, pin R_opt = I.
+            R_opt = R_bins[0].clone()
+
+        # SO(3) geodesic distance for ALL 24 anchors (matmul only; no LLM
+        # forward).  Needed before sampling so we can stratify by rank.
+        R_rel        = R_bins.transpose(-1, -2) @ R_opt              # (24,3,3)
+        trace        = R_rel.diagonal(dim1=-2, dim2=-1).sum(-1)      # (24,)
+        cos_ang      = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+        dists_tensor = torch.arccos(cos_ang)                          # (24,) rad
+        dists        = dists_tensor.tolist()
+
+        # Rank-based stratified sampling: argsort(d_k) into [0:8]/[8:16]/
+        # [16:24] (near / middle / far tiers), then 2 uniformly-random
+        # picks per tier → N=6 anchors this step.  Resampled every call.
+        order = torch.argsort(dists_tensor).tolist()
+        S: list[int] = []
+        for tier_start in (0, 8, 16):
+            tier  = order[tier_start:tier_start + 8]
+            picks = torch.randperm(8)[:2].tolist()
+            S.extend(tier[p] for p in picks)
+
+        # Pass-1 L_k only for the sampled anchors.
+        L_k_vals_S: list[float] = []
+        dists_S:    list[float] = []
+        for k in S:
+            lm_k, _, _ = _model.compute_losses_from_R(
+                R                   = R_bins[k],
+                inputs_embeds       = inputs_embeds,
+                input_ids           = input_ids,
+                attention_mask      = attention_mask,
+                image_xyz           = image_xyz,
+                image_xyz_hires     = None,
+                image_grid_thw      = image_grid_thw,
+                labels              = labels,
+                coord_scale         = args.coord_scale,
+                use_coord_loss      = False,
+                use_relative        = args.relative,
+                detach_coord_hidden = True,
+                cam_feat            = None,
+                compute_reward      = False,
+            )
+            L_k_vals_S.append(
+                float(lm_k.item()) if lm_k is not None else float("inf")
+            )
+            dists_S.append(dists[k])
+
+        lm_opt, _, _ = _model.compute_losses_from_R(
+            R                   = R_opt,
+            inputs_embeds       = inputs_embeds,
+            input_ids           = input_ids,
+            attention_mask      = attention_mask,
+            image_xyz           = image_xyz,
+            image_xyz_hires     = None,
+            image_grid_thw      = image_grid_thw,
+            labels              = labels,
+            coord_scale         = args.coord_scale,
+            use_coord_loss      = False,
+            use_relative        = args.relative,
+            detach_coord_hidden = True,
+            cam_feat            = None,
+            compute_reward      = False,
+        )
+        L_opt_val = (
+            float(lm_opt.item()) if lm_opt is not None else float("inf")
+        )
+
+    # Early bail: without a finite L_opt there is no main-term gradient.
+    if not math.isfinite(L_opt_val):
+        return None, None
+
+    # Hinge active over sampled S only; infinite L_k falls through inactive.
+    N        = len(S)
+    active_S: list[bool] = []
+    for i in range(N):
+        if not math.isfinite(L_k_vals_S[i]):
+            active_S.append(False)
+            continue
+        hinge_val = L_opt_val - L_k_vals_S[i] + alpha * dists_S[i]
+        active_S.append(hinge_val > 0.0)
+    n_active = sum(active_S)
+
+    # Per-term closed-form weights derived from
+    #   ∂L_total/∂θ = (1 + (λ2/N)·n_active)·∂L_opt
+    #               + Σ_{i∈S} [(λ1/N) − (λ2/N)·I[active_i]]·∂L_i
+    w_opt = 1.0 + (lam2 / float(N)) * n_active
+    w_k_S = [
+        (lam1 / float(N)) - ((lam2 / float(N)) if active_S[i] else 0.0)
+        for i in range(N)
+    ]
+
+    scale           = 1.0 / float(grad_accum)
+    lm_opt_val_g    = 0.0
+    coord_loss_val  = 0.0
+
+    # ── Pass 2a: R_opt with grad — carries the answer_weight·L_opt term
+    #            and the (unchanged) coord_loss at the predicted pose.
+    lm_opt_g, coord_opt_g, _ld_opt = _model.compute_losses_from_R(
+        R                   = R_opt,
+        inputs_embeds       = inputs_embeds,
+        input_ids           = input_ids,
+        attention_mask      = attention_mask,
+        image_xyz           = image_xyz,
+        image_xyz_hires     = image_xyz_hires,
+        image_grid_thw      = image_grid_thw,
+        labels              = labels,
+        coord_scale         = args.coord_scale,
+        use_coord_loss      = (not args.no_coord),
+        use_relative        = args.relative,
+        detach_coord_hidden = False,
+        cam_feat            = None,
+        compute_reward      = False,
+    )
+    step_loss_opt = torch.zeros((), device=device)
+    if lm_opt_g is not None:
+        step_loss_opt = step_loss_opt + (args.answer_weight * w_opt) * lm_opt_g
+        lm_opt_val_g  = float(lm_opt_g.item())
+    if coord_opt_g is not None:
+        step_loss_opt  = step_loss_opt + args.coord_weight * coord_opt_g
+        coord_loss_val = float(coord_opt_g.item())
+    if step_loss_opt.requires_grad:
+        (scale * step_loss_opt).backward()
+
+    # ── Pass 2b: sampled anchors (k ∈ S) — one grad forward + in-loop
+    #           backward each.  w_k=0 anchors (e.g. active with λ1=λ2)
+    #           are skipped entirely; so are any with non-finite L_k.
+    for i, k in enumerate(S):
+        wk = w_k_S[i]
+        if abs(wk) < 1e-9 or not math.isfinite(L_k_vals_S[i]):
+            continue
+        lm_k_g, _, _ = _model.compute_losses_from_R(
+            R                   = R_bins[k],
+            inputs_embeds       = inputs_embeds,
+            input_ids           = input_ids,
+            attention_mask      = attention_mask,
+            image_xyz           = image_xyz,
+            image_xyz_hires     = None,
+            image_grid_thw      = image_grid_thw,
+            labels              = labels,
+            coord_scale         = args.coord_scale,
+            use_coord_loss      = False,
+            use_relative        = args.relative,
+            detach_coord_hidden = True,
+            cam_feat            = None,
+            compute_reward      = False,
+        )
+        if lm_k_g is None:
+            continue
+        step_loss_k = (args.answer_weight * wk) * lm_k_g
+        (scale * step_loss_k).backward()
+
+    # True L_total at sampled S (matches the mathematical formula; uses
+    # Pass-1 values so every term — including skipped-w_k anchors and the
+    # α·d_k margin constants — is captured).  Reported for logging only;
+    # gradients already flowed via the per-term backward() above.
+    finite_L  = [v for v in L_k_vals_S if math.isfinite(v)]
+    lm_k_mean = (sum(finite_L) / len(finite_L)) if finite_L else 0.0
+    lm_k_min  = min(finite_L) if finite_L else 0.0
+    hinge_sum = 0.0
+    for i in range(N):
+        if active_S[i]:
+            hinge_sum += (L_opt_val - L_k_vals_S[i] + alpha * dists_S[i])
+    reg_lm_term    = (lam1 / float(N)) * sum(finite_L)
+    reg_hinge_term = (lam2 / float(N)) * hinge_sum
+    total_loss_val = (
+        args.answer_weight * (lm_opt_val_g + reg_lm_term + reg_hinge_term)
+        + args.coord_weight * coord_loss_val
+    )
+
+    ldict["lm_loss"]         = lm_opt_val_g
+    if coord_loss_val:
+        ldict["coord_loss"]  = coord_loss_val
+    ldict["reg_lm_kmean"]    = lm_k_mean
+    ldict["reg_lm_kmin"]     = lm_k_min
+    ldict["reg_hinge_sum"]   = hinge_sum
+    ldict["reg_n_active"]    = float(n_active)
+    ldict["reg_n_sampled"]   = float(N)
+    ldict["reg_w_opt"]       = float(w_opt)
+
+    return total_loss_val, ldict
+
+
 def train(args: argparse.Namespace) -> None:
     global local_rank, world_size
 
@@ -296,6 +558,18 @@ def train(args: argparse.Namespace) -> None:
     if local_rank == 0:
         mem_gb = torch.cuda.memory_allocated(device) / 1e9
         log.info(f"[MEM] After model.to(device): {mem_gb:.2f} GiB allocated")
+
+    # 24 chiral cube anchors — only materialized when --reg is active.
+    R_bins_dev: torch.Tensor | None = None
+    if args.reg:
+        R_bins_dev = _build_chiral_cube_group().to(
+            device=device, dtype=torch.float32,
+        )
+        log.info(
+            f"[--reg] Phase A composite loss enabled: "
+            f"lambda1={args.reg_lambda1}  lambda2={args.reg_lambda2}  "
+            f"alpha={args.reg_alpha}  (R_bins on {device})"
+        )
 
     # -- DDP -------------------------------------------------------------------
     if world_size > 1:
@@ -624,30 +898,60 @@ def train(args: argparse.Namespace) -> None:
                     )
 
                 # -- forward + loss ------------------------------------------------
-                _, loss, loss_dict = model(
-                    input_ids           = input_ids,
-                    attention_mask      = attention_mask,
-                    pixel_values        = pixel_values,
-                    image_grid_thw      = image_grid_thw,
-                    image_xyz           = image_xyz,
-                    image_xyz_hires     = image_xyz_hires,
-                    labels              = labels,
-                    coord_scale         = args.coord_scale,
-                    use_rotation_enc    = use_rot_enc,
-                    use_coord_loss      = not args.no_coord,
-                    use_relative        = args.relative,
-                    detach_coord_hidden = detach_coord_hidden,
-                )
+                # --reg Phase A branch: composite loss over R_opt + 24 anchors
+                # with in-loop backward; rotation_enc stays frozen, so R_opt
+                # is detached and the LLM path is the sole grad source.
+                if args.reg and current_phase == "A" and R_bins_dev is not None:
+                    loss_val, loss_dict = _phase_a_reg_step(
+                        _model        = _model,
+                        batch_tensors = {
+                            "input_ids":       input_ids,
+                            "attention_mask":  attention_mask,
+                            "pixel_values":    pixel_values,
+                            "image_grid_thw":  image_grid_thw,
+                            "image_xyz":       image_xyz,
+                            "image_xyz_hires": image_xyz_hires,
+                            "labels":          labels,
+                        },
+                        args        = args,
+                        R_bins      = R_bins_dev,
+                        grad_accum  = args.grad_accum,
+                        device      = device,
+                        use_rot_enc = use_rot_enc,
+                    )
+                    if loss_val is None:
+                        log.warning(f"[rank{local_rank}] Step {step}: "
+                                    "no reg signal, skipping.")
+                        continue
+                    running_loss += loss_val
+                    if loss_dict:
+                        for k, v in loss_dict.items():
+                            running_loss_dict[k] = running_loss_dict.get(k, 0.0) + v
+                else:
+                    _, loss, loss_dict = model(
+                        input_ids           = input_ids,
+                        attention_mask      = attention_mask,
+                        pixel_values        = pixel_values,
+                        image_grid_thw      = image_grid_thw,
+                        image_xyz           = image_xyz,
+                        image_xyz_hires     = image_xyz_hires,
+                        labels              = labels,
+                        coord_scale         = args.coord_scale,
+                        use_rotation_enc    = use_rot_enc,
+                        use_coord_loss      = not args.no_coord,
+                        use_relative        = args.relative,
+                        detach_coord_hidden = detach_coord_hidden,
+                    )
 
-                if loss is None:
-                    log.warning(f"[rank{local_rank}] Step {step}: no supervision signal, skipping.")
-                    continue
+                    if loss is None:
+                        log.warning(f"[rank{local_rank}] Step {step}: no supervision signal, skipping.")
+                        continue
 
-                (loss / args.grad_accum).backward()
-                running_loss += loss.item()
-                if loss_dict:
-                    for k, v in loss_dict.items():
-                        running_loss_dict[k] = running_loss_dict.get(k, 0.0) + v
+                    (loss / args.grad_accum).backward()
+                    running_loss += loss.item()
+                    if loss_dict:
+                        for k, v in loss_dict.items():
+                            running_loss_dict[k] = running_loss_dict.get(k, 0.0) + v
 
                 # -- gradient accumulation -----------------------------------------
                 if (step + 1) % args.grad_accum == 0:
@@ -739,6 +1043,10 @@ def train(args: argparse.Namespace) -> None:
                             f"(aggregated across {world_size} GPU{'s' if world_size > 1 else ''})"
                         )
                         if use_wandb:
+                            # Items shown when --reg is off stay in `train/`
+                            # (lm_loss, coord_loss, R_trace, …); the --reg
+                            # composite breakdown (`reg_*`) routes to
+                            # `train_sub/`.
                             wandb.log(
                                 {
                                     "train/loss":          avg_loss,
@@ -746,7 +1054,12 @@ def train(args: argparse.Namespace) -> None:
                                     "train/coord_head_lr": coord_head_lr,
                                     "train/phase":         0 if current_phase == "A" else 1,
                                     "epoch":               epoch + 1,
-                                    **{f"train/{k}": v for k, v in avg_loss_dict.items()},
+                                    **{f"train/{k}": v
+                                       for k, v in avg_loss_dict.items()
+                                       if not k.startswith("reg_")},
+                                    **{f"train_sub/{k}": v
+                                       for k, v in avg_loss_dict.items()
+                                       if k.startswith("reg_")},
                                 },
                                 step=global_step,
                             )
@@ -797,26 +1110,46 @@ def train(args: argparse.Namespace) -> None:
                                     t_xyz_h = [x.to(device) for x in t_xyz_h]
 
                                 with torch.inference_mode():
-                                    R_pred, loss, loss_dict = model(
+                                    inputs_embeds = _model.encode_inputs(
+                                        t_ids, t_pv, t_thw,
+                                    )
+                                    R_pred   = None
+                                    cam_feat = None
+                                    if use_rot_enc and t_xyz is not None and t_thw is not None:
+                                        token_txyz_int = _build_token_txyz_int(
+                                            t_ids, _model.image_token_id,
+                                            t_xyz, t_thw, _model.spatial_merge_size,
+                                            args.coord_scale,
+                                        )
+                                        R_pred, cam_feat = _model.rotation_enc(
+                                            inputs_embeds, token_txyz_int,
+                                        )
+
+                                    lm_loss, coord_loss, loss_dict = _model.compute_losses_from_R(
+                                        R                   = R_pred,
+                                        inputs_embeds       = inputs_embeds,
                                         input_ids           = t_ids,
                                         attention_mask      = t_mask,
-                                        pixel_values        = t_pv,
-                                        image_grid_thw      = t_thw,
                                         image_xyz           = t_xyz,
                                         image_xyz_hires     = t_xyz_h,
+                                        image_grid_thw      = t_thw,
                                         labels              = t_labels,
                                         coord_scale         = args.coord_scale,
-                                        use_rotation_enc    = use_rot_enc,
                                         use_coord_loss      = not args.no_coord,
                                         use_relative        = args.relative,
                                         detach_coord_hidden = detach_coord_hidden,
+                                        cam_feat            = cam_feat,
+                                        compute_reward      = True,
                                     )
-                                if loss is None:
+                                if lm_loss is None and coord_loss is None:
                                     continue
                                 local_count += 1
-                                if loss_dict:
-                                    for k, v in loss_dict.items():
-                                        local_loss_sums[k] = local_loss_sums.get(k, 0.0) + v
+                                if loss_dict is None:
+                                    loss_dict = {}
+                                if R_pred is not None:
+                                    loss_dict["R_trace"] = float(R_pred.trace().item())
+                                for k, v in loss_dict.items():
+                                    local_loss_sums[k] = local_loss_sums.get(k, 0.0) + float(v)
                                 # Rotation angle (deg) via θ = acos((tr(R)-1)/2)
                                 # — same convention as evaluation.py.
                                 if R_pred is not None:
@@ -1050,6 +1383,31 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--rot_dim_feedforward", type=int, default=2048)
     p.add_argument("--rot_num_layers",      type=int, default=2)
+
+    # ── Phase A composite regularization (--reg) ──────────────────────────
+    # L_total = L_CE(R_opt) + (λ1/N) Σ_{k∈S} L_CE(R_k)
+    #         + (λ2/N) Σ_{k∈S} max(0, L_opt − L_k + α · dist(R_k, R_opt))
+    # Replaces the plain lm_loss in Phase A; S is a rank-stratified sample
+    # of N=6 anchors from the 24 chiral-cube rotations (2 per tier of
+    # near/middle/far d_k), resampled every step.  Rotation_enc stays
+    # frozen in Phase A — R_opt is its detached prediction (R_opt = I at
+    # epoch 0) and grads flow only through LoRA/lm_head/coord_head.  Cost:
+    # 1 + N no_grad + up to 1 + N grad LLM forwards per step (in-loop
+    # backward keeps activation memory bounded; w_k=0 anchors skipped).
+    p.add_argument("--reg", action="store_true",
+                   help="Enable Phase A composite regularized loss "
+                        "(core + full-view + distance-aware margin, "
+                        "rank-stratified sampling N=6 of 24 anchors).")
+    p.add_argument("--reg_lambda1", type=float, default=0.3,
+                   help="Weight on the sampled-anchor mean L_CE "
+                        "(full-view generalization term).")
+    p.add_argument("--reg_lambda2", type=float, default=0.3,
+                   help="Weight on the distance-aware margin term "
+                        "suppressing non-optimal anchors.")
+    p.add_argument("--reg_alpha",   type=float, default=0.8,
+                   help="Distance coefficient in the margin term (radians): "
+                        "L_opt must be below L_k by at least α · θ(R_k, R_opt).")
+
     p.add_argument("--wandb_project",  default="", help="WandB project name.")
     p.add_argument("--wandb_entity",   default="", help="WandB entity.")
     p.add_argument("--wandb_run_name", default="", help="WandB run name.")

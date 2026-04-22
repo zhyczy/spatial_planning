@@ -354,6 +354,21 @@ def _phase_a_step(
 
 # -- Phase B step (GRPO) -------------------------------------------------------
 
+def _matrix_to_euler_zyx(R: torch.Tensor):
+    """Extract (yaw, pitch, roll) from rotation matrices of shape (..., 3, 3).
+
+    ZYX intrinsic Tait-Bryan convention: R = Rz(yaw) · Ry(pitch) · Rx(roll),
+    pitch ∈ [-π/2, π/2]. Numerically robust via atan2; matches pytorch3d
+    matrix_to_euler_angles(R, "ZYX") everywhere except at gimbal lock
+    (cos(pitch) ≈ 0), which is extremely rare for the MindCube anchors.
+    """
+    sin_pitch = (-R[..., 2, 0]).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    pitch = torch.asin(sin_pitch)
+    yaw   = torch.atan2(R[..., 1, 0], R[..., 0, 0])
+    roll  = torch.atan2(R[..., 2, 1], R[..., 2, 2])
+    return yaw, pitch, roll
+
+
 def _phase_b_grpo_step(
     _model:            RotationRoPEModel,
     batch_tensors:     dict,
@@ -395,8 +410,13 @@ def _phase_b_grpo_step(
     image_xyz_hires = batch_tensors["image_xyz_hires"]
     labels          = batch_tensors["labels"]
     bucket          = batch_tensors.get("bucket", "C")
-    k_gt            = int(batch_tensors.get("k_gt", -1))
+    has_gt          = bool(batch_tensors.get("has_gt", False))
+    R_gt            = batch_tensors.get("R_gt", None)
     device          = input_ids.device
+    if has_gt and R_gt is not None:
+        R_gt = R_gt.to(device=device, dtype=torch.float32)
+    else:
+        R_gt = None   # normalise sentinel — any downstream check is `R_gt is None`
 
     _ldict: dict = {}
 
@@ -415,7 +435,9 @@ def _phase_b_grpo_step(
     )   # logits (24,), residual_all=None (discrete), cam_feat (d_model,)
 
     # ── Stage 1: 24 × no_grad reward collection ──────────────────────────
-    rewards   = torch.zeros(24, dtype=torch.float32, device=device)
+    # acc_vec is kept only for logging n_correct — the reward signal below
+    # is derived from lm_losses, not from 0/1 acc.
+    acc_vec   = torch.zeros(24, dtype=torch.float32, device=device)
     lm_losses = torch.full((24,), float("inf"), dtype=torch.float32, device=device)
 
     # Consistency Protocol: evaluate with R_bins[k] @ exp(delta_k.detach()) so the
@@ -441,67 +463,103 @@ def _phase_b_grpo_step(
                 cam_feat            = None,
                 compute_reward      = True,
             )
-            rewards[k]   = float(_ldict_k.get("acc", 0.0))
+            acc_vec[k]   = float(_ldict_k.get("acc", 0.0))
             if lm_loss_k is not None:
                 lm_losses[k] = float(_ldict_k.get("lm_loss", float("inf")))
 
-    n_correct = int((rewards > 0.5).sum().item())
-    _ldict["n_correct"]   = float(n_correct)
-    _ldict["reward_mean"] = float(rewards.mean().item())
-    _ldict["reward_std"]  = float(rewards.std(unbiased=False).item())
+    n_correct = int((acc_vec > 0.5).sum().item())
+    _ldict["n_correct"]           = float(n_correct)
     _ldict["lm_loss_best_anchor"] = float(lm_losses.min().item())
 
-    # Reward shaping: within each outcome group (correct / wrong) add a
-    # zero-mean lm_loss-based perturbation. Group means are preserved
-    # (correct stays at 1, wrong stays at 0), so the correct-vs-wrong
-    # contrast is untouched while lm_loss breaks intra-group ties and
-    # provides a dense signal in the all-correct / all-wrong degenerate
-    # batches.
-    finite_mask    = torch.isfinite(lm_losses)
-    rewards_shaped = rewards.clone()
-    n_shaped_groups = 0
-    for group_mask in (rewards > 0.5, rewards < 0.5):
-        g   = group_mask & finite_mask
-        n_g = int(g.sum().item())
-        if n_g >= 2:
-            lm_g = lm_losses[g]
-            w    = F.softmax(-lm_g / args.rwr_tau, dim=0)
-            rewards_shaped[g] = rewards_shaped[g] + args.w_lm * (w - 1.0 / n_g)
-            n_shaped_groups += 1
-    rewards = rewards_shaped
-    _ldict["reward_shape_groups"] = float(n_shaped_groups)
-    _ldict["reward_shape_spread"] = float(rewards.max() - rewards.min())
+    # ── Dense reward: R(k) = -w_lm·lm_loss(k) ± SO(3)-θ shaping ─────────
+    # Replaces the 0/1 acc + intra-group softmax shaping. Using -lm_loss
+    # directly turns every anchor into a continuous scalar, so r_std
+    # essentially never collapses to 0 (eliminates the all-correct /
+    # all-wrong degenerate batch and the _any_rank_active DDP trick
+    # becomes a formality rather than a rescue).
+    #
+    # When a raw GT rotation R_gt (3,3) is available from the dataset
+    # (buckets A/B/D/E/H), two continuous geometric shapings stack on top:
+    #   (a) axis-decoupled cos-distance penalty : rewards −= α · dist(R_k, R_gt)
+    #   (b) soft anchor prior                   : rewards += w · softmax(−dist/τ)
+    # Instead of the isotropic geodesic angle θ, we decompose the relative
+    # rotation R_rel = R_kᵀ · R_gt into (yaw, pitch, roll) under ZYX
+    # Tait-Bryan convention and form a weighted cos-distance:
+    #   dist = w_yaw · (1 − cos dyaw)
+    #        + w_pitch · (0.8 − cos dpitch)
+    #        + w_roll · (0.1 − cos droll)
+    # (1 − cos x) ≈ x²/2 for small x, so this behaves like a weighted
+    # squared-angle loss but lets us emphasise yaw (heading, highly
+    # semantic for indoor viewpoint QA), down-weight pitch (tilt), and
+    # near-ignore roll (images are already upright). R_gt is NOT quantized.
+    finite_mask = torch.isfinite(lm_losses)
+    if finite_mask.all():
+        lm_clean = lm_losses
+    else:
+        _fill = float(lm_losses[finite_mask].max().item()) if finite_mask.any() else 1e6
+        lm_clean = torch.where(finite_mask, lm_losses,
+                               torch.full_like(lm_losses, _fill))
+    rewards = -float(args.w_lm) * lm_clean
 
-    # ── Bucket-aware anchor-prior shaping ───────────────────────────────
-    # Semantics: rewards is shape (24,) — the "group" here is the 24
-    # exhaustive cube anchors (group_size=24, not sampled rollouts). So
-    # rewards[k] is the reward of selecting anchor k, and shape[k_gt] is
-    # exactly "bonus for choosing the correct anchor". ASSERT (24,) to
-    # guard against any future switch to sampled-rollout GRPO: in that
-    # case k_gt ∈ [0,23] would no longer be a valid rewards index.
-    assert rewards.shape == (24,), (
-        f"anchor-prior shaping assumes rewards.shape == (24,), got "
-        f"{tuple(rewards.shape)}. If you switched to sampled rollouts, "
-        f"redesign: look up which rollouts chose anchor k_gt instead."
-    )
+    _w_rot = float(getattr(args, "w_rot", 0.0))
     _w_bucket = {
-        "B": float(getattr(args, "w_rot_hi",  0.0)),
-        "H": float(getattr(args, "w_hypo",    0.0)),
-        "D": float(getattr(args, "w_rot_mid", 0.0)),
-        "E": float(getattr(args, "w_rot_mid", 0.0)),
-        "A": float(getattr(args, "w_trans",   0.0)),
+        "B": _w_rot,
+        "H": _w_rot,
+        "D": _w_rot,
+        "E": _w_rot,
+        "A": float(getattr(args, "w_trans", 0.0)),
     }.get(bucket, 0.0)
-    _w_prior = float(getattr(args, "w_anchor_prior", 0.0)) * _w_bucket
-    _prior_active = 0.0
-    if k_gt >= 0 and _w_prior > 0.0:
-        prior_shape = torch.full_like(rewards, -_w_prior / 24.0)
-        prior_shape[k_gt] = _w_prior * (1.0 - 1.0 / 24.0)
-        rewards = rewards + prior_shape
-        _prior_active = 1.0
+    _w_prior          = float(getattr(args, "w_anchor_prior", 0.0)) * _w_bucket
+    _alpha            = float(getattr(args, "alpha_dist", 0.0))
+    _rot_penalty_mean = 0.0
+    _prior_active     = 0.0
+    _theta_min_deg    = float("nan")
+
+    if R_gt is not None and (_alpha > 0.0 or _w_prior > 0.0):
+        R_bins  = _model.rotation_enc.R_bins.to(device=device, dtype=torch.float32)
+        # R_kᵀ · R_gt for each k, vectorised: (24, 3, 3)
+        R_rel   = R_bins.transpose(-1, -2) @ R_gt
+
+        # Geodesic θ kept for diagnostics only (logged as theta_min_deg).
+        trace   = R_rel.diagonal(dim1=-2, dim2=-1).sum(-1)           # (24,)
+        cos_ang = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+        _theta_min_deg = float(torch.arccos(cos_ang).min().item() * (180.0 / math.pi))
+
+        # Axis-decoupled yaw / pitch / roll errors (radians), ZYX Tait-Bryan.
+        dyaw, dpitch, droll = _matrix_to_euler_zyx(R_rel)             # each (24,)
+        distances = (
+            float(args.w_yaw)   * (1.0 - torch.cos(dyaw))   +
+            float(args.w_pitch) * (0.8 - torch.cos(dpitch)) +
+            float(args.w_roll)  * (0.1 - torch.cos(droll))
+        )                                                             # (24,)
+
+        if _alpha > 0.0:
+            rot_pen = _alpha * distances
+            rewards = rewards - rot_pen
+            _rot_penalty_mean = float(rot_pen.mean().item())
+
+        if _w_prior > 0.0:
+            # Soft anchor prior: positive mass concentrated on anchors close
+            # to R_gt under the weighted axis-decoupled metric. Constant
+            # shifts in `distances` cancel inside softmax, so the 0.8 / 0.1
+            # pitch / roll offsets don't affect the prior shape.
+            w_soft      = F.softmax(-distances / float(args.rot_tau), dim=0)
+            prior_shape = _w_prior * w_soft
+            rewards     = rewards + prior_shape
+            _prior_active = 1.0
+
+    assert rewards.shape == (24,), (
+        f"shaping assumes rewards.shape == (24,), got {tuple(rewards.shape)}. "
+        f"If you switched to sampled rollouts, redesign the soft-prior step."
+    )
+    _ldict["rot_penalty_mean"]  = _rot_penalty_mean
     _ldict["prior_active"]      = _prior_active
     _ldict["prior_weight_used"] = _w_prior
     _ldict["bucket_id"]         = {"A":0,"B":1,"C":2,"D":3,"E":4,"H":5}.get(bucket, -1)
-    _ldict["k_gt"]              = float(k_gt)
+    _ldict["theta_min_deg"]     = _theta_min_deg          # how close any anchor lands to R_gt
+    _ldict["reward_mean"]       = float(rewards.mean().item())
+    _ldict["reward_std"]        = float(rewards.std(unbiased=False).item())
+    _ldict["reward_spread"]     = float((rewards.max() - rewards.min()).item())
 
     # ── Stage 2: policy-gradient update(s) ──────────────────────────────
     # K inner PPO epochs, each one re-forwards rotation_enc and calls
@@ -627,8 +685,10 @@ def _phase_b_grpo_step(
             step_loss = args.w_coord * coord_loss_g
             (sft_coef * step_loss).backward(retain_graph=True)
             L_sft_scalar = float(step_loss.item())
+            _ldict["coord_loss"] = float(coord_loss_g.item())
         else:
             _dummy_zero_backward(coord_head_params, scale=sft_coef)
+            _ldict["coord_loss"] = 0.0
     R_used = R_star.detach()
 
     _ldict["L_sft"] = L_sft_scalar
@@ -844,7 +904,7 @@ def train(args: argparse.Namespace) -> None:
 
     log.info("=" * 72)
     log.info(f">>> group_size     = 24 (exhaustive cube-group enumeration)")
-    log.info(f">>> rwr_tau        = {args.rwr_tau}")
+    log.info(f">>> alpha_dist     = {args.alpha_dist}")
     log.info(f">>> entropy_beta   = {args.entropy_beta}")
     log.info(f">>> kl_lambda      = {args.kl_lambda}")
     log.info(f">>> rl_weight      = {args.rl_weight}")
@@ -976,9 +1036,11 @@ def train(args: argparse.Namespace) -> None:
                     "image_xyz_hires": image_xyz_hires,
                     "labels":          labels,
                     # Reward-shaping supervision (present only when dataset
-                    # provides them; default 'C'/-1 means "no k_gt prior").
+                    # provides them; default 'C' / has_gt=False means "no
+                    # rotation prior / no geodesic penalty").
                     "bucket":          batch.get("bucket", "C"),
-                    "k_gt":            int(batch.get("k_gt", -1)),
+                    "has_gt":          bool(batch.get("has_gt", False)),
+                    "R_gt":            batch.get("R_gt", None),
                 }
 
                 if step == 0 and local_rank == 0:
@@ -1472,9 +1534,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rot_num_layers",      type=int, default=2)
 
     # RL-specific args
-    p.add_argument("--rwr_tau",        type=float, default=1.0,
-                   help="Temperature for the softmax(-lm_loss/τ) reward-shaping "
-                        "perturbation added within each outcome group.")
     p.add_argument("--entropy_beta",   type=float, default=0.01,
                    help="Coefficient for entropy bonus (-β·H).")
     p.add_argument("--kl_lambda",      type=float, default=0.001,
@@ -1493,40 +1552,74 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sft_weight",     type=float, default=1.0,
                    help="Scalar on the differentiable-SFT (argmax coord) term.")
     p.add_argument("--w_lm",           type=float, default=1.0,
-                   help="Scale on the reward-shaping perturbation "
-                        "(softmax(-lm_loss/τ) - 1/n).")
+                   help="Scale on the dense reward R_base(k) = -w_lm · lm_loss(k). "
+                        "Default 1.0 maps raw negative cross-entropy directly to "
+                        "reward; lower values compress the reward range (less "
+                        "sensitivity, smoother advantages), higher values sharpen "
+                        "it (the z-score is scale-invariant anyway, so w_lm only "
+                        "changes the balance with alpha_dist and anchor_prior).")
+    p.add_argument("--alpha_dist",     type=float, default=0.8,
+                   help="Coefficient on the axis-decoupled rotation penalty added "
+                        "to the dense reward: R(k) = -w_lm·lm_loss(k) − α·dist(R_k, R_gt), "
+                        "where dist = Σ w_axis·(c_axis − cos(dθ_axis)) over "
+                        "(yaw, pitch, roll) extracted from R_kᵀ·R_gt under ZYX "
+                        "Tait-Bryan convention. R_gt (3,3) is the raw unquantized "
+                        "ground-truth rotation supplied by the dataset. Punishes "
+                        "'right token, wrong viewpoint' shortcuts. Only active "
+                        "when the current bucket provides a valid R_gt "
+                        "(B / H / D / E / A). Default 0.8; set 0 to disable.")
+    p.add_argument("--w_yaw",          type=float, default=1.0,
+                   help="Yaw (heading) weight in the axis-decoupled rotation "
+                        "distance. Highest semantic weight for indoor viewpoint "
+                        "QA — 'turn left/right' and 'which view' depend primarily "
+                        "on yaw. Default 1.0.")
+    p.add_argument("--w_pitch",        type=float, default=0.8,
+                   help="Pitch (tilt) weight in the axis-decoupled rotation "
+                        "distance. Significant semantic weight — up/down gaze "
+                        "affects which objects are visible. Default 0.8.")
+    p.add_argument("--w_roll",         type=float, default=0.05,
+                   help="Roll weight in the axis-decoupled rotation distance. "
+                        "Small residual weight — indoor images are roughly "
+                        "upright so roll errors are mostly noise, but keeping "
+                        "a small positive coefficient mildly penalises "
+                        "implausible camera orientations. Default 0.05.")
 
-    # --- Bucket-aware anchor-prior shaping (see MindCube viewpoint buckets)
-    # Applied on rewards (shape (24,)) per sample: shape[k_gt] = +w*(1-1/24),
-    # shape[other] = -w/24, strictly zero-mean. Effective weight per bucket:
-    #   A: w_anchor_prior * w_trans    (motion query; identity prior k_gt=0)
-    #   B: w_anchor_prior * w_rot_hi   (title-regex k_gt — most reliable)
-    #   D: w_anchor_prior * w_rot_mid  (viewpoint anchor: pose(image N))
-    #   E: w_anchor_prior * w_rot_mid  (multi-view same-spot: pose(image N))
-    #   H: w_anchor_prior * w_hypo     (hypothetical action: pose(image N) ∘ 90° turn)
-    #   C / k_gt<0: no shaping (E-pos-obj residue: ~5.7% of MindCube train,
-    #                           anchored to an object — no pose-derivable frame)
+    # --- Bucket-aware soft anchor-prior shaping (see MindCube viewpoint buckets)
+    # Applied on rewards (shape (24,)) per sample when the dataset supplies a
+    # raw R_gt (3,3) rotation. The prior is an axis-decoupled cos-distance shape:
+    #     w_soft[k]    = softmax(-dist(R_bins[k], R_gt) / rot_tau)
+    #     rewards[k]  += _w_prior * w_soft[k]
+    # anchors close to R_gt under the weighted yaw/pitch/roll metric receive
+    # the most positive bonus (the raw softmax mass, no zero-mean centering).
+    # No hard quantization is used.
+    # Effective weight per bucket (_w_prior = w_anchor_prior × bucket weight):
+    #   A:       w_anchor_prior * w_trans   (motion query; identity prior R_gt = I)
+    #   B/D/E/H: w_anchor_prior * w_rot     (pose-derived R_gt — H composes with
+    #                                        the discrete ±90° yaw from R_bins)
+    #   C / has_gt=False: no shaping (E-pos-obj residue: ~5.7% of MindCube train,
+    #                                 anchored to an object — no pose-derivable frame)
     p.add_argument("--w_anchor_prior", type=float, default=1.0,
                    help="Master switch for bucket-aware anchor-prior shaping "
                         "(set 0 to disable).")
-    p.add_argument("--w_rot_hi",       type=float, default=0.8,
-                   help="Shaping weight for Bucket B (title-regex k_gt).")
-    p.add_argument("--w_hypo",         type=float, default=0.5,
-                   help="Shaping weight for Bucket H (hypothetical action: "
-                        "anchor(image N) composed with ±90° local yaw). "
-                        "Lower than w_rot_hi because the turn axis convention "
-                        "is empirically derived; set 0 to disable.")
-    p.add_argument("--w_rot_mid",      type=float, default=0.0,
-                   help="Shaping weight for Buckets D/E (pose-derived k_gt "
-                        "from image-N viewpoint / same-spot anchor). Default "
-                        "0 — set >0 to enable.")
-    p.add_argument("--w_trans",        type=float, default=0.0,
-                   help="Shaping weight for Bucket A (motion query; identity "
-                        "prior k_gt=0 because the reasoning frame is view 0). "
-                        "Default 0 — set >0 to enable.")
+    p.add_argument("--w_rot",          type=float, default=0.8,
+                   help="Soft-prior weight shared by all pose-derived buckets "
+                        "B/H/D/E (B = title-regex, H = pose ∘ ±90° yaw via "
+                        "R_bins, D/E = image-N viewpoint/same-spot). The "
+                        "continuous geodesic θ already handles anchor-"
+                        "reliability differences implicitly, so a single "
+                        "scalar is sufficient. Set 0 to disable rotation "
+                        "shaping entirely.")
+    p.add_argument("--w_trans",        type=float, default=0.8,
+                   help="Soft-prior weight for Bucket A (motion query; identity "
+                        "prior R_gt = I because the reasoning frame is view 0). "
+                        "Default 0.8 — same magnitude as w_rot; set 0 to disable.")
     p.add_argument("--rot_tau",        type=float, default=1.0,
-                   help="(reserved) softmax temperature for a future soft-prior "
-                        "variant of anchor-prior shaping.")
+                   help="Temperature τ for the soft anchor prior: "
+                        "w_soft[k] = softmax(-dist(R_bins[k], R_gt) / τ). Smaller "
+                        "τ → sharper concentration on the nearest anchor; larger "
+                        "τ → flatter gradient across nearby anchors. Unit is "
+                        "dimensionless (matches the w_yaw/w_pitch/w_roll-weighted "
+                        "cos-distance). Default 1.0.")
     p.add_argument("--w_coord",        type=float, default=1.0,
                    help="Weight on coord_loss for the argmax-anchor SFT step.")
 

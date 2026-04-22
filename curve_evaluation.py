@@ -19,7 +19,7 @@ python curve_evaluation.py \\
     --start     500 \\
     --end       1000 \\
     --step_size 50 \\
-    --method    coordinate \\  # or polar / rotation / rotation_relative
+    --method    coordinate \\  # or polar / rotation / rotation_relative / rotation_rl
     --datasets  mindcube,sat_real \\
     --gpus      0,1,2,3 \\
     --output_dir eval_results/curves/coordinate_no_cam_mindcube
@@ -304,7 +304,7 @@ def main() -> None:
     parser.add_argument(
         "--method", type=str, default="coordinate",
         choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
-                 "rotation", "rotation_relative"],
+                 "rotation", "rotation_relative", "rotation_rl"],
         help="Evaluation method (default: coordinate).",
     )
     parser.add_argument(
