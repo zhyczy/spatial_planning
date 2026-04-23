@@ -95,20 +95,38 @@ def build_model(
     answer_weight:      float = 1.0,
     coord_weight:       float = 1.0,
     polar:              bool  = False,
+    full_rotary:        bool  = False,
 ) -> CoordinateModel:
     """
     Build CoordinateModel with LM + coordinate supervision.
     Camera transform prediction is removed.
+
+    If ``full_rotary`` is True, partial_rotary_factor is forced to 1.0 so every
+    head_dim dimension gets RoPE (vs. default 0.25 where 75% of dims bypass).
+    This quadruples the number of RoPE freq bands (32 → 128 for head_dim=256)
+    so the mrope_section is rebuilt to sum = head_dim // 2.
     """
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
-    total = sum(orig_section)
-    xyz_size = (total - 2) // 3
-    new_section = [2, xyz_size, xyz_size, xyz_size]
+    if full_rotary:
+        # Enable full rotary: every head_dim dim gets RoPE. Breaks pretraining
+        # convention of 75% content-only dims; relies on LoRA to adapt.
+        config.text_config.rope_scaling["partial_rotary_factor"] = 1.0
+        if hasattr(config.text_config, "rope_parameters") and config.text_config.rope_parameters is not None:
+            config.text_config.rope_parameters["partial_rotary_factor"] = 1.0
+        total = int(config.text_config.head_dim) // 2  # 128
+        # Match Qwen's original t=11 allocation; split remainder evenly across x/y/z.
+        t_size = 11
+    else:
+        orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
+        total = sum(orig_section)  # 32
+        t_size = 2
+    xyz_size = (total - t_size) // 3
+    new_section = [t_size, xyz_size, xyz_size, xyz_size]
     config.text_config.rope_scaling["mrope_section"] = new_section
     log.info(
-        f"mrope_section: {orig_section} -> {new_section}  "
-        f"(4D M-RoPE: 2 for t, {xyz_size} each for x/y/z)"
+        f"mrope_section -> {new_section}  sum={sum(new_section)}  "
+        f"(4D M-RoPE: {t_size} for t, {xyz_size} each for x/y/z; "
+        f"partial_rotary={'1.0 (full)' if full_rotary else '0.25 (default)'})"
     )
 
     spa = SpaForConditionalGeneration.from_pretrained(
@@ -223,6 +241,7 @@ def train(args: argparse.Namespace) -> None:
         answer_weight      = args.answer_weight,
         coord_weight       = args.coord_weight,
         polar              = args.polar,
+        full_rotary        = args.full,
     )
     log.info("Using CoordinateModel (camera transform prediction removed)")
 
@@ -732,6 +751,16 @@ def parse_args() -> argparse.Namespace:
              "mrope_section[0] bands at the high-freq end, then x/y/z round-robin "
              "through the remaining bands so each spans the full freq range. "
              "Removes the need for per-axis scales because x/y/z become symmetric.",
+    )
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help="Force partial_rotary_factor=1.0 so every head_dim dimension gets "
+             "RoPE (vs. default 0.25 where 75%% of dims are content-only "
+             "pass-through). Rebuilds mrope_section to sum=head_dim//2 "
+             "(e.g. 32 -> 128 for head_dim=256, giving [2, 42, 42, 42]). "
+             "Breaks Qwen's pretrained content/position split; only LoRA can "
+             "adapt. Use with caution — expect degraded LM loss initially.",
     )
     # -- WandB -----------------------------------------------------------------
     p.add_argument("--wandb_project",  default="", help="WandB project name.")
