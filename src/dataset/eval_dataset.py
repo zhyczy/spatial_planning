@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .train_dataset import POSE_TOKEN, COORD_TOKEN, resize_xyz
+from .train_dataset import resize_xyz
 
 
 class Eval_Dataset(Dataset):
@@ -70,13 +70,14 @@ class Eval_Dataset_Coord(Dataset):
     MindCube evaluation dataset in the same prompt format as MindCube_Train_Dataset_Coord.
 
     Produces batches with:
-      - pose sentences (<pose> tokens, unless no_cam=True)
-      - coord sentences (<coord> tokens, one per LLM patch per image)
       - QA supervision labels
-      - gt_transforms, image_xyz, image_xyz_hires for full loss computation
+      - image_xyz, image_xyz_hires for coord-head loss computation
+
+    The coord head reads LM hidden states at the <|image_pad|> vision-token
+    positions directly; no dedicated per-patch text token is inserted.
 
     This lets the eval loop call model() directly and log all losses
-    (pose_loss, lm_loss, coord_loss) instead of only lm_loss.
+    (lm_loss, coord_loss).
     """
 
     def __init__(
@@ -84,16 +85,13 @@ class Eval_Dataset_Coord(Dataset):
         jsonl_path:         str,
         results_dir:        str,
         processor,
-        pose_token_id:      int | None,
         log,
         max_images:         int = 4,
         spatial_merge_size: int = 2,
         coord_upscale:      int = 4,
-        no_cam:             bool = False,
         max_samples:        int | None = None,
         question_key:       str = "question",
         answer_key:         str = "gt_answer",
-        coord_token_id:     int | None = None,  # kept for backward compat, unused
     ):
         raw = []
         with open(jsonl_path) as fh:
@@ -113,11 +111,9 @@ class Eval_Dataset_Coord(Dataset):
             self.samples = self.samples[:max_samples]
 
         self.processor          = processor
-        self.pose_token_id      = pose_token_id
         self.max_images         = max_images
         self.spatial_merge_size = spatial_merge_size
         self.coord_upscale      = coord_upscale
-        self.no_cam             = no_cam
         self.question_key       = question_key
         self.answer_key         = answer_key
         self.log                = log
@@ -152,29 +148,9 @@ class Eval_Dataset_Coord(Dataset):
             )
 
         N = len(images)
-        # Single-image samples skip pose prediction regardless of no_cam setting
-        skip_pose = self.no_cam or N < 2
 
-        # ── camera poses and relative transforms ─────────────────────────────
-        pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-        if not skip_pose:
-            poses = []
-            for vd in view_dirs[:N]:
-                cp_path = os.path.join(sample_dir, vd, "camera_pose.npy")
-                poses.append(np.load(cp_path).astype(np.float64))
-            rel_list = [np.linalg.inv(poses[j]) @ poses[i] for i, j in pairs]
-            gt_transforms = torch.tensor(
-                np.stack(rel_list, axis=0), dtype=torch.float32
-            )
-        else:
-            gt_transforms = None
-
-        # ── pose sentences ────────────────────────────────────────────────────
+        # ── build prompt (images + QA) ───────────────────────────────────────
         content: list = [{"type": "image", "image": img} for img in images]
-        pose_sentences = [] if skip_pose else [
-            f"The camera pose of image {j + 1} relative to image {i + 1} is {POSE_TOKEN}."
-            for (i, j) in pairs
-        ]
 
         _question = entry.get(self.question_key, "")
         _answer   = entry.get(self.answer_key, "")
@@ -183,12 +159,7 @@ class Eval_Dataset_Coord(Dataset):
                 f"Eval_Dataset_Coord sample {idx} (id={entry.get('id')}) has no QA pair."
             )
 
-        # ── Final prompt: pose (if applicable) + QA ──────────────────────────
-        parts = []
-        if pose_sentences:
-            parts.append(" ".join(pose_sentences))
-        parts.append(_question)
-        content.append({"type": "text", "text": " ".join(parts)})
+        content.append({"type": "text", "text": _question})
 
         text_full = self.processor.apply_chat_template(
             [{"role": "user",      "content": content},
@@ -232,7 +203,6 @@ class Eval_Dataset_Coord(Dataset):
 
         return {
             **proc_out,
-            "gt_transforms":   gt_transforms,
             "image_xyz":       image_xyz,
             "image_xyz_hires": image_xyz_hires,
             "labels":          labels,

@@ -36,8 +36,6 @@ SPAR_ROOT = os.path.join(
 )
 RECONSTRUCT_DIR = os.path.join(SPAR_ROOT, "reconstruct")
 POS3D_DIR       = os.path.join(SPAR_ROOT, "3D_pos")
-POSE_TOKEN  = "<pose>"
-COORD_TOKEN = "<coord>"
 
 
 # ── 3D coordinate helper ──────────────────────────────────────────────────────
@@ -94,26 +92,37 @@ def resize_xyz(
 
 def xyz_to_polar(xyz: torch.Tensor) -> torch.Tensor:
     """
-    Convert Cartesian (x, y, z) → spherical (r, θ, α).
+    Convert Cartesian (x, y, z) → log-spherical (log r, θ, α).
 
-        r = sqrt(x²+y²+z²)          — radial distance  ∈ [0, ∞)
-        θ = atan2(y, x)              — azimuth          ∈ [-π, π]
-        α = atan2(sqrt(x²+y²), z)   — inclination      ∈ [0, π]
+        r  = sqrt(x²+y²+z²)           — radial distance  ∈ [0, ∞)
+        log r                          — scale-invariant radial channel
+        θ  = atan2(y, x)               — azimuth          ∈ [-π, π]
+        α  = atan2(sqrt(x²+y²), z)    — inclination      ∈ [0, π]
+
+    Why log r (not raw r):
+      RoPE scores depend on (pos_i − pos_j). Using log r makes the radial
+      difference log(r_i / r_j), which is invariant to a global scene scaling
+      r → k·r. Raw r fails this (difference scales linearly with k), causing
+      the same model to see very different attention patterns on MindCube
+      (r ~ O(1)) vs SAT (r ~ O(100)). θ and α are angular and already
+      scale-invariant.
 
     Works on tensors of any shape (..., 3); returns same shape with the
-    last dimension replaced by (r, θ, α).
+    last dimension replaced by (log r, θ, α).
     Patches with zero xyz (no valid pixels) stay at (0, 0, 0).
     """
     x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
     r = torch.sqrt(x**2 + y**2 + z**2)
     zero_mask = (r == 0)
     r_safe = r.clamp(min=1e-8)
+    log_r = torch.log(r_safe)
     theta = torch.atan2(y, x)
     alpha = torch.atan2(torch.sqrt(x**2 + y**2), z)
     # restore exact zero for invalid patches
+    log_r = torch.where(zero_mask, torch.zeros_like(log_r), log_r)
     theta = torch.where(zero_mask, torch.zeros_like(theta), theta)
     alpha = torch.where(zero_mask, torch.zeros_like(alpha), alpha)
-    return torch.stack([r, theta, alpha], dim=-1)
+    return torch.stack([log_r, theta, alpha], dim=-1)
 
 
 # ── MindCube training dataset ─────────────────────────────────────────────────
@@ -132,7 +141,7 @@ class MindCube_Train_Dataset(Dataset):
 
     Each JSONL line: { id, question, gt_answer, images, ... }
 
-    Prompt: images only (no <pose> tokens, no pose sentences).
+    Prompt: images only.
     Labels: always generated when QA is available (plus reserved for future use).
     """
 
@@ -276,10 +285,12 @@ class MindCube_Train_Dataset_Coord(Dataset):
     MindCube training dataset with coordinate prediction support.
 
     Extends MindCube_Train_Dataset by:
-      - Inserting <coord> tokens (one per LLM patch per image) into the prompt
       - Computing both patch-level image_xyz (for 4D M-RoPE) and
         sub-pixel image_xyz_hires (for PixelShuffle coord loss)
       - Always including QA supervision (like plus mode)
+
+    The coord head reads LM hidden states at the <|image_pad|> vision-token
+    positions directly; no dedicated per-patch text token is inserted.
     """
 
     def __init__(
@@ -287,14 +298,11 @@ class MindCube_Train_Dataset_Coord(Dataset):
         jsonl_path:         str,
         results_dir:        str,
         processor,
-        pose_token_id:      int,
         log,
         max_images:         int = 4,
         spatial_merge_size: int = 2,
         coord_upscale:      int = 4,
         max_samples:        int | None = None,
-        no_cam:             bool = False,
-        coord_token_id:     int | None = None,  # kept for backward compat, unused
     ):
         import json
         raw = []
@@ -315,11 +323,9 @@ class MindCube_Train_Dataset_Coord(Dataset):
             self.samples = self.samples[:max_samples]
 
         self.processor          = processor
-        self.pose_token_id      = pose_token_id
         self.max_images         = max_images
         self.spatial_merge_size = spatial_merge_size
         self.coord_upscale      = coord_upscale
-        self.no_cam             = no_cam
         self.log = log
         log.info(
             f"MindCube_Train_Dataset_Coord: {len(self.samples)} valid entries "
@@ -360,31 +366,8 @@ class MindCube_Train_Dataset_Coord(Dataset):
                 f"valid images; need >= 2."
             )
 
-        # ── load camera poses and compute relative transforms ─────────────────
-        pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
-        if not self.no_cam:
-            poses = []
-            for vd in view_dirs[:N]:
-                cp_path = os.path.join(sample_dir, vd, "camera_pose.npy")
-                poses.append(np.load(cp_path).astype(np.float64))  # (4, 4)
-            rel_list = []
-            for i, j in pairs:
-                T = np.linalg.inv(poses[j]) @ poses[i]
-                rel_list.append(T)
-            gt_transforms = torch.tensor(
-                np.stack(rel_list, axis=0), dtype=torch.float32
-            )  # (N*(N-1), 4, 4)
-        else:
-            gt_transforms = None
-
-        # ── build prompt (pose + coord + QA) ──────────────────────────────────
+        # ── build prompt (images + QA) ────────────────────────────────────────
         content: list = [{"type": "image", "image": img} for img in images]
-
-        pose_sentences = [] if self.no_cam else [
-            f"The camera pose of image {j + 1} relative to image {i + 1} is "
-            f"{POSE_TOKEN}."
-            for (i, j) in pairs
-        ]
 
         _question = entry.get("question", "")
         _answer   = entry.get("gt_answer", "")
@@ -394,12 +377,7 @@ class MindCube_Train_Dataset_Coord(Dataset):
                 f"MindCube sample {idx} (id={entry.get('id')}) has no QA pair."
             )
 
-        # ── Build prompt (pose if not no_cam) + QA ───────────────────────────
-        parts = []
-        if pose_sentences:
-            parts.append(" ".join(pose_sentences))
-        parts.append(_question)
-        content.append({"type": "text", "text": " ".join(parts)})
+        content.append({"type": "text", "text": _question})
         text_full = self.processor.apply_chat_template(
             [{"role": "user",      "content": content},
              {"role": "assistant", "content": _answer}],
@@ -446,7 +424,6 @@ class MindCube_Train_Dataset_Coord(Dataset):
 
         return {
             **proc_out,
-            "gt_transforms":  gt_transforms,
             "image_xyz":      image_xyz,
             "image_xyz_hires": image_xyz_hires,
             "labels":         labels,
@@ -1049,8 +1026,7 @@ class SAT_Train_Dataset_Rotation(Dataset):
 
     Returns the same per-item fields as MindCube_Train_Dataset_Rotation:
       input_ids, attention_mask, pixel_values, image_grid_thw,
-      labels, image_xyz, image_xyz_hires,
-      gt_transforms (None), cam_pos_frame0, gt_rotation.
+      labels, image_xyz, image_xyz_hires, cam_pos_frame0, gt_rotation.
     """
 
     def __init__(
@@ -1217,7 +1193,6 @@ class SAT_Train_Dataset_Rotation(Dataset):
 
         return {
             **proc_out,
-            "gt_transforms":   None,
             "image_xyz":       image_xyz,
             "image_xyz_hires": image_xyz_hires,
             "labels":          labels,
@@ -1229,9 +1204,16 @@ class SAT_Train_Dataset_Rotation(Dataset):
 class MindCube_Train_Dataset_Coord_Polar(MindCube_Train_Dataset_Coord):
     """
     Variant of MindCube_Train_Dataset_Coord where image_xyz_hires is
-    converted from Cartesian (x, y, z) to spherical (r, θ, α) before
-    being returned.  image_xyz (patch-level, used for 4D M-RoPE) is
-    kept in Cartesian so that RoPE position encoding is unchanged.
+    converted from Cartesian (x, y, z) to log-spherical (log r, θ, α)
+    via xyz_to_polar before being returned.  image_xyz (patch-level,
+    used for 4D M-RoPE) is kept in Cartesian here — the RoPE layer
+    converts it internally when polar=True is passed through
+    CoordinateModel.forward → spa_model → get_vision_position_ids.
+
+    Conventions (match xyz_to_polar and get_vision_position_ids):
+        log r — scale-invariant radius
+        θ     = atan2(y, x)          ∈ [-π, π]  — azimuth
+        α     = atan2(√(x²+y²), z)   ∈ [0, π]   — inclination
 
     Use with --polar flag in train_coordinate.py.
     """

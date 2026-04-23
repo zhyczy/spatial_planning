@@ -1,8 +1,4 @@
-from .correspondence_llm import (
-    PoseRegressionHead,
-    SpaCorrespondenceModel,
-    CorrespondencePlusModel,
-)
+from .correspondence_llm import rot6d_to_rotmat
 from .answer_llm import AnswerOnlyModel, AnswerRelativeModel
 from .spa_emb import SpaForConditionalGeneration
 from .spa_emb_relative import (
@@ -12,7 +8,6 @@ from .spa_emb_relative import (
 )
 from .coordinate_llm import (
     DepthPredictionTransformer,
-    CoordinatePlusModel,
     CoordinateModel,
 )
 from .rotation_rope_llm import (

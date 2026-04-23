@@ -4,12 +4,11 @@ import torch.nn.functional as F
 
 class AnswerOnlyModel(nn.Module):
     """
-    Ablation model: LoRA fine-tuning with only LM answer-prediction loss.
-    No pose regression head, no <pose> tokens.
+    LoRA fine-tuning with only the LM answer-prediction loss.
 
-    Used for two ablation studies:
-      - no_cam:  keeps 4D M-RoPE (image_xyz passed), removes pose prediction
-      - vanilla: uses original 3D M-RoPE (no image_xyz), removes pose prediction
+    Two modes:
+      - no_cam:  keeps 4D M-RoPE (image_xyz passed)
+      - vanilla: uses original 3D M-RoPE (no image_xyz)
     """
 
     def __init__(self, spa_model: nn.Module, use_xyz: bool = True, polar: bool = False):

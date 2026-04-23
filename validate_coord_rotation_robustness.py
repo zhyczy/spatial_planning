@@ -116,10 +116,10 @@ def _sweep_one_sample(
     inputs, prompt, image_xyz = prepare_batch_spa(
         item, spa_proc,
         spatial_merge_size=spatial_merge_size,
-        use_coord=True,        # coordinate model expects <coord> tokens
+        use_coord=False,
         coord_scale=coord_scale,
         thinking=False,
-        load_xyz=False,        # use_coord=True already loads xyz
+        load_xyz=True,         # need xyz for 4D M-RoPE
     )
 
     gt_letter = str(item.get("answer", "")).strip().upper()

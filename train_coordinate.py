@@ -281,16 +281,18 @@ def train(args: argparse.Namespace) -> None:
         args.json_path,
         args.mindcube_results_dir,
         processor,
-        None,
         log,
         max_images         = args.max_images,
         spatial_merge_size = spatial_merge_size,
         coord_upscale      = args.coord_upscale,
         max_samples        = args.max_samples,
-        no_cam             = True,
     )
     if args.polar:
-        log.info("Polar mode: image_xyz_hires GT converted to (r, θ, α)")
+        log.info(
+            "Polar mode: image_xyz_hires GT converted to (log r, θ, α) "
+            "[θ=azimuth ∈ [-π,π],  α=inclination ∈ [0,π]]; "
+            "visual-token RoPE also uses log-spherical positions."
+        )
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
                            rank=local_rank, shuffle=True)
@@ -324,12 +326,10 @@ def train(args: argparse.Namespace) -> None:
                 _ds_jsonl,
                 _ds_results,
                 processor,
-                None,
                 log,
                 max_images         = args.max_images,
                 spatial_merge_size = spatial_merge_size,
                 coord_upscale      = args.coord_upscale,
-                no_cam             = True,
                 question_key       = _q_key,
                 answer_key         = _a_key,
             )
@@ -705,8 +705,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--polar",
         action="store_true",
-        help="Convert coordinate GT from Cartesian (x,y,z) to spherical (r,θ,α) "
-             "before computing coord loss. Uses MindCube_Train_Dataset_Coord_Polar.",
+        help="Use log-spherical (log r, θ=azimuth, α=inclination) instead of "
+             "Cartesian for both the coord-loss target (via "
+             "MindCube_Train_Dataset_Coord_Polar) and the visual-token 4D M-RoPE "
+             "positions (get_vision_position_ids polar branch).",
     )
     p.add_argument(
         "--skip_layers",
@@ -728,7 +730,7 @@ def parse_args() -> argparse.Namespace:
         "--coord_upscale",
         type=int, default=4,
         help="PixelShuffle upscale factor for coord head. "
-             "Each <coord> token predicts upscale^2 sub-pixel (x,y,z) values.",
+             "Each vision patch predicts upscale^2 sub-pixel (x,y,z) values.",
     )
     p.add_argument(
         "--coord_scale",

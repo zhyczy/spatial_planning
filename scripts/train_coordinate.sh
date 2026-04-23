@@ -2,20 +2,17 @@
 # =============================================================================
 # train_coordinate.sh
 #
-# LoRA fine-tuning of SpaForConditionalGeneration with supervision signals:
-#   - Full:     pose regression + LM answer + per-patch 3D coordinate (via vision tokens)
-#   - Ablation: LM answer + per-patch 3D coordinate only (--no_cam)
-#
-# Coordinate regression is applied directly to vision token (<|image_pad|>) hidden
-# states — no <coord> special tokens or prompt insertions are used.
+# LoRA fine-tuning of SpaForConditionalGeneration with:
+#   - LM answer loss
+#   - Per-patch 3D coordinate loss (coord head reads vision-token hidden states)
 #
 # Usage:
-#   bash scripts/train_coordinate.sh [num_gpus] [--no_cam] [--polar] [--skip_layers LAYER] [--max_samples N] [--coord_scale_xyz SX SY SZ]
+#   bash scripts/train_coordinate.sh [num_gpus] [--polar] [--skip_layers LAYER] [--max_samples N] [--coord_scale_xyz SX SY SZ]
 #
 #   num_gpus            — first positional arg, number of GPUs (default: all)
-#   --no_cam            — ablation: remove pose head, use CoordinateModel
-#   --polar             — convert coord GT from (x,y,z) to spherical (r,θ,α)
-#   --skip_layers LAYER — layer for pose/coord heads (default: -1 = last layer)
+#   --polar             — use log-spherical (log r, θ=azimuth, α=inclination)
+#                         for both coord-loss target and visual-token 4D M-RoPE
+#   --skip_layers LAYER — layer for coord head (default: -1 = last layer)
 #                         -1 = Layer 32 (post-norm), -2 = Layer 31, etc.
 #   --max_samples N     — truncate dataset to N entries (default: all)
 #   --coord_scale_xyz SX SY SZ — per-axis RoPE scales for (x, y, z), overrides
@@ -35,10 +32,9 @@
 #                         initially.
 #
 # Examples:
-#   bash scripts/train_coordinate.sh                      # all GPUs, full model, Layer 32
-#   bash scripts/train_coordinate.sh 2                    # 2 GPUs, full model, Layer 32
-#   bash scripts/train_coordinate.sh 6 --no_cam           # 6 GPUs, ablation
-#   bash scripts/train_coordinate.sh 6 --no_cam --polar   # no_cam + spherical coord GT
+#   bash scripts/train_coordinate.sh                      # all GPUs, Layer 32
+#   bash scripts/train_coordinate.sh 2                    # 2 GPUs, Layer 32
+#   bash scripts/train_coordinate.sh 6 --polar            # 6 GPUs, log-spherical coord GT
 #   bash scripts/train_coordinate.sh 1 --skip_layers -2   # single GPU, use Layer 31
 #   bash scripts/train_coordinate.sh 1 --max_samples 6    # single GPU, 6 samples
 # =============================================================================
@@ -56,7 +52,6 @@ cd "$SPATIAL_DIR"
 
 NPROC=""
 MAX_SAMPLES=""
-NO_CAM_ARG=""
 POLAR_FLAG=""
 SKIP_LAYERS_ARG=""
 COORD_SCALE_XYZ_ARG=""
@@ -66,8 +61,6 @@ _positional=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --no_cam)
-            NO_CAM_ARG="no_cam"; shift ;;
         --polar)
             POLAR_FLAG="--polar"; shift ;;
         --skip_layers)
@@ -144,18 +137,8 @@ SKIP_LAYERS_FLAG="--skip_layers ${SKIP_LAYERS}"
 
 _polar_suffix="${POLAR_FLAG:+_polar}"
 
-if [ "$NO_CAM_ARG" = "no_cam" ]; then
-    RUN_NAME="coordinate_no_cam_mindcube${_polar_suffix}"
-    WANDB_RUN_NAME="coord_no_cam_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}${_polar_suffix}"
-    NO_CAM_FLAG="--no_cam"
-    CYCLE_FLAG=""
-else
-    CYCLE_WEIGHT=0.1
-    RUN_NAME="coordinate_mindcube${_polar_suffix}"
-    WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_cycle${CYCLE_WEIGHT}_coord${COORD_WEIGHT}${_polar_suffix}"
-    NO_CAM_FLAG=""
-    CYCLE_FLAG="--cycle_weight $CYCLE_WEIGHT"
-fi
+RUN_NAME="coordinate_mindcube${_polar_suffix}"
+WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}${_polar_suffix}"
 
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
@@ -171,12 +154,11 @@ echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
-echo "[INFO] Mode                 = ${NO_CAM_ARG:-full (pose+coord+lm)}"
 echo "[INFO] Polar coord GT       = ${POLAR_FLAG:-disabled}"
 echo "[INFO] Coord scale xyz      = ${COORD_SCALE_XYZ_ARG:-default scalar 100}"
 echo "[INFO] Interleave vision    = ${INTERLEAVE_FLAG:-disabled (sequential)}"
 echo "[INFO] Full rotary          = ${FULL_FLAG:-disabled (partial=0.25)}"
-echo "[INFO] Pose/Coord Heads at  = $SKIP_LAYERS_DISPLAY"
+echo "[INFO] Coord Head at        = $SKIP_LAYERS_DISPLAY"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 

@@ -472,7 +472,6 @@ class SpaRelativeForConditionalGeneration(SpaForConditionalGeneration):
         image_xyz: object = None,
         image_xyz_relative: object = None,
         coord_scale: float = 100.0,
-        coord_token_id=None,
         polar: bool = False,
         **kwargs,
     ):
@@ -486,8 +485,6 @@ class SpaRelativeForConditionalGeneration(SpaForConditionalGeneration):
             kwargs["image_xyz_relative"] = image_xyz_relative
         if coord_scale != 100.0:
             kwargs["coord_scale"] = coord_scale
-        if coord_token_id is not None:
-            kwargs["coord_token_id"] = coord_token_id
         if polar:
             kwargs["polar"] = polar
         # Call grandparent (Qwen3_5ForConditionalGeneration.forward) to avoid

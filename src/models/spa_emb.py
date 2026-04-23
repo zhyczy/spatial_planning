@@ -386,8 +386,10 @@ class SpaTextModel(Qwen3_5TextModel):
 
         # ← only change from parent: >= 4 instead of == 4
         if position_ids.ndim == 3 and position_ids.shape[0] >= 4:
-            text_position_ids = position_ids[0]    # seq dim → causal mask
-            position_ids = position_ids[1:]        # (t, x3d, y3d, z3d) → rotary
+            # Dim 0 (seq) is float32 in our pipeline; cast to long for the
+            # causal-mask utility (which expects integer positions).
+            text_position_ids = position_ids[0].long()
+            position_ids = position_ids[1:]        # (t, x3d, y3d, z3d) → rotary (float)
         else:
             text_position_ids = None
 
@@ -538,18 +540,25 @@ class SpaModel(Qwen3_5Model):
             spatial_merge_size: spatial downscale factor (from vision_config).
             coord_scale: multiplier applied to float xyz before rounding to int.
                 Default 100 maps ±10 m → ±1000, which is a reasonable RoPE range.
-            polar: if True, convert Cartesian (x, y, z) → spherical (ρ, θ, α) first.
-                ρ = ||xyz||,  θ ∈ [0, π] (polar angle),  α ∈ [-π, π] (azimuthal).
-                Discretized as: ρ*coord_scale, θ/π*coord_scale, (α+π)/(2π)*coord_scale.
+            polar: if True, convert Cartesian (x, y, z) → log-spherical
+                (log ρ, θ, α) first. Convention matches dataset xyz_to_polar:
+                    log ρ = log(||xyz||)             — scale-invariant radius
+                    θ     = atan2(y, x)  ∈ [-π, π]   — azimuth (raw radians)
+                    α     = atan2(√(x²+y²), z) ∈ [0, π] — inclination (raw radians)
+                RoPE positions are assigned as (no [0,1] normalization, so θ
+                and α share the same angular resolution under one scale):
+                    log ρ * coord_scale,
+                    θ     * coord_scale,
+                    α     * coord_scale.
             device: torch device.
 
         Returns:
             vision_position_ids: (5, llm_grid_t * llm_grid_h * llm_grid_w)
-                [0] = seq — sequential position in sequence (for causal mask)
-                [1] = t   — start_position (same for every token in this image)
-                [2] = x/ρ — per-patch discretized x (Cartesian) or ρ (spherical)
-                [3] = y/θ — per-patch discretized y (Cartesian) or θ (spherical)
-                [4] = z/α — per-patch discretized z (Cartesian) or α (spherical)
+                [0] = seq   — sequential position in sequence (for causal mask)
+                [1] = t     — start_position (same for every token in this image)
+                [2] = x/logρ — per-patch discretized x (Cartesian) or log ρ (spherical)
+                [3] = y/θ   — per-patch discretized y (Cartesian) or θ=azimuth (spherical)
+                [4] = z/α   — per-patch discretized z (Cartesian) or α=inclination (spherical)
 
         ── MODIFY BELOW ──────────────────────────────────────────────────────
         Ideas:
@@ -570,61 +579,45 @@ class SpaModel(Qwen3_5Model):
 
         scale_vec = self._coord_scale_vec(coord_scale, device=device)         # (3,) float
         if polar:
-            # Cartesian → spherical: (x, y, z) → (ρ, θ, α)
-            rho   = torch.norm(xyz_flat, dim=-1).clamp(min=1e-6)              # (N,)
-            theta = torch.acos((xyz_flat[:, 2] / rho).clamp(-1.0, 1.0))       # (N,) ∈ [0, π]
-            alpha = torch.atan2(xyz_flat[:, 1], xyz_flat[:, 0])               # (N,) ∈ [-π, π]
-            # Per-axis scale interpreted as (scale_ρ, scale_θ, scale_α)
-            rho_int   = (rho   * scale_vec[0]).round().long()                 # (N,)
-            theta_int = (theta / torch.pi * scale_vec[1]).round().long()      # (N,)
-            alpha_int = ((alpha + torch.pi) / (2 * torch.pi) * scale_vec[2]
-                         ).round().long()
-            xyz_int = torch.stack([rho_int, theta_int, alpha_int], dim=1)     # (N, 3)
+            # Cartesian → log-spherical: (x, y, z) → (log ρ, θ, α)
+            # Convention matches dataset xyz_to_polar:
+            #   log ρ — scale-invariant radius (RoPE pos-diff = log(ρ_i/ρ_j),
+            #           invariant to global scene scaling ρ → k·ρ)
+            #   θ     = atan2(y, x)          ∈ [-π, π]  — azimuth
+            #   α     = atan2(√(x²+y²), z)   ∈ [0, π]   — inclination
+            rho     = torch.norm(xyz_flat, dim=-1).clamp(min=1e-6)            # (N,)
+            log_rho = torch.log(rho)                                           # (N,) ∈ ℝ
+            theta   = torch.atan2(xyz_flat[:, 1], xyz_flat[:, 0])              # (N,) ∈ [-π, π]
+            alpha   = torch.atan2(
+                torch.sqrt(xyz_flat[:, 0] ** 2 + xyz_flat[:, 1] ** 2),
+                xyz_flat[:, 2],
+            )                                                                  # (N,) ∈ [0, π]
+            # Per-axis scale interpreted as (scale_log_ρ, scale_θ, scale_α).
+            # Raw radians × scale — no [0,1] normalization — so θ and α share
+            # the same angular resolution (1 rad difference ⇒ same position
+            # delta for both). Float32, no round/long: RoPE uses position ×
+            # inv_freq, integer quantization would discard sub-unit precision.
+            rho_f   = (log_rho * scale_vec[0]).float()                         # (N,)
+            theta_f = (theta   * scale_vec[1]).float()                         # (N,) θ ∈ [-π, π]
+            alpha_f = (alpha   * scale_vec[2]).float()                         # (N,) α ∈ [0, π]
+            xyz_pos = torch.stack([rho_f, theta_f, alpha_f], dim=1)            # (N, 3)
         else:
-            # Per-axis scale broadcasts (N, 3) * (3,) → (N, 3)
-            xyz_int = (xyz_flat * scale_vec).round().long()                   # (num_tokens, 3)
+            # Per-axis scale broadcasts (N, 3) * (3,) → (N, 3).
+            # Cartesian: round to integer-valued float (1 cm grid at scale=100).
+            # Only polar stays continuous — angle discretization at scale=100 is
+            # too coarse (~3.6°) for far-range patches.
+            xyz_pos = (xyz_flat * scale_vec).round().float()                   # (num_tokens, 3)
 
-        pos_t = torch.full((num_tokens,), start_position, dtype=torch.long, device=device)
-        pos_x = xyz_int[:, 0]
-        pos_y = xyz_int[:, 1]
-        pos_z = xyz_int[:, 2]
+        pos_t = torch.full(
+            (num_tokens,), float(start_position), dtype=torch.float32, device=device,
+        )
+        pos_x = xyz_pos[:, 0]
+        pos_y = xyz_pos[:, 1]
+        pos_z = xyz_pos[:, 2]
 
         # seq row filled in by get_rope_index() after this call (needs actual seq offset)
         pos_seq = pos_t.clone()  # placeholder; overwritten in get_rope_index
-        return torch.stack([pos_seq, pos_t, pos_x, pos_y, pos_z], dim=0)  # (5, num_tokens)
-
-    def get_coord_position_ids(
-        self,
-        start_position: int,
-        xyz_int: torch.LongTensor,
-        device=None,
-    ) -> torch.LongTensor:
-        """
-        Compute 4D (T, X, Y, Z) position indices for <coord> tokens of one image.
-
-        X, Y, Z are copied directly from the corresponding image patch positions,
-        so each <coord> token is perfectly aligned with its image patch in RoPE space
-        (ΔX=0, ΔY=0, ΔZ=0). Only T differs (coord appears later in the sequence).
-
-        Args:
-            start_position: cur_text_pos when the coord run starts.
-            xyz_int: (n_coord, 3) — discretized xyz, identical to the values used
-                for the corresponding image patches (round(xyz * coord_scale).long()).
-            device: torch device.
-
-        Returns:
-            coord_position_ids: (4, n_coord)
-                [0] = T — cur_text_pos (shared across all coord tokens)
-                [1] = X — copied from image patch X
-                [2] = Y — copied from image patch Y
-                [3] = Z — copied from image patch Z
-        """
-        n_coord = xyz_int.shape[0]
-        T = torch.full((n_coord,), start_position, dtype=torch.long, device=device)
-        X = xyz_int[:, 0].to(device)
-        Y = xyz_int[:, 1].to(device)
-        Z = xyz_int[:, 2].to(device)
-        return torch.stack([T, X, Y, Z], dim=0)  # (4, n_coord)
+        return torch.stack([pos_seq, pos_t, pos_x, pos_y, pos_z], dim=0)  # (5, num_tokens) float32
 
     def get_rope_index(
         self,
@@ -635,7 +628,6 @@ class SpaModel(Qwen3_5Model):
         attention_mask: torch.Tensor | None = None,
         image_xyz: torch.Tensor | None = None,
         coord_scale=100.0,
-        coord_token_id: int | None = None,
         polar: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -685,11 +677,17 @@ class SpaModel(Qwen3_5Model):
         xyz_iter = iter(image_xyz) if image_xyz is not None else None
 
         mrope_position_deltas = []
+        # position_ids is kept as float32 end-to-end. Dim 0 (seq) holds integer
+        # values cast to float; the causal-mask call in SpaTextModel.forward
+        # casts it back to long. Dims 1-4 (t, x, y, z) carry continuous RoPE
+        # positions (no round/long), which avoids sub-unit precision loss —
+        # especially important in --polar where one integer unit can be several
+        # degrees of angle.
         position_ids = torch.zeros(
             5,                      # ← 5D: (seq, t, x, y, z)
             input_ids.shape[0],
             input_ids.shape[1],
-            dtype=input_ids.dtype,
+            dtype=torch.float32,
             device=input_ids.device,
         )
         grid_iters = {
@@ -715,97 +713,25 @@ class SpaModel(Qwen3_5Model):
             actual_seq  = 0      # true sequential position (for causal mask, dim 0)
             llm_pos_ids_list = []
 
-            # Track per-image (t_val, llm_h, llm_w) for coord token 3D-RoPE assignment
-            image_info: list[tuple[int, int, int]] = []
-            coord_img_ptr = 0   # which image's coord tokens we are assigning next
-
             for modality_type, start_idx, end_idx in input_type_group:
-                if modality_type == 0:  # text (may contain <coord> tokens)
+                if modality_type == 0:  # text
                     text_len = end_idx - start_idx
-                    tokens_in_group = current_input_ids[start_idx:end_idx]
-
-                    if (coord_token_id is not None
-                            and image_info
-                            and (tokens_in_group == coord_token_id).any()):
-                        # Mixed text + coord tokens: assign 3D-RoPE to coord tokens,
-                        # sequential positions to regular text tokens.
-                        dev = input_ids.device
-                        group_pos = torch.empty(5, text_len, device=dev,
-                                                dtype=input_ids.dtype)
-                        # dim-0 (seq) is always sequential for causal mask
-                        group_pos[0] = torch.arange(actual_seq, actual_seq + text_len,
-                                                     device=dev)
-                        is_coord = (tokens_in_group == coord_token_id)
-                        cur_text_pos = current_pos
-                        i = 0
-                        while i < text_len:
-                            if not is_coord[i]:
-                                # Non-coord run: sequential on dims 1-4
-                                j = i
-                                while j < text_len and not is_coord[j]:
-                                    j += 1
-                                run = torch.arange(cur_text_pos,
-                                                   cur_text_pos + (j - i), device=dev)
-                                group_pos[1, i:j] = run
-                                group_pos[2, i:j] = run
-                                group_pos[3, i:j] = run
-                                group_pos[4, i:j] = run
-                                cur_text_pos += j - i
-                                i = j
-                            else:
-                                # Coord run: 3D (T, H, W) — via get_coord_position_ids()
-                                j = i
-                                while j < text_len and is_coord[j]:
-                                    j += 1
-                                n_coord = j - i
-                                if coord_img_ptr < len(image_info):
-                                    _, llm_h, llm_w, xyz_c = image_info[coord_img_ptr]
-                                    # Discretize xyz — same formula as get_vision_position_ids
-                                    _scale_vec = self._coord_scale_vec(coord_scale, device=dev)
-                                    xyz_int = (
-                                        xyz_c.reshape(-1, 3).to(dev) * _scale_vec
-                                    ).round().long()               # (n_coord, 3)
-                                    coord_pos = self.get_coord_position_ids(
-                                        cur_text_pos, xyz_int, dev
-                                    )                              # (4, n_coord): T, X, Y, Z
-                                    group_pos[1, i:j] = coord_pos[0]  # T = cur_text_pos
-                                    group_pos[2, i:j] = coord_pos[1]  # X copied from image patch
-                                    group_pos[3, i:j] = coord_pos[2]  # Y copied from image patch
-                                    group_pos[4, i:j] = coord_pos[3]  # Z copied from image patch
-                                    cur_text_pos += max(llm_h, llm_w)  # advance like image tokens
-                                    coord_img_ptr += 1
-                                else:
-                                    # Fallback: treat as sequential text
-                                    run = torch.arange(cur_text_pos,
-                                                       cur_text_pos + n_coord, device=dev)
-                                    group_pos[1, i:j] = run
-                                    group_pos[2, i:j] = run
-                                    group_pos[3, i:j] = run
-                                    group_pos[4, i:j] = run
-                                    cur_text_pos += n_coord
-                                i = j
-
-                        llm_pos_ids_list.append(group_pos)
-                        current_pos = cur_text_pos
-                        actual_seq  += text_len
-
-                    else:
-                        # No coord tokens: original sequential text handling
-                        # dim-0 (seq) uses actual_seq for correct causal mask;
-                        # dims 1-4 (t,x,y,z) use current_pos (RoPE budget).
-                        seq_row = torch.arange(
-                            actual_seq, actual_seq + text_len,
-                            device=input_ids.device,
-                        )
-                        rope_row = torch.arange(
-                            current_pos, current_pos + text_len,
-                            device=input_ids.device,
-                        )
-                        plain_pos = torch.stack([seq_row, rope_row, rope_row,
-                                                 rope_row, rope_row], dim=0)  # (5, text_len)
-                        llm_pos_ids_list.append(plain_pos)
-                        current_pos += text_len
-                        actual_seq  += text_len
+                    # dim-0 (seq) uses actual_seq for correct causal mask;
+                    # dims 1-4 (t,x,y,z) use current_pos (RoPE budget).
+                    # Float32 so position_ids can carry continuous xyz too.
+                    seq_row = torch.arange(
+                        actual_seq, actual_seq + text_len,
+                        device=input_ids.device, dtype=torch.float32,
+                    )
+                    rope_row = torch.arange(
+                        current_pos, current_pos + text_len,
+                        device=input_ids.device, dtype=torch.float32,
+                    )
+                    plain_pos = torch.stack([seq_row, rope_row, rope_row,
+                                             rope_row, rope_row], dim=0)  # (5, text_len)
+                    llm_pos_ids_list.append(plain_pos)
+                    current_pos += text_len
+                    actual_seq  += text_len
 
                 else:  # image (1) or video (2)
                     grid_thw = next(grid_iters[modality_type])
@@ -819,9 +745,6 @@ class SpaModel(Qwen3_5Model):
                             dtype=torch.float32, device=input_ids.device,
                         )
 
-                    # Record for coord token assignment: t_val, grid, and xyz for X/Y/Z copy
-                    image_info.append((current_pos, llm_h, llm_w, xyz_coords))
-
                     vision_position_ids = self.get_vision_position_ids(
                         start_position=current_pos,
                         xyz_coords=xyz_coords,
@@ -833,10 +756,12 @@ class SpaModel(Qwen3_5Model):
                         device=input_ids.device,
                     )                                        # (5, num_tokens)
 
-                    # Fix dim-0 (seq): sequential positions for causal mask
+                    # Fix dim-0 (seq): sequential positions for causal mask (float32)
                     num_img_tokens = vision_position_ids.shape[1]
                     vision_position_ids[0] = (
-                        torch.arange(num_img_tokens, device=input_ids.device) + actual_seq
+                        torch.arange(
+                            num_img_tokens, device=input_ids.device, dtype=torch.float32,
+                        ) + actual_seq
                     )
                     llm_pos_ids_list.append(vision_position_ids)
 
@@ -900,7 +825,6 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     def forward(self, *args, image_xyz: torch.Tensor | None = None,
                 coord_scale=100.0,
-                coord_token_id: int | None = None,
                 polar: bool = False, **kwargs):
         """
         Thin wrapper that injects image_xyz into get_rope_index() via kwargs.
@@ -908,10 +832,8 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         image_xyz: (num_images, 3) float tensor of 3D camera coordinates,
                    in the same order as images appear left-to-right in the batch.
         coord_scale: passed through to get_rope_index / get_vision_position_ids.
-        coord_token_id: if set, <coord> tokens in text segments get 3D-RoPE
-                        (t=image_t, x=row, y=col, z=0) matching their image/patch.
-        polar: if True, convert Cartesian (x, y, z) → spherical (ρ, θ, α) for
-               the M-RoPE position embedding of vision tokens.
+        polar: if True, convert Cartesian (x, y, z) → log-spherical
+               (log ρ, θ, α) for the M-RoPE position embedding of vision tokens.
         """
         if image_xyz is not None:
             kwargs["image_xyz"] = image_xyz
@@ -922,8 +844,6 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         )
         if _pass_scale:
             kwargs["coord_scale"] = coord_scale
-        if coord_token_id is not None:
-            kwargs["coord_token_id"] = coord_token_id
         if polar:
             kwargs["polar"] = polar
         return super().forward(*args, **kwargs)

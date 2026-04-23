@@ -18,20 +18,20 @@ Multi-method QA evaluation:
 
   coordinate
       Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
-      Input : images + <coord>-token sentences + question
-      3D pos: precomputed XYZ → 4D M-RoPE on image patches AND <coord> tokens
-      Coord : predicted in Cartesian (x, y, z)
+      Input : images + question
+      3D pos: precomputed XYZ → 4D M-RoPE on image patches
+      Coord : predicted in Cartesian (x, y, z) at vision-token positions
 
   polar
       Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA  (trained with --polar)
       Input : images + question
-      3D pos: precomputed XYZ → spherical (ρ, θ, α) → 4D M-RoPE on image patches
+      3D pos: precomputed XYZ → log-spherical (log ρ, θ, α) → 4D M-RoPE on image patches
 
   rotation
       Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
               + CameraTokenRotationEncoder (predicts canonical R)
               + DepthPredictionTransformer (coord head in rotated frame, cam_dim=0)
-      Input : images + question  (no pose sentences, no <coord> tokens; no_cam)
+      Input : images + question  (no pose sentences; no_cam)
       3D pos: R = rotation_enc(merged_embeds, token_txyz_int);
               rotated_xyz = R @ xyz_world → 4D M-RoPE on image patches
       Coord : predicted in rotated frame; GT = R @ gt_xyz before MAE
@@ -318,6 +318,7 @@ def load_spa_model(
     ckpt_path: str,
     device: str = "cuda:0",
     vanilla: bool = False,
+    interleaving: bool = False,
 ) -> Tuple[Any, Any]:
     """Load SPA model with LoRA adapter.
 
@@ -329,6 +330,12 @@ def load_spa_model(
         3. Load processor/tokenizer from ckpt_path.
       4. Resize embedding table to match the saved tokenizer.
       5. Load PEFT LoRA adapter from ckpt_path, then merge into base weights.
+      6. If interleaving=True (and not vanilla), set
+         language_model.rotary_emb.visual_interleave = True so the M-RoPE band
+         layout is [tt | x,y,z, x,y,z, ...] (t at high-freq end, x/y/z
+         round-robin through remaining bands) instead of the default
+         sequential [tt | x..x | y..y | z..z]. Mirrors --interleave_vision in
+         train_coordinate.py and must match the layout used at training time.
     """
     logger = logging.getLogger(__name__)
     ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=False)
@@ -403,6 +410,31 @@ def load_spa_model(
     logger.info("[spa] LoRA adapter merged.")
 
     spa = spa.to(device).eval()
+
+    # Toggle visual-interleave M-RoPE layout (must match training-time setting).
+    # Skipped for vanilla (stock Qwen3.5 has no SpaTextRotaryEmbedding).
+    if interleaving:
+        if vanilla:
+            logger.warning(
+                "[spa] --interleaving has no effect with vanilla (3D M-RoPE); ignoring."
+            )
+        else:
+            _rotary = None
+            for _name, _mod in spa.named_modules():
+                if _name.endswith("language_model.rotary_emb"):
+                    _rotary = _mod
+                    break
+            if _rotary is None:
+                raise RuntimeError(
+                    "[spa] --interleaving set but could not find "
+                    "language_model.rotary_emb on the SPA model."
+                )
+            _rotary.visual_interleave = True
+            logger.info(
+                "[spa] visual_interleave=True: M-RoPE band layout "
+                "[tt | x,y,z,x,y,z,...] (t at high-freq end, x/y/z round-robin)."
+            )
+
     logger.info(f"[spa] Model ready on {next(spa.parameters()).device}")
     return spa, processor
 
@@ -1019,13 +1051,15 @@ def prepare_batch_spa(
 ) -> Tuple[Dict, str, List[torch.Tensor]]:
     """Tokenise one sample and build image_xyz for SPA model inference.
 
-    The prompt matches training format:
-            [images] + (coord_sentences if use_coord) + question
+    The prompt matches training format exactly:
+            [images] + question
 
-    use_coord=True : adds <coord>-token sentences and loads image_xyz.
-    load_xyz=True  : loads image_xyz without adding <coord>-token sentences.
-                     Used for the polar method which needs xyz for the RoPE but
-                     has no <coord> tokens in the prompt.
+    The coord_head (DepthPredictionTransformer) takes its input from the LM
+    hidden states at the <|image_pad|> vision-token positions directly; no
+    dedicated per-patch text token is inserted, matching training.
+
+    Either `use_coord=True` or `load_xyz=True` triggers loading image_xyz for
+    the 4D M-RoPE. They are synonyms; both kept for backward compatibility.
 
     No system prompt, no answer instruction — identical to train_dataset.py.
 
@@ -1033,55 +1067,16 @@ def prepare_batch_spa(
     -------
     inputs     : processor output dict (input_ids, attention_mask, pixel_values, image_grid_thw)
     prompt_str : prompt text (used for logging)
-    image_xyz  : list of (llm_H, llm_W, 3) tensors, or None if neither use_coord nor load_xyz
+    image_xyz  : list of (llm_H, llm_W, 3) tensors, or None if neither flag set
     """
     from qwen_vl_utils import process_vision_info
 
-    COORD_TOKEN = "<coord>"
-
     image_paths = item["image"]
-    N = len(image_paths)
     question = item.get("question", "")
 
     # ── image content ────────────────────────────────────────────────────────
     content: list = [{"type": "image", "image": p} for p in image_paths]
-
-    if use_coord and N >= 2:
-        # ── probe step: get image_grid_thw to know patch counts per image ──
-        probe_content = list(content)
-        probe_text = question
-        probe_content.append({"type": "text", "text": probe_text})
-        probe_messages = [{"role": "user", "content": probe_content}]
-        probe_prompt = processor.apply_chat_template(
-            probe_messages, tokenize=False, add_generation_prompt=False,
-        )
-        probe_images, _ = process_vision_info(probe_messages)
-        probe_out = processor(
-            text=[probe_prompt],
-            images=probe_images if probe_images else None,
-            return_tensors="pt", padding=False,
-        )
-        thw_all = probe_out["image_grid_thw"]  # (N, 3)
-        sms = spatial_merge_size
-
-        # ── coord sentences (one <coord> token per LLM patch) ──────────────
-        coord_sentences = []
-        for k in range(N):
-            llm_h = int(thw_all[k][1]) // sms
-            llm_w = int(thw_all[k][2]) // sms
-            n_tok = llm_h * llm_w
-            coord_tokens = "".join([COORD_TOKEN] * n_tok)
-            coord_sentences.append(
-                f"Image {k + 1} 3D spatial coordinates: {coord_tokens}."
-            )
-
-        # ── final text: coord + question ───────────────────────────────────
-        final_text = (" ".join(coord_sentences) + " " + question).strip()
-    else:
-        # ── final text: question (no coord) ────────────────────────────────
-        final_text = question
-
-    content.append({"type": "text", "text": final_text})
+    content.append({"type": "text", "text": question})
 
     # ── build messages (no system prompt — matches training) ─────────────────
     messages = [{"role": "user", "content": content}]
@@ -1149,12 +1144,6 @@ def run_inference_spa(
         for k, v in inputs.items()
     }
 
-    # Resolve <coord> token id for 3D-RoPE on coord tokens
-    coord_token_id = None
-    _coord_id = processor.tokenizer.convert_tokens_to_ids("<coord>")
-    if isinstance(_coord_id, int) and _coord_id != processor.tokenizer.unk_token_id:
-        coord_token_id = _coord_id
-
     if vanilla:
         # Stock Qwen3.5: let the model compute its own 3D position_ids
         gen_kwargs: Dict[str, Any] = dict(
@@ -1184,7 +1173,6 @@ def run_inference_spa(
                 attention_mask=inputs_dev.get("attention_mask"),
                 image_xyz=xyz_on_device,
                 coord_scale=coord_scale,
-                coord_token_id=coord_token_id,
                 polar=polar,
             )
 
@@ -1202,8 +1190,6 @@ def run_inference_spa(
         gen_kwargs.pop("mm_token_type_ids", None)
         if xyz_on_device is not None:
             gen_kwargs["image_xyz"] = xyz_on_device
-        if coord_token_id is not None:
-            gen_kwargs["coord_token_id"] = coord_token_id
         if polar:
             gen_kwargs["polar"] = True
 
@@ -1497,16 +1483,17 @@ def evaluate(
     output_dir: Path,
     device: str = "cuda:0",
     thinking: bool = False,
+    interleaving: bool = False,
 ) -> Dict[str, List[Dict]]:
     """Run evaluation for the requested method(s) on *data*.
 
     method choices:
       baseline           — stock Qwen3.5-VL
-        vanilla            — SPA LoRA + 3D M-RoPE (prompt has no <coord> tokens)
-        position_embedding — SPA LoRA + 4D M-RoPE (prompt has no <coord> tokens)
-      coordinate         — SPA LoRA + 4D M-RoPE + <coord> tokens, no_cam variant (Cartesian)
-      polar              — SPA LoRA + 4D M-RoPE, XYZ → spherical (ρ,θ,α) for RoPE;
-                       prompt has no <coord> tokens; matches --polar in train_correspondence.py
+        vanilla            — SPA LoRA + 3D M-RoPE
+        position_embedding — SPA LoRA + 4D M-RoPE
+      coordinate         — SPA LoRA + 4D M-RoPE + coord head (vision-token readout); no_cam variant (Cartesian)
+      polar              — SPA LoRA + 4D M-RoPE, XYZ → log-spherical (log ρ,θ,α) for RoPE;
+                       matches --polar in train_correspondence.py
       rotation           — SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder
                        + coord head (rotated frame, cam_dim=0);
                        matches train_rotation.py (no --relative)
@@ -1554,7 +1541,8 @@ def evaluate(
             )
         use_vanilla_arch = run_vanilla
         spa_model, spa_proc = load_spa_model(
-            spa_base_model_path, correspondence_ckpt, device, vanilla=use_vanilla_arch
+            spa_base_model_path, correspondence_ckpt, device,
+            vanilla=use_vanilla_arch, interleaving=interleaving,
         )
 
         # Resolve spatial_merge_size from base model config
@@ -1596,11 +1584,11 @@ def evaluate(
 
     # Determine which SPA variants to run.
     # Tuple: (method_name, use_coord, is_polar, is_rotation)
-    # vanilla           : no <coord> tokens, 3D RoPE
-    # position_embedding: no <coord> tokens, 4D Cartesian RoPE
-    # coordinate (no_cam): <coord> tokens, 4D Cartesian RoPE
-    # polar             : no <coord> tokens, 4D spherical RoPE (polar=True)
-    # rotation          : no <coord> tokens, 4D Cartesian RoPE on rotated xyz
+    # vanilla           : 3D RoPE (no xyz)
+    # position_embedding: 4D Cartesian RoPE on vision tokens
+    # coordinate (no_cam): 4D Cartesian RoPE + coord head (vision-token readout)
+    # polar             : 4D log-spherical (log ρ, θ, α) RoPE on vision tokens
+    # rotation          : 4D Cartesian RoPE on rotated xyz + coord head
     spa_variants: List[Tuple[str, bool, bool, bool]] = []
     if run_vanilla:
         spa_variants.append(("vanilla", False, False, False))
@@ -1763,6 +1751,7 @@ def _worker(
     output_dir: str,
     log_file: Optional[str],
     thinking: bool = False,
+    interleaving: bool = False,
 ) -> None:
     if log_file:
         logging.basicConfig(
@@ -1787,6 +1776,7 @@ def _worker(
         output_dir=Path(output_dir),
         device=device,
         thinking=thinking,
+        interleaving=interleaving,
     )
     logger.info(f"[Worker {gpu_id}] Done.")
 
@@ -1884,10 +1874,10 @@ def main() -> None:
         help=(
             "Which method(s) to run. "
             "baseline=stock Qwen3.5-VL; "
-            "vanilla=SPA LoRA + 3D M-RoPE, prompt has no <coord> tokens; "
-            "position_embedding=SPA LoRA + 4D M-RoPE, prompt has no <coord> tokens; "
-            "coordinate=SPA LoRA + 4D M-RoPE + <coord> tokens (no_cam, Cartesian); "
-            "polar=SPA LoRA + 4D M-RoPE, XYZ→spherical for RoPE, prompt has no <coord> tokens; "
+            "vanilla=SPA LoRA + 3D M-RoPE; "
+            "position_embedding=SPA LoRA + 4D M-RoPE; "
+            "coordinate=SPA LoRA + 4D M-RoPE + coord head (vision-token readout, no_cam, Cartesian); "
+            "polar=SPA LoRA + 4D M-RoPE, XYZ → log-spherical (log ρ,θ,α) for RoPE; "
             "rotation=SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder (canonical R) + coord head (cam_dim=0, non-relative ckpt); "
             "rotation_relative=same as rotation but for --relative ckpts (coord head has cam_proj, cam_dim>0); "
             "rotation_rl=same as rotation but for RL-trained ckpts (rotation_enc has head_cls/head_res; non-relative coord head); "
@@ -1943,6 +1933,17 @@ def main() -> None:
                         help="Max new tokens for generation. "
                              "Use ≥4096 (recommend 8192) with --thinking.")
 
+    parser.add_argument(
+        "--interleaving", action="store_true", default=False,
+        help="Use interleaved M-RoPE band layout for visual tokens: t keeps "
+             "its mrope_section[0] bands at the high-freq end, and x/y/z "
+             "round-robin through the remaining bands so each spans the full "
+             "freq range — i.e. position embedding [tt, x, y, z, x, y, z, ...]. "
+             "Must match the layout used at training time (mirrors "
+             "--interleave_vision in train_coordinate.py). No effect with "
+             "--method baseline / vanilla.",
+    )
+
     # ── output ────────────────────────────────────────────────────────────────
     parser.add_argument("--output_dir", type=str, default="results/eval")
     parser.add_argument("--run_name", type=str, default=None,
@@ -1990,6 +1991,7 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info(f"  method              : {args.method}")
     logger.info(f"  thinking            : {args.thinking}")
+    logger.info(f"  interleaving        : {args.interleaving}")
     logger.info(f"  model_path          : {args.model_path}")
     logger.info(f"  correspondence_ckpt : {args.correspondence_ckpt}")
     logger.info(f"  coord_scale         : {args.coord_scale}")
@@ -2029,6 +2031,7 @@ def main() -> None:
                 str(output_dir),
                 str(log_file),
                 args.thinking,
+                args.interleaving,
             ),
         )
         p.start()
@@ -2073,8 +2076,8 @@ def main() -> None:
         "baseline":           "baseline           (Qwen3.5-VL)",
         "vanilla":            "vanilla            (SPA LoRA + 3D M-RoPE)",
         "position_embedding": "position_embedding (SPA LoRA + 4D M-RoPE)",
-        "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + <coord>, no_cam, Cartesian)",
-        "polar":              "polar              (SPA LoRA + 4D M-RoPE, XYZ→spherical, no <coord>)",
+        "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + coord head, no_cam, Cartesian)",
+        "polar":              "polar              (SPA LoRA + 4D M-RoPE, XYZ → log-spherical)",
         "rotation":           "rotation           (SPA LoRA + 4D M-RoPE + rotation_enc + coord head, cam_dim=0)",
         "rotation_relative":  "rotation_relative  (SPA LoRA + 4D M-RoPE + rotation_enc + coord head, --relative ckpt)",
         "rotation_rl":        "rotation_rl        (SPA LoRA + 4D M-RoPE + rotation_enc_rl + coord head, cam_dim=0)",

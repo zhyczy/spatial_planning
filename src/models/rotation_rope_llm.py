@@ -478,9 +478,9 @@ def _build_float_position_ids(
                   x/y/z = xyz_world * coord_scale  (NO rounding, gradient-preserving)
     Sequence dim [0] is sequential for causal mask construction.
 
-    Only the Cartesian / no-coord-token path is implemented — this model is
-    used from the RotationRoPE training pipeline which does not insert
-    <coord> text tokens.
+    Only the Cartesian path is implemented — this model is used from the
+    RotationRoPE training pipeline; coord_head reads vision-token hidden
+    states directly, no auxiliary text token is needed.
     """
     batch_size, seq_len = input_ids.shape
     device              = input_ids.device
