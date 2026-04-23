@@ -203,6 +203,14 @@ def train(args: argparse.Namespace) -> None:
     spatial_merge_size = int(_vcfg.get("spatial_merge_size", 2))
     rank0_print(f"spatial_merge_size = {spatial_merge_size}")
 
+    # -- coord_scale (scalar or per-axis) --------------------------------------
+    if args.coord_scale_xyz is not None:
+        coord_scale_final = tuple(float(s) for s in args.coord_scale_xyz)
+        rank0_print(f"coord_scale per-axis (x, y, z) = {coord_scale_final}")
+    else:
+        coord_scale_final = float(args.coord_scale)
+        rank0_print(f"coord_scale (scalar, all axes) = {coord_scale_final}")
+
     # -- model -----------------------------------------------------------------
     model = build_model(
         args.model_path,
@@ -217,6 +225,24 @@ def train(args: argparse.Namespace) -> None:
         polar              = args.polar,
     )
     log.info("Using CoordinateModel (camera transform prediction removed)")
+
+    # Toggle visual-interleave RoPE layout (t at high-freq end, x/y/z round-robin)
+    if args.interleave_vision:
+        # PEFT-wrapped path: model.spa_model.model.model.language_model.rotary_emb
+        # Fall back to shallower paths if structure differs.
+        _rotary = None
+        for _name, _mod in model.spa_model.named_modules():
+            if _name.endswith("language_model.rotary_emb"):
+                _rotary = _mod
+                break
+        if _rotary is None:
+            raise RuntimeError("Could not find language_model.rotary_emb on spa_model")
+        _rotary.visual_interleave = True
+        rank0_print(
+            "[RoPE] visual_interleave=True: t at high-freq end (bands 0..s0-1), "
+            "x/y/z round-robin through remaining bands."
+        )
+
     model = model.to(device)
     if local_rank == 0:
         mem_gb = torch.cuda.memory_allocated(device) / 1e9
@@ -409,6 +435,7 @@ def train(args: argparse.Namespace) -> None:
                 image_grid_thw  = image_grid_thw,
                 image_xyz       = image_xyz,
                 image_xyz_hires = image_xyz_hires,
+                coord_scale     = coord_scale_final,
                 labels          = labels,
             )
 
@@ -528,6 +555,7 @@ def train(args: argparse.Namespace) -> None:
                                     image_grid_thw  = t_thw,
                                     image_xyz       = t_xyz,
                                     image_xyz_hires = t_xyz_h,
+                                    coord_scale     = coord_scale_final,
                                     labels          = t_labels,
                                 )
                             if loss is None:
@@ -561,7 +589,7 @@ def train(args: argparse.Namespace) -> None:
                                 + f"  (n={total_count}, {world_size} GPU{'s' if world_size > 1 else ''})"
                             )
                             if use_wandb:
-                                _main_keys = {"coord_loss", "lm_loss"}
+                                _main_keys = {"coord_loss", "lm_loss", "acc"}
                                 wandb.log(
                                     {
                                         **(
@@ -682,6 +710,28 @@ def parse_args() -> argparse.Namespace:
         type=int, default=4,
         help="PixelShuffle upscale factor for coord head. "
              "Each <coord> token predicts upscale^2 sub-pixel (x,y,z) values.",
+    )
+    p.add_argument(
+        "--coord_scale",
+        type=float, default=100.0,
+        help="Scalar multiplier applied to xyz before RoPE discretization. "
+             "Used as the default for all three axes when --coord_scale_xyz is unset.",
+    )
+    p.add_argument(
+        "--coord_scale_xyz",
+        type=float, nargs=3, default=None, metavar=("SX", "SY", "SZ"),
+        help="Per-axis scales (scale_x scale_y scale_z) applied to xyz before RoPE "
+             "discretization. Overrides --coord_scale. Useful because x/y/z are "
+             "assigned to freq bands with very different inv_freq ranges; picking "
+             "different scales lets each axis land in its own useful freq region.",
+    )
+    p.add_argument(
+        "--interleave_vision",
+        action="store_true",
+        help="Use interleaved M-RoPE layout for visual tokens: t keeps its "
+             "mrope_section[0] bands at the high-freq end, then x/y/z round-robin "
+             "through the remaining bands so each spans the full freq range. "
+             "Removes the need for per-axis scales because x/y/z become symmetric.",
     )
     # -- WandB -----------------------------------------------------------------
     p.add_argument("--wandb_project",  default="", help="WandB project name.")

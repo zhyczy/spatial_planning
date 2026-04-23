@@ -10,7 +10,7 @@
 # states — no <coord> special tokens or prompt insertions are used.
 #
 # Usage:
-#   bash scripts/train_coordinate.sh [num_gpus] [--no_cam] [--polar] [--skip_layers LAYER] [--max_samples N]
+#   bash scripts/train_coordinate.sh [num_gpus] [--no_cam] [--polar] [--skip_layers LAYER] [--max_samples N] [--coord_scale_xyz SX SY SZ]
 #
 #   num_gpus            — first positional arg, number of GPUs (default: all)
 #   --no_cam            — ablation: remove pose head, use CoordinateModel
@@ -18,6 +18,15 @@
 #   --skip_layers LAYER — layer for pose/coord heads (default: -1 = last layer)
 #                         -1 = Layer 32 (post-norm), -2 = Layer 31, etc.
 #   --max_samples N     — truncate dataset to N entries (default: all)
+#   --coord_scale_xyz SX SY SZ — per-axis RoPE scales for (x, y, z), overrides
+#                         the default scalar coord_scale=100. Useful because
+#                         mrope_section [2,10,10,10] gives x/y/z very different
+#                         inv_freq ranges; typical values e.g. 14 1250 170000.
+#   --interleave_vision — switch visual M-RoPE layout to interleaved: t keeps
+#                         bands 0..s0-1 (high freq), then x/y/z round-robin
+#                         through the remaining bands so each spans the full
+#                         freq range. Makes x/y/z symmetric under a single
+#                         scalar scale (no need for per-axis scaling).
 #
 # Examples:
 #   bash scripts/train_coordinate.sh                      # all GPUs, full model, Layer 32
@@ -44,6 +53,8 @@ MAX_SAMPLES=""
 NO_CAM_ARG=""
 POLAR_FLAG=""
 SKIP_LAYERS_ARG=""
+COORD_SCALE_XYZ_ARG=""
+INTERLEAVE_FLAG=""
 _positional=0
 
 while [ $# -gt 0 ]; do
@@ -56,6 +67,10 @@ while [ $# -gt 0 ]; do
             SKIP_LAYERS_ARG="$2"; shift 2 ;;
         --max_samples)
             MAX_SAMPLES="$2"; shift 2 ;;
+        --coord_scale_xyz)
+            COORD_SCALE_XYZ_ARG="--coord_scale_xyz $2 $3 $4"; shift 4 ;;
+        --interleave_vision)
+            INTERLEAVE_FLAG="--interleave_vision"; shift ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -149,6 +164,8 @@ echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] Mode                 = ${NO_CAM_ARG:-full (pose+coord+lm)}"
 echo "[INFO] Polar coord GT       = ${POLAR_FLAG:-disabled}"
+echo "[INFO] Coord scale xyz      = ${COORD_SCALE_XYZ_ARG:-default scalar 100}"
+echo "[INFO] Interleave vision    = ${INTERLEAVE_FLAG:-disabled (sequential)}"
 echo "[INFO] Pose/Coord Heads at  = $SKIP_LAYERS_DISPLAY"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
@@ -191,9 +208,9 @@ $TORCHRUN \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
     $SKIP_LAYERS_FLAG                                  \
-    $CYCLE_FLAG                                        \
-    $NO_CAM_FLAG                                       \
     $POLAR_FLAG                                        \
+    $COORD_SCALE_XYZ_ARG                               \
+    $INTERLEAVE_FLAG                                   \
     $MAX_SAMPLES_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

@@ -279,16 +279,53 @@ class SpaTextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
         """
-        Sequential N-D M-RoPE (no interleaving).
-        Dims are laid out sequentially: t, x, y, z without interleaving.
+        Build per-band cos/sin from N position-axis frequency stacks.
+
+        Two layouts are supported, switched by `self.visual_interleave`:
+
+        1) Sequential (default): t|x|y|z laid out contiguously, section-sized blocks.
+             band:  [0 .. s0-1 | s0 .. s0+s1-1 | ...]
+             dim:   [   0      |       1       | ...]
+           This is the original Qwen layout.
+
+        2) Visual-interleave (`self.visual_interleave = True`): t keeps its s0
+           bands at the high-freq end; dims 1..N-1 (e.g. x, y, z) round-robin
+           through the remaining bands so each spans the full freq range.
+             band:  [0 .. s0-1 | s0 s0+1 s0+2  s0+3 s0+4 s0+5  ...]
+             dim:   [   0      |  1    2    3    1    2    3   ...]
+           x/y/z each get ≈ (total - s0) / (N-1) bands covering high→low freq.
+           Makes x/y/z symmetric under a single global scale.
 
         Args:
             freqs:        (N, bs, seq_len, head_dim//2)
-            mrope_section: list of N equal ints, e.g. [8, 8, 8, 8]
+            mrope_section: list of N ints
         Returns:
             (bs, seq_len, head_dim//2)
         """
         num_dims = len(mrope_section)
+        n_bands = freqs.shape[-1]
+
+        if getattr(self, "visual_interleave", False) and num_dims >= 2:
+            # Cache band→dim layout per device
+            if not hasattr(self, "_interleave_layout_cache"):
+                self._interleave_layout_cache = {}
+            cache_key = (n_bands, int(mrope_section[0]), num_dims, str(freqs.device))
+            if cache_key not in self._interleave_layout_cache:
+                layout = torch.empty(n_bands, dtype=torch.long, device=freqs.device)
+                n_t = int(mrope_section[0])
+                layout[:n_t] = 0  # t at high-freq end
+                # Round-robin dims 1..N-1 for the remainder
+                rest = torch.arange(n_bands - n_t, device=freqs.device)
+                layout[n_t:] = 1 + (rest % (num_dims - 1))
+                self._interleave_layout_cache[cache_key] = layout
+            layout = self._interleave_layout_cache[cache_key]
+
+            band_idx = torch.arange(n_bands, device=freqs.device)
+            # Advanced indexing: pick freqs[layout[k], :, :, k] for each k
+            out = freqs[layout, :, :, band_idx]  # (n_bands, bs, seq_len)
+            return out.permute(1, 2, 0).contiguous()
+
+        # Sequential layout (original behavior)
         freqs_out_list = []
         offset = 0
         for dim in range(num_dims):
@@ -448,6 +485,26 @@ class SpaModel(Qwen3_5Model):
             out.last_hidden_state = out.last_hidden_state.detach()
         return out
 
+    @staticmethod
+    def _coord_scale_vec(coord_scale, device=None):
+        """
+        Normalize coord_scale (scalar | tuple/list/tensor of 3) into a (3,) float tensor.
+        Allows per-axis scaling of (x, y, z) — useful because mrope_section assigns
+        x/y/z to freq bands with very different inv_freq ranges.
+        """
+        if isinstance(coord_scale, (int, float)):
+            return torch.tensor([float(coord_scale)] * 3, device=device, dtype=torch.float32)
+        if isinstance(coord_scale, (tuple, list)):
+            assert len(coord_scale) == 3, f"coord_scale list must have 3 entries, got {len(coord_scale)}"
+            return torch.tensor([float(s) for s in coord_scale], device=device, dtype=torch.float32)
+        if isinstance(coord_scale, torch.Tensor):
+            t = coord_scale.to(device=device, dtype=torch.float32).reshape(-1)
+            if t.numel() == 1:
+                return t.expand(3).contiguous()
+            assert t.numel() == 3, f"coord_scale tensor must have 1 or 3 elements, got {t.numel()}"
+            return t
+        raise TypeError(f"unsupported coord_scale type: {type(coord_scale)}")
+
     def get_vision_position_ids(
         self,
         start_position: int,
@@ -455,7 +512,7 @@ class SpaModel(Qwen3_5Model):
         grid_thw,
         temp_merge_size: int = 1,
         spatial_merge_size: int = 1,
-        coord_scale: float = 100.0,
+        coord_scale=100.0,
         polar: bool = False,
         device=None,
     ) -> torch.LongTensor:
@@ -511,20 +568,21 @@ class SpaModel(Qwen3_5Model):
         if llm_grid_t > 1:
             xyz_flat = xyz_flat.repeat(llm_grid_t, 1)            # (num_tokens, 3)
 
+        scale_vec = self._coord_scale_vec(coord_scale, device=device)         # (3,) float
         if polar:
             # Cartesian → spherical: (x, y, z) → (ρ, θ, α)
             rho   = torch.norm(xyz_flat, dim=-1).clamp(min=1e-6)              # (N,)
-            theta = torch.acos((xyz_flat[:, 2] / rho).clamp(-1.0, 1.0))      # (N,) ∈ [0, π]
-            alpha = torch.atan2(xyz_flat[:, 1], xyz_flat[:, 0])              # (N,) ∈ [-π, π]
-            # Discretize to [0, coord_scale] each
-            rho_int   = (rho   * coord_scale).round().long()                  # (N,)
-            theta_int = (theta / torch.pi * coord_scale).round().long()       # (N,)
-            alpha_int = ((alpha + torch.pi) / (2 * torch.pi) * coord_scale   # (N,)
+            theta = torch.acos((xyz_flat[:, 2] / rho).clamp(-1.0, 1.0))       # (N,) ∈ [0, π]
+            alpha = torch.atan2(xyz_flat[:, 1], xyz_flat[:, 0])               # (N,) ∈ [-π, π]
+            # Per-axis scale interpreted as (scale_ρ, scale_θ, scale_α)
+            rho_int   = (rho   * scale_vec[0]).round().long()                 # (N,)
+            theta_int = (theta / torch.pi * scale_vec[1]).round().long()      # (N,)
+            alpha_int = ((alpha + torch.pi) / (2 * torch.pi) * scale_vec[2]
                          ).round().long()
             xyz_int = torch.stack([rho_int, theta_int, alpha_int], dim=1)     # (N, 3)
         else:
-            # Discretize float coordinates → integer position indices
-            xyz_int = (xyz_flat * coord_scale).round().long()                 # (num_tokens, 3)
+            # Per-axis scale broadcasts (N, 3) * (3,) → (N, 3)
+            xyz_int = (xyz_flat * scale_vec).round().long()                   # (num_tokens, 3)
 
         pos_t = torch.full((num_tokens,), start_position, dtype=torch.long, device=device)
         pos_x = xyz_int[:, 0]
@@ -576,7 +634,7 @@ class SpaModel(Qwen3_5Model):
         video_grid_thw: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         image_xyz: torch.Tensor | None = None,
-        coord_scale: float = 100.0,
+        coord_scale=100.0,
         coord_token_id: int | None = None,
         polar: bool = False,
         **kwargs,
@@ -703,8 +761,9 @@ class SpaModel(Qwen3_5Model):
                                 if coord_img_ptr < len(image_info):
                                     _, llm_h, llm_w, xyz_c = image_info[coord_img_ptr]
                                     # Discretize xyz — same formula as get_vision_position_ids
+                                    _scale_vec = self._coord_scale_vec(coord_scale, device=dev)
                                     xyz_int = (
-                                        xyz_c.reshape(-1, 3).to(dev) * coord_scale
+                                        xyz_c.reshape(-1, 3).to(dev) * _scale_vec
                                     ).round().long()               # (n_coord, 3)
                                     coord_pos = self.get_coord_position_ids(
                                         cur_text_pos, xyz_int, dev
@@ -840,7 +899,7 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self.model = SpaModel(config)
 
     def forward(self, *args, image_xyz: torch.Tensor | None = None,
-                coord_scale: float = 100.0,
+                coord_scale=100.0,
                 coord_token_id: int | None = None,
                 polar: bool = False, **kwargs):
         """
@@ -856,7 +915,12 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         """
         if image_xyz is not None:
             kwargs["image_xyz"] = image_xyz
-        if coord_scale != 100.0:
+        # Pass coord_scale only if user overrode default scalar 100.0.
+        # Always pass if it's a non-scalar (per-axis tuple/list/tensor).
+        _pass_scale = (
+            not isinstance(coord_scale, (int, float)) or float(coord_scale) != 100.0
+        )
+        if _pass_scale:
             kwargs["coord_scale"] = coord_scale
         if coord_token_id is not None:
             kwargs["coord_token_id"] = coord_token_id

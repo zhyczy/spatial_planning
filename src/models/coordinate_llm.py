@@ -193,7 +193,7 @@ class CoordinatePlusModel(nn.Module):
         gt_transforms:  torch.Tensor | None = None,  # (K, 4, 4)
         image_xyz:      list | None = None,     # list[i] = (llm_H_i, llm_W_i, 3) for RoPE
         image_xyz_hires: list | None = None,    # list[i] = (llm_H_i*up, llm_W_i*up, 3) for coord loss
-        coord_scale:    float = 100.0,
+        coord_scale          = 100.0,
         cycle_weight:   float = 0.0,
         labels:         torch.Tensor | None = None,
         **kwargs,
@@ -277,6 +277,11 @@ class CoordinatePlusModel(nn.Module):
             shift_logits = shift_logits[0, mask]               # (N_valid, V)
             shift_labels = shift_labels[0, mask]               # (N_valid,)
             lm_loss = F.cross_entropy(shift_logits, shift_labels)
+            # Top-1 accuracy on the first answer token (eval-only).
+            if (not self.training) and shift_logits.numel() > 0:
+                _pred = shift_logits[0].argmax(-1).item()
+                _gt   = int(shift_labels[0].item())
+                _ldict["acc"] = 1.0 if _pred == _gt else 0.0
 
         # ── per-patch 3D coordinate prediction (PixelShuffle sub-pixel) ────────
         # One <coord> token per LLM patch; Linear+PixelShuffle decodes each to
@@ -390,7 +395,7 @@ class CoordinateModel(nn.Module):
         gt_transforms:   torch.Tensor | None = None,   # ignored (ablation)
         image_xyz:       list | None = None,
         image_xyz_hires: list | None = None,
-        coord_scale:     float = 100.0,
+        coord_scale          = 100.0,
         cycle_weight:    float = 0.0,            # ignored (ablation)
         labels:          torch.Tensor | None = None,
         **kwargs,
@@ -427,9 +432,12 @@ class CoordinateModel(nn.Module):
             shift_logits = logits[:, :-1, :]
             shift_labels = labels[:, 1:].to(logits.device)
             mask         = shift_labels[0] != -100
-            lm_loss = F.cross_entropy(
-                shift_logits[0, mask], shift_labels[0, mask]
-            )
+            _sl_m = shift_logits[0, mask]
+            _sb_m = shift_labels[0, mask]
+            lm_loss = F.cross_entropy(_sl_m, _sb_m)
+            # Top-1 accuracy on the first answer token (eval-only).
+            if (not self.training) and _sl_m.numel() > 0:
+                _ldict["acc"] = 1.0 if _sl_m[0].argmax(-1).item() == int(_sb_m[0].item()) else 0.0
 
         # ── per-patch 3D coordinate prediction ──────────────────────────────
         coord_loss = None

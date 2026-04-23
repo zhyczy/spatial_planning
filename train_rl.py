@@ -3,7 +3,12 @@ train_rl.py
 
 Alternating two-phase LoRA fine-tuning of SpaForConditionalGeneration
 (Qwen3.5-VL) where Phase B is replaced with GRPO-based RL over a
-discretised SO(3) action space (24 chiral cube rotations).
+yaw-only discrete action space (24 yaw bins, every 15°).
+
+The full-SO(3) 24-chiral-cube action space was dropped after the
+rotation-diversity validation (see md/rotation_diversity_analysis.md)
+showed that lm_loss reward is rotation-insensitive beyond the yaw axis
+for this task. Policy now only decides camera heading.
 
 Architecture
 ~~~~~~~~~~~~
@@ -11,11 +16,11 @@ RotationRLModel = RotationRoPEModel + CameraTokenRotationEncoderRL
     +-- SpaForConditionalGeneration [backbone + LoRA]
     +-- CameraTokenRotationEncoderRL
     |     +-- shallow 4D M-RoPE encoder (2 layers)
-    |     +-- head_cls  : Linear(d, 24)   — anchor-classifier logits
-    |     +-- R_bins    : 24 chiral cube rotations (buffer)
+    |     +-- head_cls  : Linear(d, 24)   — yaw-anchor classifier logits
+    |     +-- R_bins    : 24 yaw bins Rot_z(k · 2π/24) (buffer)
     +-- DepthPredictionTransformer   [coordinate head]
 
-Final rotation composition: R_final(k) = R_bins[k].
+Final rotation composition: R_final(k) = R_bins[k] (= Rot_z(k · 15°)).
 
 Schedule (per epoch — two full passes over the dataset)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -40,7 +45,7 @@ Gradient flow in Phase B
 
 GRPO objective (per batch)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-  1. Enumerate all G=24 cube anchors in a no_grad reward pass
+  1. Enumerate all G=24 yaw anchors in a no_grad reward pass
      → rewards[k] ∈ {0, 1} (binary accuracy of MCQ answer)
   2. Group-normalised advantage:  A[k] = (r[k] - mean) / (std + ε)
      (If std < ε → group is degenerate; skip RL term but still do SFT.)
@@ -379,7 +384,7 @@ def _phase_b_grpo_step(
     rot_bb_params:     list | None                  = None,
     coord_head_params: list | None                  = None,
 ):
-    """One GRPO update over all 24 cube anchors (discrete action space only).
+    """One GRPO update over all 24 yaw anchors (discrete action space only).
 
     Discrete mode: true PPO inner loop.
         - ``log_probs_old`` and group-normalised advantages are snapshotted
@@ -482,16 +487,12 @@ def _phase_b_grpo_step(
     # (buckets A/B/D/E/H), two continuous geometric shapings stack on top:
     #   (a) axis-decoupled cos-distance penalty : rewards −= α · dist(R_k, R_gt)
     #   (b) soft anchor prior                   : rewards += w · softmax(−dist/τ)
-    # Instead of the isotropic geodesic angle θ, we decompose the relative
-    # rotation R_rel = R_kᵀ · R_gt into (yaw, pitch, roll) under ZYX
-    # Tait-Bryan convention and form a weighted cos-distance:
-    #   dist = w_yaw · (1 − cos dyaw)
-    #        + w_pitch · (0.8 − cos dpitch)
-    #        + w_roll · (0.1 − cos droll)
-    # (1 − cos x) ≈ x²/2 for small x, so this behaves like a weighted
-    # squared-angle loss but lets us emphasise yaw (heading, highly
-    # semantic for indoor viewpoint QA), down-weight pitch (tilt), and
-    # near-ignore roll (images are already upright). R_gt is NOT quantized.
+    # Since policy is yaw-only (R_bins[k] = Rot_z(k · 15°)), dpitch and
+    # droll of R_kᵀ·R_gt do not depend on k — they only reflect R_gt's own
+    # tilt/roll. With default w_pitch = w_roll = 0 the distance reduces to
+    # a pure yaw term:  dist = w_yaw · (1 − cos dyaw).  The pitch/roll
+    # knobs are preserved for ablation but should stay at 0 under
+    # yaw-only anchors (constant offsets cancel inside softmax anyway).
     finite_mask = torch.isfinite(lm_losses)
     if finite_mask.all():
         lm_clean = lm_losses
@@ -500,6 +501,15 @@ def _phase_b_grpo_step(
         lm_clean = torch.where(finite_mask, lm_losses,
                                torch.full_like(lm_losses, _fill))
     rewards = -float(args.w_lm) * lm_clean
+
+    # Per-anchor lm_loss diagnostic (rotation-sensitivity probe).
+    # Checks whether lm_loss(k) actually differs across the 24 rotation
+    # anchors. If spread/std is tiny, the pure -w_lm·lm_loss signal cannot
+    # distinguish anchors → reward shaping was carrying all the signal.
+    for _k in range(24):
+        _ldict[f"lm_loss_a{_k:02d}"] = float(lm_clean[_k].item())
+    _ldict["lm_loss_spread"]           = float((lm_clean.max() - lm_clean.min()).item())
+    _ldict["lm_loss_std_over_anchors"] = float(lm_clean.std(unbiased=False).item())
 
     _w_rot = float(getattr(args, "w_rot", 0.0))
     _w_bucket = {
@@ -1171,8 +1181,17 @@ def train(args: argparse.Namespace) -> None:
                             g["lr"] for g in optimizer.param_groups
                             if g.get("name") == "coord_head"
                         )
+                        # Split per-anchor lm_loss_aNN keys onto a dedicated
+                        # log line so the main metrics row stays readable.
+                        _anchor_keys = sorted(
+                            k for k in avg_loss_dict if k.startswith("lm_loss_a")
+                        )
+                        _detail_items = [
+                            (k, v) for k, v in avg_loss_dict.items()
+                            if k not in _anchor_keys
+                        ]
                         detail = "  ".join(
-                            f"{k}={v:.4f}" for k, v in avg_loss_dict.items()
+                            f"{k}={v:.4f}" for k, v in _detail_items
                         )
                         log.info(
                             f"[train][Phase {current_phase}] "
@@ -1183,6 +1202,14 @@ def train(args: argparse.Namespace) -> None:
                             f"(aggregated across {world_size} GPU"
                             f"{'s' if world_size > 1 else ''})"
                         )
+                        if _anchor_keys:
+                            _vals = " ".join(
+                                f"{avg_loss_dict[k]:.3f}" for k in _anchor_keys
+                            )
+                            log.info(
+                                f"[train][Phase {current_phase}][lm_loss/24] "
+                                f"step={global_step:05d}  {_vals}"
+                            )
                         if use_wandb:
                             _shared_train_keys = {"lm_loss", "coord_loss", "R_trace"}
                             wandb.log(
@@ -1281,6 +1308,36 @@ def _run_eval(
                 entropy  = float(-(probs * (probs.clamp_min(1e-12)).log()).sum().item())
                 topk_idx = logits.topk(_topk).indices.tolist()              # list[int]
                 k_star   = int(topk_idx[0])
+
+                # Per-anchor lm_loss diagnostic at eval time.
+                # Same rotation-sensitivity probe as Phase B training: scan
+                # all 24 anchors, record lm_loss for each so we can check
+                # whether the LM output actually depends on which R is fed
+                # at inference. NB: 24x forward per eval sample.
+                _eval_lm_losses = [float("nan")] * 24
+                for _k in range(24):
+                    _R_k = _model.rotation_enc.compose_R(int(_k), residual_all)
+                    _, _, _ld_k = _model.compute_losses_from_R(
+                        R                   = _R_k,
+                        inputs_embeds       = inputs_embeds,
+                        input_ids           = t_ids,
+                        attention_mask      = t_mask,
+                        image_xyz           = t_xyz,
+                        image_xyz_hires     = None,
+                        image_grid_thw      = t_thw,
+                        labels              = t_labels,
+                        coord_scale         = args.coord_scale,
+                        use_coord_loss      = False,
+                        use_relative        = args.relative,
+                        detach_coord_hidden = True,
+                        cam_feat            = None,
+                        compute_reward      = True,
+                    )
+                    if _ld_k is not None:
+                        _eval_lm_losses[_k] = float(
+                            _ld_k.get("lm_loss", float("nan"))
+                        )
+
                 R = _model.rotation_enc.compose_R(k_star, residual_all)
 
                 lm_loss, coord_loss, _ldict = _model.compute_losses_from_R(
@@ -1332,6 +1389,20 @@ def _run_eval(
                 _ldict = {}
             if R is not None:
                 _ldict["R_trace"] = float(R.trace().item())
+
+            # Stash per-anchor lm_loss + summary stats so the all_reduce
+            # below aggregates them the same way as the other scalars.
+            for _k in range(24):
+                _ldict[f"eval_lm_loss_a{_k:02d}"] = _eval_lm_losses[_k]
+            _finite_lm = [v for v in _eval_lm_losses if math.isfinite(v)]
+            if _finite_lm:
+                _ldict["eval_lm_loss_spread"]           = max(_finite_lm) - min(_finite_lm)
+                _ldict["eval_lm_loss_std_over_anchors"] = float(
+                    torch.tensor(_finite_lm, dtype=torch.float64)
+                    .std(unbiased=False).item()
+                )
+                _ldict["eval_lm_loss_best_anchor"]      = min(_finite_lm)
+
             if _ldict:
                 for k, v in _ldict.items():
                     local_loss_sums[k] = local_loss_sums.get(k, 0.0) + float(v)
@@ -1357,13 +1428,25 @@ def _run_eval(
             agg_sums    = dict(local_loss_sums)
 
         if total_count > 0 and local_rank == 0:
+            # Split per-anchor eval_lm_loss_aNN keys onto a dedicated log
+            # line so the main eval metrics row stays readable.
+            _anchor_keys = [k for k in _keys if k.startswith("eval_lm_loss_a")]
+            _main_keys   = [k for k in _keys if k not in _anchor_keys]
             detail = "  ".join(
-                f"{k}={agg_sums[k] / total_count:.4f}" for k in _keys
+                f"{k}={agg_sums[k] / total_count:.4f}" for k in _main_keys
             )
             log.info(f"[eval] global_step={global_step:05d}  {ds_name}  "
                      + detail
                      + f"  (n={total_count}, {world_size} GPU"
                      f"{'s' if world_size > 1 else ''})")
+            if _anchor_keys:
+                _vals = " ".join(
+                    f"{agg_sums[k] / total_count:.3f}" for k in _anchor_keys
+                )
+                log.info(
+                    f"[eval][lm_loss/24] global_step={global_step:05d}  "
+                    f"{ds_name}  {_vals}"
+                )
             if use_wandb:
                 _main = {"coord_loss", "lm_loss"}
                 wandb.log(
@@ -1573,16 +1656,19 @@ def parse_args() -> argparse.Namespace:
                         "distance. Highest semantic weight for indoor viewpoint "
                         "QA — 'turn left/right' and 'which view' depend primarily "
                         "on yaw. Default 1.0.")
-    p.add_argument("--w_pitch",        type=float, default=0.8,
+    p.add_argument("--w_pitch",        type=float, default=0.0,
                    help="Pitch (tilt) weight in the axis-decoupled rotation "
-                        "distance. Significant semantic weight — up/down gaze "
-                        "affects which objects are visible. Default 0.8.")
-    p.add_argument("--w_roll",         type=float, default=0.05,
+                        "distance. Disabled by default because the yaw-only "
+                        "anchors cannot change pitch — dpitch is a constant "
+                        "across k determined solely by R_gt, so any non-zero "
+                        "weight just adds a sample-level constant offset to "
+                        "all rewards. Keep at 0 unless you wire pitch back "
+                        "into the action space.")
+    p.add_argument("--w_roll",         type=float, default=0.0,
                    help="Roll weight in the axis-decoupled rotation distance. "
-                        "Small residual weight — indoor images are roughly "
-                        "upright so roll errors are mostly noise, but keeping "
-                        "a small positive coefficient mildly penalises "
-                        "implausible camera orientations. Default 0.05.")
+                        "Disabled by default for the same reason as w_pitch "
+                        "(yaw-only anchors leave droll invariant across k). "
+                        "Keep at 0 unless the action space gains a roll DoF.")
 
     # --- Bucket-aware soft anchor-prior shaping (see MindCube viewpoint buckets)
     # Applied on rewards (shape (24,)) per sample when the dataset supplies a

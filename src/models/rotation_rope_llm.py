@@ -1065,6 +1065,28 @@ def _build_chiral_cube_group() -> torch.Tensor:
     return R_bins
 
 
+def _build_yaw_group(n_bins: int = 24) -> torch.Tensor:
+    """n_bins evenly-spaced yaw rotations Rot_z(k · 2π / n_bins).
+
+    Policy only decides camera yaw (heading around +z) — pitch and roll
+    are fixed to 0 so the action space is effectively SO(2). R_bins[0] = I.
+
+    Returns:
+        (n_bins, 3, 3) float32 tensor.
+    """
+    angles = torch.arange(n_bins, dtype=torch.float32) * (2.0 * math.pi / n_bins)
+    c = torch.cos(angles)
+    s = torch.sin(angles)
+    R = torch.zeros(n_bins, 3, 3, dtype=torch.float32)
+    R[:, 0, 0] = c
+    R[:, 0, 1] = -s
+    R[:, 1, 0] = s
+    R[:, 1, 1] = c
+    R[:, 2, 2] = 1.0
+    assert torch.allclose(R[0], torch.eye(3)), "R_bins[0] must be identity"
+    return R
+
+
 def _hat(v: torch.Tensor) -> torch.Tensor:
     """Skew-symmetric matrix of (3,) vector v (differentiable in v)."""
     vx, vy, vz = v[0], v[1], v[2]
@@ -1101,19 +1123,26 @@ def _rodrigues(axis_angle: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class CameraTokenRotationEncoderRL(nn.Module):
-    """Shallow M-RoPE encoder predicting (anchor_logits, per-anchor residual).
+    """Shallow M-RoPE encoder predicting (yaw_anchor_logits, per-anchor yaw residual).
+
+    Yaw-only policy
+    ~~~~~~~~~~~~~~~
+    The policy only decides camera yaw (heading around +z) — pitch and roll
+    are fixed to 0 so the action space collapses from SO(3) to SO(2).
+    R_bins spans 24 evenly-spaced yaw bins (every 15°), and each anchor's
+    residual is a single scalar Δyaw ∈ [-residual_clamp, residual_clamp].
 
     Output heads
     ~~~~~~~~~~~~
-    head_cls: Linear(d_model, 24)   → anchor logits (softmax = π(a|s))
-    head_res: Linear(d_model, 72)   → (24, 3) axis-angle residual per anchor,
+    head_cls: Linear(d_model, 24)   → yaw-anchor logits (softmax = π(a|s))
+    head_res: Linear(d_model, 24)   → (24,) scalar yaw residual per anchor,
                                        zero-init, active only in "hybrid" mode.
 
     Final rotation (for anchor k):
-        R_final(k) = R_bins[k] @ exp(hat(residual_clamp · tanh(residual_all[k])))
+        R_final(k) = Rot_z(yaw_k + residual_clamp · tanh(residual_all[k]))
 
     With zero-init head_cls → uniform π₀ at step 0; entropy bonus in the
-    RL objective prevents dead anchors.  With zero-init head_res → ΔR = I,
+    RL objective prevents dead anchors.  With zero-init head_res → Δyaw = 0,
     so R_final(k) = R_bins[k] at step 0 and residual only learns corrections
     on anchors the policy has already identified as high-reward.
 
@@ -1129,9 +1158,9 @@ class CameraTokenRotationEncoderRL(nn.Module):
                          same inputs so advantages are comparable.
         action_space:    "discrete" (head_cls only, head_res = None) or
                          "hybrid"   (head_cls + head_res).
-        residual_clamp:  max axis-angle magnitude (rad) per DoF after tanh.
-                         Default π/6 ≈ 30° — chosen so adjacent cube anchors
-                         (separated by 60°–90° geodesic) do not overlap.
+        residual_clamp:  max Δyaw magnitude (rad) after tanh.
+                         Default π/24 ≈ 7.5° = half-width of a 15° yaw bin,
+                         so adjacent anchors do not overlap.
     """
 
     def __init__(
@@ -1144,7 +1173,7 @@ class CameraTokenRotationEncoderRL(nn.Module):
         num_layers:      int   = 2,
         dropout:         float = 0.0,
         action_space:    str   = "hybrid",
-        residual_clamp:  float = math.pi / 6,
+        residual_clamp:  float = math.pi / 24,
     ):
         super().__init__()
         assert action_space in ("discrete", "hybrid"), \
@@ -1177,17 +1206,17 @@ class CameraTokenRotationEncoderRL(nn.Module):
         nn.init.zeros_(self.head_cls.weight)
         nn.init.zeros_(self.head_cls.bias)
 
-        # Per-anchor 3-DoF residual head — zero-init → ΔR = I at step 0.
+        # Per-anchor 1-DoF yaw-residual head — zero-init → Δyaw = 0 at step 0.
         if action_space == "hybrid":
-            self.head_res = nn.Linear(self.d_model, 24 * 3)
+            self.head_res = nn.Linear(self.d_model, 24)
             nn.init.zeros_(self.head_res.weight)
             nn.init.zeros_(self.head_res.bias)
         else:
             self.head_res = None
 
-        # Fixed 24-element chiral cube rotation group (persistent=False so
-        # we don't pollute state_dict with a constant).
-        R_bins = _build_chiral_cube_group()
+        # Fixed 24-element yaw-bin group (persistent=False so we don't
+        # pollute state_dict with a constant).
+        R_bins = _build_yaw_group(24)
         self.register_buffer("R_bins", R_bins, persistent=False)
 
     def forward(
@@ -1197,8 +1226,8 @@ class CameraTokenRotationEncoderRL(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """
         Returns:
-            logits:       (24,) float32 — anchor classifier logits.
-            residual_all: (24, 3) float32 raw axis-angle output (pre-clamp),
+            logits:       (24,) float32 — yaw-anchor classifier logits.
+            residual_all: (24,) float32 raw Δyaw output (pre-clamp),
                           or None if action_space=="discrete".
             cam_feat:     (d_model,) cam-token feature in encoder dtype.
         """
@@ -1219,7 +1248,7 @@ class CameraTokenRotationEncoderRL(nn.Module):
         cam_feat = x[0, 0]
         logits   = self.head_cls(cam_feat).float()              # (24,)
         if self.head_res is not None:
-            residual_all = self.head_res(cam_feat).float().view(24, 3)
+            residual_all = self.head_res(cam_feat).float()       # (24,) scalar Δyaw per anchor
         else:
             residual_all = None
         return logits, residual_all, cam_feat
@@ -1229,7 +1258,7 @@ class CameraTokenRotationEncoderRL(nn.Module):
         k:            int,
         residual_all: torch.Tensor | None,
     ) -> torch.Tensor:
-        """R_final = R_bins[k] @ exp(hat(residual_clamp · tanh(residual_all[k]))).
+        """R_final = Rot_z(yaw_k + residual_clamp · tanh(residual_all[k])).
 
         In discrete mode (or residual_all None) returns R_bins[k] directly.
         Return dtype is float32 regardless of the model's bf16 cast, matching
@@ -1238,7 +1267,10 @@ class CameraTokenRotationEncoderRL(nn.Module):
         R_k = self.R_bins[k].float()
         if residual_all is None or self.head_res is None:
             return R_k
-        delta_raw = residual_all[k]                              # (3,)
-        delta     = self.residual_clamp * torch.tanh(delta_raw)
-        R_delta   = _rodrigues(delta)                            # (3, 3)
+        dyaw_raw = residual_all[k]                               # scalar
+        dyaw     = self.residual_clamp * torch.tanh(dyaw_raw)
+        axis_ang = torch.stack([
+            torch.zeros_like(dyaw), torch.zeros_like(dyaw), dyaw,
+        ])                                                        # (3,)
+        R_delta  = _rodrigues(axis_ang)                           # (3, 3)
         return R_k @ R_delta

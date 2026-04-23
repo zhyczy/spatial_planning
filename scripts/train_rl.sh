@@ -6,7 +6,7 @@
 #   Phase A (SFT)  : LoRA + coord_head trainable; encoder frozen at argmax anchor.
 #   Phase B (GRPO) : LoRA frozen; encoder heads + coord_head trainable.
 #     - head_cls / rot_bb ← PPO (K inner epochs, clipped surrogate + entropy + KL)
-#                           over 24 chiral-cube anchors; dense reward
+#                           over 24 yaw anchors (every 15°); dense reward
 #                           R(k) = -w_lm·lm_loss(k) − α·dist(R_k, R_gt) where
 #                           dist is a w_yaw/w_pitch/w_roll-weighted cos-distance
 #                           over decoupled ZYX Tait-Bryan Euler errors.
@@ -27,10 +27,11 @@
 #   --lr_phase_b LR          Phase B base LR (rot_bb; head_cls = this × scale / K)
 #   --w_lm W                 scale on -lm_loss dense reward (default: 1.0)
 #   --alpha_dist A           Axis-decoupled cos-distance penalty coeff
-#                            (default: 0.8; set 0 to disable rotation discriminability)
+#                            (default: 0.0 — disabled for lm_loss rotation-sensitivity
+#                             probe. Set 0.8 to re-enable rotation discriminability.)
 #   --w_yaw W                yaw weight in axis-decoupled distance (default: 1.0)
-#   --w_pitch W              pitch weight in axis-decoupled distance (default: 0.8)
-#   --w_roll W               roll weight in axis-decoupled distance (default: 0.05)
+#   --w_pitch W              pitch weight (default: 0.0 — yaw-only policy)
+#   --w_roll W               roll weight (default: 0.0 — yaw-only policy)
 #   --entropy_beta B         entropy bonus coeff (default: 0.01)
 #   --kl_lambda L            KL-to-uniform coeff (default: 0.001)
 #   --rl_weight W            scale on (L_rl + L_ent + L_kl) (default: 1.0)
@@ -40,7 +41,7 @@
 #
 #   Bucket-aware anchor-prior shaping (MindCube 5-bucket taxonomy A/B/D/E/H;
 #   C residue = 571 E-pos-obj samples with no pose-derivable frame):
-#   --w_anchor_prior W       master switch (default: 1.0; 0 disables shaping)
+#   --w_anchor_prior W       master switch (default: 0.0 — disabled; set 1.0 to re-enable)
 #   --w_rot W                Buckets B/H/D/E (default: 0.8; pose-derived R_gt,
 #                            geodesic θ handles anchor-reliability implicitly)
 #   --w_trans W              Bucket A weight  (default: 0.8; identity prior)
@@ -182,12 +183,15 @@ ROT_NUM_LAYERS=2
 
 # RL / PPO hyperparameters
 W_LM="${W_LM_CLI:-1.0}"
-ALPHA_DIST="${ALPHA_DIST_CLI:-0.8}"
+# Geometric constraints disabled by default for lm_loss rotation-sensitivity probe.
+# Re-enable with --alpha_dist 0.8 --w_anchor_prior 1.0 once diagnosis is done.
+ALPHA_DIST="${ALPHA_DIST_CLI:-0.0}"
 # Axis-decoupled rotation-distance weights (defaults match train_rl.py argparse).
-# Indoor viewpoint QA: yaw dominates, pitch secondary (up/down gaze), roll residual.
+# Policy is yaw-only (R_bins = 24 yaw bins every 15°); dpitch/droll do not
+# depend on the anchor k, so keep w_pitch = w_roll = 0.
 W_YAW="${W_YAW_CLI:-1.0}"
-W_PITCH="${W_PITCH_CLI:-0.8}"
-W_ROLL="${W_ROLL_CLI:-0.05}"
+W_PITCH="${W_PITCH_CLI:-0.0}"
+W_ROLL="${W_ROLL_CLI:-0.0}"
 ENTROPY_BETA="${ENTROPY_BETA_CLI:-0.01}"
 KL_LAMBDA="${KL_LAMBDA_CLI:-0.001}"
 RL_WEIGHT="${RL_WEIGHT_CLI:-1.0}"
@@ -200,7 +204,7 @@ PPO_CLIP_EPS="${PPO_CLIP_EPS_CLI:-0.2}"
 # geodesic θ already differentiates anchor reliability implicitly. w_trans
 # stays separate because Bucket A uses an identity R_gt (semantically distinct
 # from pose-derived rotations).
-W_ANCHOR_PRIOR="${W_ANCHOR_PRIOR_CLI:-1.0}"
+W_ANCHOR_PRIOR="${W_ANCHOR_PRIOR_CLI:-0.0}"
 W_ROT="${W_ROT_CLI:-0.8}"
 W_TRANS="${W_TRANS_CLI:-0.8}"
 
