@@ -64,8 +64,7 @@ from src.models import (
 from src.dataset import (
     MindCube_Train_Dataset,
     MindCube_Train_Dataset_Relative,
-    Eval_Dataset,
-    load_testing_dataset,
+    Eval_Dataset_Coord,
 )
 
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
@@ -412,18 +411,37 @@ def train(args: argparse.Namespace) -> None:
         sampler     = train_sampler,
     )
 
-    # ── test datasets (for periodic LM loss evaluation) ────────────────────
+    # ── test datasets (for periodic LM loss + first-token acc evaluation) ─────
+    # Uses Eval_Dataset_Coord so that image_xyz is loaded from pts3d and passed
+    # to the model at eval time — matching the training input distribution for
+    # all xyz-using modes (default 4D / polar / relative / decouple).
+    # coord_upscale=1 to skip the unused image_xyz_hires (save memory).
     _eval_dir = os.path.join(_ROOT, "datasets/evaluation")
     test_loaders = {}
     test_samplers = {}
-    for _ds_name, _ds_dir in [
-        ("mindcube",             os.path.join(_eval_dir, "MindCube")),
-        ("spinbench",            os.path.join(_eval_dir, "spinbench_data")),
-        # ("sparbench_multi_view", os.path.join(_eval_dir, "SPARBench")),
+    for _ds_name, _ds_jsonl, _ds_results, _q_key, _a_key in [
+        ("mindcube",
+         os.path.join(_eval_dir, "MindCube", "MindCube_tinybench.jsonl"),
+         os.path.join(_eval_dir, "MindCube", "3d_results"),
+         "question", "gt_answer"),
+        ("spinbench",
+         os.path.join(_eval_dir, "spinbench_data", "test.jsonl"),
+         os.path.join(_eval_dir, "spinbench_data", "3d_results"),
+         "problem", "answer"),
     ]:
         try:
-            raw_samples = load_testing_dataset(data_dir=_ds_dir, dataset=_ds_name)
-            ds = Eval_Dataset(raw_samples, processor)
+            ds = Eval_Dataset_Coord(
+                _ds_jsonl,
+                _ds_results,
+                processor,
+                log,
+                max_images         = args.max_images,
+                spatial_merge_size = spatial_merge_size,
+                coord_upscale      = 1,
+                question_key       = _q_key,
+                answer_key         = _a_key,
+                relative           = args.relative,
+            )
             _eval_sampler = (
                 DistributedSampler(ds, num_replicas=world_size,
                                    rank=local_rank, shuffle=False)
@@ -637,20 +655,39 @@ def train(args: argparse.Namespace) -> None:
                             t_pv    = test_batch.get("pixel_values")
                             t_thw   = test_batch.get("image_grid_thw")
                             t_labels = test_batch.get("labels")
+                            t_xyz     = test_batch.get("image_xyz")
+                            t_xyz_rel = test_batch.get("image_xyz_relative")
                             if t_pv is not None:
                                 t_pv = t_pv.to(device, dtype=torch.bfloat16)
                             if t_thw is not None:
                                 t_thw = t_thw.to(device)
                             if t_labels is not None:
                                 t_labels = t_labels.to(device)
+                            if t_xyz is not None:
+                                t_xyz = [x.to(device) for x in t_xyz]
+                            if t_xyz_rel is not None:
+                                t_xyz_rel = [x.to(device) for x in t_xyz_rel]
                             try:
+                                # Match training input distribution per mode:
+                                #   vanilla       — no xyz kwargs (stock Qwen)
+                                #   --relative    — image_xyz_relative (per-frame)
+                                #   --polar       — image_xyz + polar=True (xyz→log-spherical in M-RoPE)
+                                #   default/decouple — image_xyz
+                                _eval_fwd_kwargs = dict(
+                                    input_ids=t_ids, attention_mask=t_mask,
+                                    pixel_values=t_pv, image_grid_thw=t_thw,
+                                    return_dict=True,
+                                    kv_cache=(ds_name == "spinbench"),
+                                )
+                                if not args.vanilla:
+                                    if args.relative and t_xyz_rel is not None:
+                                        _eval_fwd_kwargs["image_xyz_relative"] = t_xyz_rel
+                                    elif t_xyz is not None:
+                                        _eval_fwd_kwargs["image_xyz"] = t_xyz
+                                    if args.polar:
+                                        _eval_fwd_kwargs["polar"] = True
                                 with torch.no_grad():
-                                    out = _spa(
-                                        input_ids=t_ids, attention_mask=t_mask,
-                                        pixel_values=t_pv, image_grid_thw=t_thw,
-                                        return_dict=True,
-                                        kv_cache=(ds_name == "spinbench"),
-                                    )
+                                    out = _spa(**_eval_fwd_kwargs)
                                     logits = out.logits
                                     shift_logits = logits[..., :-1, :].contiguous()
                                     shift_labels = t_labels[..., 1:].contiguous()

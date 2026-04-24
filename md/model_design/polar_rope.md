@@ -1,5 +1,9 @@
 # `--polar`: Decoupled log-spherical XYZ RoPE
 
+**See also**:
+- [`train_correspondence_algorithms.md`](train_correspondence_algorithms.md) — high-level overview of all training modes and compatibility matrix
+- [`decouple_xyz_rope.md`](decouple_xyz_rope.md) — base architecture that `--polar` extends (with Cartesian input and θ=10000)
+
 ## 1. What `--polar` does now
 
 `--polar` is the log-spherical variant of the decoupled architecture from [`decouple_xyz_rope.md`](decouple_xyz_rope.md). It **reuses the same decoupled architecture** (Qwen 3D M-RoPE in the rotary 64 dims untouched + new XYZ RoPE in pass-through dims 64..129 + 126 content dims untouched) but:

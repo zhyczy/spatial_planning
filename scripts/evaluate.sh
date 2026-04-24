@@ -10,7 +10,7 @@
 #   bash scripts/evaluate.sh [options]
 #
 # Options:
-#   --method    baseline | vanilla | position_embedding | coordinate | polar | rotation | rotation_relative | rotation_rl | both
+#   --method    baseline | vanilla | position_embedding | coordinate | polar | decouple | relative | rotation | rotation_relative | rotation_rl | both
 #               (default: both = baseline + coordinate)
 #   --ckpt      path to SPA LoRA checkpoint dir
 #               (required when method != baseline)
@@ -38,7 +38,15 @@
 #   position_embedding — SPA LoRA + 4D M-RoPE (xyz fed through RoPE; no coord head)
 #   coordinate         — SPA LoRA + 4D M-RoPE + coord head (Cartesian xyz regression
 #                        at vision-token hidden states)
-#   polar              — SPA LoRA + 4D M-RoPE + coord head (log-spherical (log r, θ, α))
+#   polar              — SpaDec + LoRA: Qwen original 3D M-RoPE unchanged (rotary dims 0..63)
+#                        + new log-spherical XYZ RoPE in pass-through dims 64..129, θ=1000.
+#                        Matches train_correspondence.py / train_coordinate.py --polar.
+#   decouple           — SpaDec + LoRA: Qwen original 3D M-RoPE unchanged
+#                        + new Cartesian XYZ RoPE in pass-through dims 64..129, θ=10000.
+#                        Matches train_correspondence.py / train_coordinate.py --decouple.
+#   relative           — SpaRelative + LoRA: 4D M-RoPE + SpaRelativeAttentionWrapper on
+#                        every self_attn (per-query-frame xyz). Matches
+#                        train_correspondence.py --relative. NOT the same as rotation_relative.
 #   rotation           — SPA LoRA + 4D M-RoPE + rotation_enc + coord head (cam_dim=0)
 #                        (predicts canonical R; xyz rotated before RoPE/MAE)
 #                        Requires ckpt trained by train_rotation.py WITHOUT --relative.
@@ -146,7 +154,7 @@ done
 # Validate arguments
 # =============================================================================
 
-VALID_METHODS="baseline vanilla position_embedding coordinate polar rotation rotation_relative rotation_rl both"
+VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple relative rotation rotation_relative rotation_rl both"
 if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
     echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1

@@ -130,7 +130,7 @@ MINDCUBE_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
 
 EPOCHS=6
 LR=2e-4
-MAX_IMAGES=4
+MAX_IMAGES=10
 GRAD_ACCUM=8
 NUM_WORKERS=4
 SAVE_STEPS=50
@@ -234,7 +234,7 @@ TORCHRUN=/egr/research-actionlab/caizhon2/miniconda3/envs/spc/bin/torchrun
 
 $TORCHRUN \
     --nproc_per_node "$NPROC" \
-    --master_port    "${MASTER_PORT:-29504}" \
+    --master_port    "${MASTER_PORT:-29507}" \
     train_geo.py \
     --model_path             "$MODEL_PATH"             \
     --json_path              "$JSON_PATH"              \

@@ -70,8 +70,7 @@ from src.models import (
 )
 from src.dataset import (
     MindCube_Train_Dataset,
-    Eval_Dataset,
-    load_testing_dataset,
+    Eval_Dataset_Coord,
 )
 
 logging.basicConfig(
@@ -475,10 +474,18 @@ def train(args: argparse.Namespace) -> None:
     log.info(f"GeoModel: use_contrast={use_contrast}  use_match={use_match}")
 
     if world_size > 1:
-        # find_unused_parameters=True because contrast_loss is skipped half the
-        # time (permuted steps), so some LoRA params receive grads only through
-        # lm + match on those steps.
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        # find_unused_parameters=False: contrast has no learnable parameters
+        # (triplet L2 on hidden states only), and match_head either participates
+        # every step (use_match=True and N ≥ 2) or is None (use_match=False).
+        # LoRA params in q/k/v/o/gate/up/down_proj always receive lm_loss
+        # gradient. So no parameter is unused across iterations under default
+        # max_images ≥ 2; keeping this False avoids the per-step autograd-graph
+        # traversal overhead and matches DDP's preference.
+        #
+        # Caveat: if a sample has only N<2 images (rare, e.g. max_images=1
+        # smoke tests), match_head won't receive gradient on that step and
+        # DDP will raise. Keep max_images ≥ 2 when use_match=True.
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
         _model = model.module
     else:
         _model = model
@@ -503,18 +510,32 @@ def train(args: argparse.Namespace) -> None:
         num_workers=args.num_workers, collate_fn=collate_fn, sampler=train_sampler,
     )
 
-    # ── eval loaders (LM-only signal; geometric transfer eval per doc §4
-    #    is orthogonal and lives in a separate harness) ───────────────────────
+    # ── eval loaders (use Eval_Dataset_Coord so image_xyz is available at eval,
+    #    letting GeoModel run contrast_loss / match_loss on test data too) ─────
     _eval_dir = os.path.join(_ROOT, "datasets/evaluation")
     test_loaders = {}
     test_samplers = {}
-    for _ds_name, _ds_dir in [
-        ("mindcube",  os.path.join(_eval_dir, "MindCube")),
-        ("spinbench", os.path.join(_eval_dir, "spinbench_data")),
+    for _ds_name, _ds_jsonl, _ds_results, _q_key, _a_key in [
+        ("mindcube",
+         os.path.join(_eval_dir, "MindCube", "MindCube_tinybench.jsonl"),
+         os.path.join(_eval_dir, "MindCube", "3d_results"),
+         "question", "gt_answer"),
+        ("spinbench",
+         os.path.join(_eval_dir, "spinbench_data", "test.jsonl"),
+         os.path.join(_eval_dir, "spinbench_data", "3d_results"),
+         "problem", "answer"),
     ]:
         try:
-            raw = load_testing_dataset(data_dir=_ds_dir, dataset=_ds_name)
-            ds = Eval_Dataset(raw, processor)
+            ds = Eval_Dataset_Coord(
+                _ds_jsonl,
+                _ds_results,
+                processor,
+                log,
+                max_images         = args.max_images,
+                spatial_merge_size = spatial_merge_size,
+                question_key       = _q_key,
+                answer_key         = _a_key,
+            )
             _eval_sampler = (
                 DistributedSampler(ds, num_replicas=world_size, rank=local_rank, shuffle=False)
                 if world_size > 1 else None
@@ -522,7 +543,7 @@ def train(args: argparse.Namespace) -> None:
             test_loaders[_ds_name] = DataLoader(
                 ds, batch_size=1, shuffle=False,
                 num_workers=args.num_workers, collate_fn=collate_fn,
-                sampler=_eval_sampler,
+                sampler=_eval_sampler, pin_memory=True,
             )
             test_samplers[_ds_name] = _eval_sampler
             log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
@@ -653,7 +674,14 @@ def train(args: argparse.Namespace) -> None:
                     if global_step % args.save_steps == 0:
                         _save_checkpoint(_model, tokenizer, args.output_dir, global_step)
 
-                # ── periodic eval (LM loss + acc) ────────────────────────────
+                # ── periodic eval (lm + contrast + match losses via GeoModel) ─
+                # Calls `model(...)` rather than spa_model directly, so
+                # Eval_Dataset_Coord's image_xyz flows through decouple's XYZ
+                # RoPE and GeoModel's loss_dict reports all three heads on test
+                # data. GeoModel.forward gates permutation on `self.training`,
+                # so eval is always un-permuted → contrast fires every eval
+                # step; match_loss is computed on the trivial all-matches case
+                # (CE against label=1 for every image).
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
                     _spa = _model.spa_model
@@ -668,61 +696,82 @@ def train(args: argparse.Namespace) -> None:
                     for ds_name, loader in test_loaders.items():
                         if test_samplers.get(ds_name) is not None:
                             test_samplers[ds_name].set_epoch(global_step)
-                        l_loss = 0.0; l_acc = 0.0; l_n = 0
+                        local_count = 0
+                        local_loss_sums: dict[str, float] = {}
+
                         for tb in loader:
                             t_ids  = tb["input_ids"].to(device)
                             t_mask = tb["attention_mask"].to(device)
                             t_pv   = tb.get("pixel_values")
                             t_thw  = tb.get("image_grid_thw")
                             t_lbl  = tb.get("labels")
+                            t_xyz  = tb.get("image_xyz")
                             if t_pv is not None:
                                 t_pv = t_pv.to(device, dtype=torch.bfloat16)
                             if t_thw is not None:
                                 t_thw = t_thw.to(device)
                             if t_lbl is not None:
                                 t_lbl = t_lbl.to(device)
+                            if t_xyz is not None:
+                                t_xyz = [x.to(device) for x in t_xyz]
+
                             try:
-                                with torch.no_grad():
-                                    out = _spa(
-                                        input_ids=t_ids, attention_mask=t_mask,
-                                        pixel_values=t_pv, image_grid_thw=t_thw,
-                                        return_dict=True,
-                                        kv_cache=(ds_name == "spinbench"),
+                                with torch.inference_mode():
+                                    _, _, eval_ldict = model(
+                                        input_ids      = t_ids,
+                                        attention_mask = t_mask,
+                                        pixel_values   = t_pv,
+                                        image_grid_thw = t_thw,
+                                        image_xyz      = t_xyz,
+                                        labels         = t_lbl,
                                     )
-                                    logits = out.logits
-                                    shift_logits = logits[..., :-1, :].contiguous()
-                                    shift_labels = t_lbl[..., 1:].contiguous()
-                                    lm_loss = F.cross_entropy(
-                                        shift_logits.view(-1, shift_logits.size(-1)),
-                                        shift_labels.view(-1), ignore_index=-100,
-                                    )
-                                    l_loss += lm_loss.item()
-                                    _mk = shift_labels[0] != -100
-                                    _sl = shift_logits[0, _mk]; _sb = shift_labels[0, _mk]
-                                    if _sl.numel() > 0:
-                                        l_acc += 1.0 if _sl[0].argmax(-1).item() == int(_sb[0].item()) else 0.0
-                                    l_n += 1
                             except Exception as exc:
                                 log.debug(f"Eval skip ({ds_name}): {exc}")
                                 continue
+                            if not eval_ldict:
+                                continue
+                            local_count += 1
+                            for k, v in eval_ldict.items():
+                                local_loss_sums[k] = local_loss_sums.get(k, 0.0) + v
+
+                        # Aggregate across all ranks
+                        _loss_keys = sorted(local_loss_sums.keys())
                         if world_size > 1:
-                            stats = torch.tensor([l_loss, l_acc, l_n], dtype=torch.float64, device=device)
+                            _vals = [float(local_count)] + [
+                                local_loss_sums.get(k, 0.0) for k in _loss_keys
+                            ]
+                            stats = torch.tensor(_vals, dtype=torch.float64, device=device)
                             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                            tot_loss = stats[0].item(); tot_acc = stats[1].item(); tot_n = int(stats[2].item())
+                            total_count = int(stats[0].item())
+                            agg_sums = {k: stats[i + 1].item() for i, k in enumerate(_loss_keys)}
                         else:
-                            tot_loss = l_loss; tot_acc = l_acc; tot_n = l_n
-                        if tot_n > 0 and local_rank == 0:
-                            avg_l = tot_loss / tot_n
-                            avg_a = tot_acc / tot_n
+                            total_count = local_count
+                            agg_sums = dict(local_loss_sums)
+
+                        # match_loss / match_acc in eval are degenerate: the
+                        # §1.D permutation is gated by self.training, so eval
+                        # always sees correct xyz → label=[1,…,1] (trivial CE).
+                        # Drop them from both the INFO line and wandb so the
+                        # plots don't carry misleading flat curves.
+                        _eval_keys = [
+                            k for k in _loss_keys
+                            if k not in ("match_loss", "match_acc")
+                        ]
+
+                        if total_count > 0 and local_rank == 0:
+                            detail = "  ".join(
+                                f"{k}={agg_sums[k] / total_count:.4f}"
+                                for k in _eval_keys
+                            )
                             log.info(
                                 f"[eval] step={global_step:05d}  {ds_name}  "
-                                f"lm_loss={avg_l:.4f}  acc={avg_a:.4f}  (n={tot_n})"
+                                + detail + f"  (n={total_count})"
                             )
                             if use_wandb:
                                 wandb.log(
                                     {
-                                        f"eval/{ds_name}_lm_loss": avg_l,
-                                        f"eval/{ds_name}_acc":     avg_a,
+                                        f"eval/{ds_name}_{k}": agg_sums[k] / total_count
+                                        for k in _eval_keys
                                     },
                                     step=global_step,
                                 )

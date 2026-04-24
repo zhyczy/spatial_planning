@@ -1,8 +1,12 @@
 # `--decouple`: Decoupled XYZ RoPE in the Pass-Through Region
 
+**See also**:
+- [`train_correspondence_algorithms.md`](train_correspondence_algorithms.md) — high-level overview of all training modes
+- [`polar_rope.md`](polar_rope.md) — `--polar` (same decoupled architecture with log-spherical input and θ=1000)
+
 ## 1. Motivation
 
-Earlier modes (`default` 4D M-RoPE, `--polar`, `--relative`) all **modify** Qwen3.5's pretrained `mrope_section` (`[11, 11, 10]` → `[2, 10, 10, 10]`) to inject xyz into the existing 64 rotary dims. This:
+Earlier modes (`default` 4D M-RoPE, `--relative`) all **modify** Qwen3.5's pretrained `mrope_section` (`[11, 11, 10]` → `[2, 10, 10, 10]`) to inject xyz into the existing 64 rotary dims. This:
 
 - Disrupts the pretrained allocation: `t / h / w` bands are repurposed for `t / x / y / z`
 - Forces LoRA to relearn what was already in pretraining
