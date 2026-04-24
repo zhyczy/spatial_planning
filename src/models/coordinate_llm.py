@@ -154,19 +154,52 @@ class CoordinateModel(nn.Module):
         self.coord_weight       = coord_weight
         self.polar              = polar
 
-        # Pre-hook on lm_head to capture last hidden state without
-        # output_hidden_states=True (preserves gradient checkpointing savings).
-        # Only used when skip_layers == [-1].
+        # Capture the probe hidden state via a hook, always. This avoids
+        # `output_hidden_states=True`, which triggers a NaN bug on the
+        # SpaDecTextModel (decouple) path with gradient checkpointing, and it
+        # also preserves gradient-checkpointing memory savings.
+        #
+        # skip_layers[0] ==  -1  →  pre-hook on lm_head input (post-norm).
+        # skip_layers[0] ==  -k  (k>=2) →  forward-hook on language_model
+        #                                  .layers[-(k-1)] output (pre-norm).
+        # In HF convention:
+        #     hidden_states = (embeds, layer0_out, …, layer31_out, post_norm)
+        #     → hidden_states[-k] == layers[-(k-1)].output   for k ≥ 2
         self._lm_head_input: torch.Tensor | None = None
-        only_last = (len(self.skip_layers) == 1 and self.skip_layers[0] == -1)
-        if only_last:
+        k = self.skip_layers[0]
+
+        if k == -1:
             for name, mod in self.spa_model.named_modules():
                 if name.endswith("lm_head"):
                     mod.register_forward_pre_hook(self._capture_lm_input)
                     break
+        else:
+            target_idx = k + 1  # e.g. -8 → -7 (layers[-7].output == hidden_states[-8])
+            if target_idx >= 0:
+                raise ValueError(
+                    f"skip_layers[0]={k} must be negative (and ≤ -1); "
+                    f"got target layer index {target_idx} which is non-negative."
+                )
+            layers = None
+            for name, mod in self.spa_model.named_modules():
+                if name.endswith("language_model.layers") and isinstance(mod, nn.ModuleList):
+                    layers = mod
+                    break
+            if layers is None:
+                raise RuntimeError(
+                    "Could not find language_model.layers on spa_model for "
+                    "the skip_layers forward-hook."
+                )
+            target = layers[target_idx]
+            target.register_forward_hook(self._capture_layer_output)
 
     def _capture_lm_input(self, module, args):
         self._lm_head_input = args[0]
+
+    def _capture_layer_output(self, module, inputs, output):
+        # Decoder-layer forward may return a plain tensor or a tuple whose
+        # first element is the hidden states.
+        self._lm_head_input = output[0] if isinstance(output, tuple) else output
 
     def forward(
         self,
@@ -181,13 +214,18 @@ class CoordinateModel(nn.Module):
         **kwargs,
     ):
         # ── backbone ─────────────────────────────────────────────────────────
-        only_last = (len(self.skip_layers) == 1 and self.skip_layers[0] == -1)
+        # Always use the hook-captured hidden state (set up in __init__):
+        #   skip_layers[0] == -1  →  lm_head pre-hook (post-norm)
+        #   skip_layers[0] == -k  →  layers[-(k-1)] forward-hook (pre-norm)
+        # output_hidden_states=True path is intentionally avoided — it triggers
+        # a NaN bug on the SpaDecTextModel (decouple) + gradient-checkpointing
+        # path, and it would cost activation memory we don't need.
         outputs = self.spa_model(
             input_ids            = input_ids,
             attention_mask       = attention_mask,
             pixel_values         = pixel_values,
             image_grid_thw       = image_grid_thw,
-            output_hidden_states = not only_last,
+            output_hidden_states = False,
             return_dict          = True,
             image_xyz            = image_xyz,
             coord_scale          = coord_scale,
@@ -195,12 +233,7 @@ class CoordinateModel(nn.Module):
             **kwargs,
         )
 
-        # ── hidden states for coord head ───────────────────────────────────
-        if only_last:
-            # Captured by lm_head pre-hook (post-norm last hidden state)
-            hidden_coord = self._lm_head_input
-        else:
-            hidden_coord = outputs.hidden_states[self.skip_layers[0]]
+        hidden_coord = self._lm_head_input
 
         logits = outputs.logits
         del outputs

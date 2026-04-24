@@ -21,7 +21,7 @@ $PY $SCRIPT \
   --data_dir /egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning/datasets/evaluation/MindCube \
   --dataset mindcube \
   --output_dir "$OUT_ROOT/R_sweep_corresp_decouple_mindcube" \
-  --no_coord_head \
+  --no_coord_head --decouple \
   2>&1 | tee "$OUT_ROOT/corresp_decouple_mindcube_run.log"
 echo "=== [$(date)] corresp_decouple MindCube done ==="
 
@@ -31,7 +31,7 @@ $PY $SCRIPT \
   --data_dir /egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning/datasets/evaluation/SAT \
   --dataset sat \
   --output_dir "$OUT_ROOT/R_sweep_corresp_decouple_sat" \
-  --no_coord_head \
+  --no_coord_head --decouple \
   2>&1 | tee "$OUT_ROOT/corresp_decouple_sat_run.log"
 echo "=== [$(date)] corresp_decouple SAT done ==="
 
@@ -41,6 +41,6 @@ $PY $SCRIPT \
   --data_dir /egr/research-actionlab/caizhon2/codes/EQA/3DSPI/spatial_planning/datasets/evaluation/spinbench_data \
   --dataset spinbench \
   --output_dir "$OUT_ROOT/R_sweep_corresp_decouple_spinbench" \
-  --no_coord_head \
+  --no_coord_head --decouple \
   2>&1 | tee "$OUT_ROOT/corresp_decouple_spinbench_run.log"
 echo "=== [$(date)] corresp_decouple SpinBench done ==="

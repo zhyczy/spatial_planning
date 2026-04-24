@@ -110,8 +110,14 @@ def _sweep_one_sample(
     max_new_tokens: int,
     rot_grid: List[Tuple[str, torch.Tensor]],
     device: str,
+    decouple: bool = False,
+    polar: bool = False,
+    zero_xyz: bool = False,
 ) -> List[Dict]:
-    """Run the 22-R sweep on a single sample and return one result dict per R."""
+    """Run the rotation sweep on a single sample and return one result dict per R.
+    If zero_xyz=True, replace per-patch xyz with zeros before every forward pass
+    (ablates the XYZ / 4D M-RoPE channel entirely; under R·0 = 0 the xyz input
+    is invariant to R, so the grid collapses to a single point)."""
     # Tokenize + load xyz ONCE; reuse inputs across all rotations.
     inputs, prompt, image_xyz = prepare_batch_spa(
         item, spa_proc,
@@ -121,6 +127,8 @@ def _sweep_one_sample(
         thinking=False,
         load_xyz=True,         # need xyz for 4D M-RoPE
     )
+    if zero_xyz and image_xyz is not None:
+        image_xyz = [torch.zeros_like(x) for x in image_xyz]
 
     gt_letter = str(item.get("answer", "")).strip().upper()
     model_device = next(spa_model.parameters()).device
@@ -142,7 +150,8 @@ def _sweep_one_sample(
             output = run_inference_spa(
                 inputs, xyz_rot, spa_model, spa_proc,
                 max_new_tokens, coord_scale,
-                vanilla=False, polar=False,
+                vanilla=False, polar=polar,
+                decouple=decouple,
             )
         except Exception as exc:
             output = f"[ERROR] {type(exc).__name__}: {exc}"
@@ -192,6 +201,8 @@ def _worker(
     no_coord_head: bool = False,
     decouple: bool = False,
     polar: bool = False,
+    zero_xyz: bool = False,
+    identity_only: bool = False,
 ) -> None:
     if log_file:
         logging.basicConfig(
@@ -225,6 +236,11 @@ def _worker(
     else:
         coord_head = _load_coord_head(ckpt, device, expect_relative=None)
     rot_grid = build_rotation_grid()
+    if identity_only:
+        rot_grid = rot_grid[:1]   # keep only ("I", eye)
+        logger.info("[R-grid] --identity_only: reduced to 1 R (I)")
+    if zero_xyz:
+        logger.info("[xyz] --zero_xyz: replacing image_xyz with zeros each sample")
 
     all_rows: List[Dict] = []
     desc = f"[cuda:{gpu_label}]"
@@ -234,6 +250,8 @@ def _worker(
                 item, spa_model, spa_proc, coord_head,
                 spatial_merge_size, image_token_id, coord_scale,
                 max_new_tokens, rot_grid, device,
+                decouple=decouple, polar=polar,
+                zero_xyz=zero_xyz,
             )
             all_rows.extend(rows)
         except Exception as exc:
@@ -331,6 +349,12 @@ def main() -> None:
     ap.add_argument("--polar", action="store_true",
                     help="Ckpt was trained with --polar (log-spherical XYZ RoPE, "
                          "theta=1000). Implies decouple architecture.")
+    ap.add_argument("--zero_xyz", action="store_true",
+                    help="Ablation: replace image_xyz with zeros during inference. "
+                         "Tests how much the XYZ / 4D M-RoPE channel contributes to QA.")
+    ap.add_argument("--identity_only", action="store_true",
+                    help="Skip the 22-R sweep; only evaluate under R=I. "
+                         "Useful with --zero_xyz since R·0 = 0.")
     args = ap.parse_args()
     if args.polar:
         args.decouple = True
@@ -408,6 +432,8 @@ def main() -> None:
                 args.no_coord_head,
                 args.decouple,
                 args.polar,
+                args.zero_xyz,
+                args.identity_only,
             ),
         )
         p.start()

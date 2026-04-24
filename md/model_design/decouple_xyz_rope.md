@@ -244,6 +244,154 @@ This is the design's payoff: the model learns cross-image 3D spatial
 relations via the new channel while keeping all of Qwen's text-handling
 capability intact.
 
+## 4.6 Formal RoPE Formulation
+
+### Notation
+
+- $d_h = 256$: per-head dim
+- $d_r = 64$: original Qwen rotary dim
+- $d_x = 66$: new XYZ RoPE dim
+- $d_p = 126$: pure pass-through dim   ($d_h = d_r + d_x + d_p$)
+
+Per-token coordinates:
+- $(t_i, h_i, w_i) \in \mathbb{N}^3$: Qwen M-RoPE position
+  - Text token at seq position $p$: $(t_i, h_i, w_i) = (p, p, p)$
+  - Image patch (row $r$, col $c$ of image $\ell$): $(t_i, h_i, w_i) = (s_\ell,\ s_\ell+r,\ s_\ell+c)$
+- $(x_i, y_i, z_i) \in \mathbb{R}^3$: 3D scene coordinates
+  - Text: $(0, 0, 0)$
+  - Image patch: mean xyz of valid pixels in the LLM patch's source block
+
+### Channel 1 — Qwen 3D M-RoPE (dims 0..63)
+
+Inverse frequencies (Qwen default, $\theta_{\text{Qwen}} = 10^7$):
+
+$$\beta_k = \theta_{\text{Qwen}}^{-2k/d_r},\qquad k = 0, 1, \ldots, 31$$
+
+Band-to-axis assignment (M-RoPE section $[11, 11, 10]$):
+
+$$
+p^{(k)}_i = \begin{cases}
+t_i, & k \in \{0, \ldots, 10\} \\
+h_i, & k \in \{11, \ldots, 21\} \\
+w_i, & k \in \{22, \ldots, 31\}
+\end{cases}
+\qquad
+\phi^{\text{orig}}_{i,k} = p^{(k)}_i \cdot \beta_k
+$$
+
+2D rotation on pair $(k,\ k + 32)$ of Q (same for K):
+
+$$
+\begin{pmatrix} q'_{i,k} \\ q'_{i,k+32} \end{pmatrix}
+=
+\begin{pmatrix} \cos \phi^{\text{orig}}_{i,k} & -\sin \phi^{\text{orig}}_{i,k} \\
+                \sin \phi^{\text{orig}}_{i,k} &  \cos \phi^{\text{orig}}_{i,k} \end{pmatrix}
+\begin{pmatrix} q_{i,k} \\ q_{i,k+32} \end{pmatrix}
+$$
+
+### Channel 2 — New XYZ RoPE (dims 64..129)
+
+Per-axis inverse frequencies (shared across $x$, $y$, $z$), $\theta_{\text{xyz}} = 10^4$, $D_a = 22$:
+
+$$\beta'_m = \theta_{\text{xyz}}^{-2m/D_a},\qquad m = 0, 1, \ldots, 10$$
+
+Band-to-axis assignment (sequential, but all three axes see the same $\beta'$ spectrum):
+
+$$
+\xi^{(k)}_i = \begin{cases}
+x_i, & k \in \{0, \ldots, 10\} \\
+y_i, & k \in \{11, \ldots, 21\} \\
+z_i, & k \in \{22, \ldots, 32\}
+\end{cases}
+\qquad
+m(k) = k \bmod 11
+$$
+
+Rotation angle (with $c = \text{coord\_scale} = 100$):
+
+$$\phi^{\text{xyz}}_{i,k} = c \cdot \xi^{(k)}_i \cdot \beta'_{m(k)}$$
+
+2D rotation on the absolute Q dim pair $(64 + k,\ 97 + k)$ (split-half pairing within the 66-dim slice):
+
+$$
+\begin{pmatrix} q'_{i,\,64+k} \\ q'_{i,\,97+k} \end{pmatrix}
+=
+\begin{pmatrix} \cos \phi^{\text{xyz}}_{i,k} & -\sin \phi^{\text{xyz}}_{i,k} \\
+                \sin \phi^{\text{xyz}}_{i,k} &  \cos \phi^{\text{xyz}}_{i,k} \end{pmatrix}
+\begin{pmatrix} q_{i,\,64+k} \\ q_{i,\,97+k} \end{pmatrix}
+$$
+
+For text tokens, $(x_i, y_i, z_i) = (0, 0, 0)$, so $\phi^{\text{xyz}}_{i,k} = 0$ for all $k$,
+giving $\cos = 1$, $\sin = 0$ — identity rotation on dims 64..129.
+
+### Channel 3 — Pass-through (dims 130..255)
+
+$$q'_{i,d} = q_{i,d},\quad d \in \{130, \ldots, 255\}$$
+
+### Attention score decomposition
+
+After applying both rotations, the Q/K dot product splits additively:
+
+$$
+\langle q'_i,\, k'_j \rangle
+= \underbrace{\sum_{d=0}^{63} q'_{i,d}\, k'_{j,d}}_{\text{Qwen M-RoPE: } \Delta(t,h,w)}
++ \underbrace{\sum_{d=64}^{129} q'_{i,d}\, k'_{j,d}}_{\text{new XYZ RoPE: } \Delta(x,y,z)}
++ \underbrace{\sum_{d=130}^{255} q'_{i,d}\, k'_{j,d}}_{\text{pure content}}
+$$
+
+Each RoPE band's pair-wise contribution reduces (via standard RoPE identity) to a
+function of **phase difference** only:
+
+$$
+q'_{i,k} k'_{j,k} + q'_{i,k+N/2} k'_{j,k+N/2}
+= A_{ij,k}\, \cos(\phi_i - \phi_j) + B_{ij,k}\, \sin(\phi_i - \phi_j)
+$$
+
+where $A_{ij,k},\ B_{ij,k}$ are bilinear in the unrotated $(q_i, k_j)$.
+Thus:
+- Channel 1 encodes $\Delta(t, h, w) = (t_i - t_j,\ h_i - h_j,\ w_i - w_j)$
+- Channel 2 encodes $\Delta(x, y, z) = (x_i - x_j,\ y_i - y_j,\ z_i - z_j)$
+
+The two channels are mathematically **orthogonal** — they share no dims.
+
+### Text-text invariance (formal)
+
+For any two text tokens $i, j$: $(x_i, y_i, z_i) = (x_j, y_j, z_j) = (0, 0, 0)$,
+so $\phi^{\text{xyz}}_{i,k} - \phi^{\text{xyz}}_{j,k} = 0$ for all $k$. The XYZ channel becomes:
+
+$$
+\sum_{d=64}^{129} q'_{i,d}\, k'_{j,d} \;=\; \sum_{d=64}^{129} q_{i,d}\, k_{j,d}
+\qquad (\text{un-rotated content dot-product})
+$$
+
+Combining with the identical Channel 1 (since $t=h=w=p$ for text, and $\beta_k$ unchanged):
+
+$$
+\langle q'_i,\, k'_j \rangle_{\text{decouple}}
+\;=\;
+\langle q'_i,\, k'_j \rangle_{\text{Qwen}}
+\;+\; \underbrace{\sum_{d=64}^{129} q_{i,d}\, k_{j,d}}_{\text{extra content channel}}
+$$
+
+The added term is **position-independent**, so text-text relative attention
+patterns are exactly preserved — the model just has 66 more content-only
+dims for text reasoning.
+
+### Relative-phase form (why only $\Delta$ matters)
+
+Letting $p_i = p^{(k)}_i,\ p_j = p^{(k)}_j$ (or their xyz equivalent), the rotated-pair dot product:
+
+$$
+q'_{i,k} k'_{j,k} + q'_{i,k+N/2} k'_{j,k+N/2}
+\;=\;
+\operatorname{Re}\Big( (q_{i,k} + i\, q_{i,k+N/2})\, \overline{(k_{j,k} + i\, k_{j,k+N/2})}\cdot e^{i\, \beta_k (p_i - p_j)} \Big)
+$$
+
+The attention score depends on position only through $(p_i - p_j)$ — the defining
+property of RoPE. In our case this means Channel 2 contributes a signal that
+depends purely on $(\xi^{(k)}_i - \xi^{(k)}_j) \cdot \beta'_{m(k)}$ — the xyz
+separation of the two patches, scaled by the band's frequency.
+
 ## 5. Mutual Exclusivity
 
 `--decouple` is mutually exclusive with `--vanilla`, `--polar`, `--relative`:

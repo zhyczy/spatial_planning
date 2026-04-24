@@ -548,6 +548,10 @@ class SpaDecModel(Qwen3_5Model):
     ):
         # Compute per-token xyz BEFORE the parent forward (which calls
         # self.language_model.forward, which reads _xyz_pos / _coord_scale).
+        # When mm_token_type_ids is None (generate() loop: HF doesn't forward
+        # custom kwargs through prepare_inputs_for_generation), leave _xyz_pos
+        # as-is so a caller-set prefill tensor is preserved; SpaDecTextModel
+        # falls back to zeros when the cached shape doesn't match seq_len.
         if input_ids is not None and mm_token_type_ids is not None:
             self.language_model._xyz_pos = self._compute_xyz_pos(
                 input_ids         = input_ids,
@@ -556,8 +560,6 @@ class SpaDecModel(Qwen3_5Model):
                 attention_mask    = attention_mask,
                 image_xyz         = image_xyz,
             )
-        else:
-            self.language_model._xyz_pos = None
         self.language_model._coord_scale = float(coord_scale)
         self.language_model._polar       = bool(polar)
 

@@ -1177,6 +1177,7 @@ def run_inference_spa(
     coord_scale: float = 100.0,
     vanilla: bool = False,
     polar: bool = False,
+    decouple: bool = False,
 ) -> str:
     """Run generation with SPA model (or stock Qwen3.5 for vanilla ablation).
 
@@ -1200,6 +1201,37 @@ def run_inference_spa(
             do_sample=False,
             pad_token_id=processor.tokenizer.eos_token_id,
         )
+    elif decouple:
+        # Decouple: original 3D M-RoPE is untouched (HF handles position_ids).
+        # XYZ feeds a new RoPE in pass-through dims via SpaDecTextModel, which
+        # reads language_model._xyz_pos.  HF's generate() strips non-standard
+        # kwargs (mm_token_type_ids, image_xyz) via _validate_model_kwargs, so
+        # pre-compute xyz_pos and stash it on the language_model; the patched
+        # SpaDecModel.forward leaves it intact when mm_token_type_ids=None.
+        xyz_on_device = None
+        if image_xyz is not None:
+            xyz_on_device = [xyz.to(device) for xyz in image_xyz]
+
+        with torch.no_grad():
+            xyz_pos = model.model._compute_xyz_pos(
+                input_ids         = inputs_dev["input_ids"],
+                mm_token_type_ids = inputs_dev["mm_token_type_ids"],
+                image_grid_thw    = inputs_dev.get("image_grid_thw"),
+                attention_mask    = inputs_dev.get("attention_mask"),
+                image_xyz         = xyz_on_device,
+            )
+        model.model.language_model._xyz_pos     = xyz_pos
+        model.model.language_model._coord_scale = float(coord_scale)
+        model.model.language_model._polar       = bool(polar)
+
+        gen_kwargs: Dict[str, Any] = dict(
+            **inputs_dev,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=processor.tokenizer.eos_token_id,
+        )
+        # HF rejects these: prefill already consumed them into _xyz_pos.
+        gen_kwargs.pop("mm_token_type_ids", None)
     else:
         # Move image_xyz to device
         xyz_on_device = None
