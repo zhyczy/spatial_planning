@@ -56,7 +56,13 @@ from peft import LoraConfig, TaskType, get_peft_model
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
-from src.models import DepthPredictionTransformer, CoordinateModel, SpaForConditionalGeneration
+from src.models import (
+    DepthPredictionTransformer,
+    CoordinateModel,
+    SpaForConditionalGeneration,
+    SpaDecForConditionalGeneration,
+    patch_attention_layers_dec,
+)
 from src.dataset import MindCube_Train_Dataset_Coord, MindCube_Train_Dataset_Coord_Polar, Eval_Dataset_Coord, xyz_to_polar
 
 logging.basicConfig(
@@ -96,6 +102,7 @@ def build_model(
     coord_weight:       float = 1.0,
     polar:              bool  = False,
     full_rotary:        bool  = False,
+    decouple:           bool  = False,
 ) -> CoordinateModel:
     """
     Build CoordinateModel with LM + coordinate supervision.
@@ -105,36 +112,69 @@ def build_model(
     head_dim dimension gets RoPE (vs. default 0.25 where 75% of dims bypass).
     This quadruples the number of RoPE freq bands (32 → 128 for head_dim=256)
     so the mrope_section is rebuilt to sum = head_dim // 2.
-    """
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    if full_rotary:
-        # Enable full rotary: every head_dim dim gets RoPE. Breaks pretraining
-        # convention of 75% content-only dims; relies on LoRA to adapt.
-        config.text_config.rope_scaling["partial_rotary_factor"] = 1.0
-        if hasattr(config.text_config, "rope_parameters") and config.text_config.rope_parameters is not None:
-            config.text_config.rope_parameters["partial_rotary_factor"] = 1.0
-        total = int(config.text_config.head_dim) // 2  # 128
-        # Match Qwen's original t=11 allocation; split remainder evenly across x/y/z.
-        t_size = 11
-    else:
-        orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
-        total = sum(orig_section)  # 32
-        t_size = 2
-    xyz_size = (total - t_size) // 3
-    new_section = [t_size, xyz_size, xyz_size, xyz_size]
-    config.text_config.rope_scaling["mrope_section"] = new_section
-    log.info(
-        f"mrope_section -> {new_section}  sum={sum(new_section)}  "
-        f"(4D M-RoPE: {t_size} for t, {xyz_size} each for x/y/z; "
-        f"partial_rotary={'1.0 (full)' if full_rotary else '0.25 (default)'})"
-    )
 
-    spa = SpaForConditionalGeneration.from_pretrained(
-        model_path,
-        config              = config,
-        torch_dtype         = torch.bfloat16,
-        attn_implementation = "sdpa",
-    )
+    If ``decouple`` is True, mirrors train_correspondence.py --decouple:
+    keep Qwen original 3D M-RoPE [11,11,10] in the rotary 64 dims (UNCHANGED)
+    and add a new XYZ RoPE (66 dims, Cartesian xyz, rope_theta=10000) in
+    pass-through dims 64..129. Text tokens get xyz=(0,0,0) → identity rotation.
+    Mutually exclusive with --polar and --full.
+    """
+    if decouple and polar:
+        raise ValueError("--decouple and --polar are mutually exclusive.")
+    if decouple and full_rotary:
+        raise ValueError(
+            "--decouple and --full are mutually exclusive (decouple keeps "
+            "partial_rotary_factor=0.25 and adds XYZ RoPE in the pass-through "
+            "region; --full forces partial_rotary_factor=1.0)."
+        )
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+    if decouple:
+        # Keep Qwen's original 3D M-RoPE [11,11,10] and partial_rotary=0.25
+        # completely untouched; the XYZ RoPE lives in the pass-through 66 dims
+        # via SpaDecForConditionalGeneration + patch_attention_layers_dec.
+        orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
+        log.info(
+            f"mrope_section: {orig_section} (UNCHANGED — Qwen original 3D M-RoPE) "
+            f"+ new XYZ RoPE (66 dims, rope_theta=10000) in pass-through region "
+            f"[input: Cartesian (x, y, z)]"
+        )
+        spa = SpaDecForConditionalGeneration.from_pretrained(
+            model_path,
+            config              = config,
+            torch_dtype         = torch.bfloat16,
+            attn_implementation = "sdpa",
+        )
+    else:
+        if full_rotary:
+            # Enable full rotary: every head_dim dim gets RoPE. Breaks pretraining
+            # convention of 75% content-only dims; relies on LoRA to adapt.
+            config.text_config.rope_scaling["partial_rotary_factor"] = 1.0
+            if hasattr(config.text_config, "rope_parameters") and config.text_config.rope_parameters is not None:
+                config.text_config.rope_parameters["partial_rotary_factor"] = 1.0
+            total = int(config.text_config.head_dim) // 2  # 128
+            # Match Qwen's original t=11 allocation; split remainder evenly across x/y/z.
+            t_size = 11
+        else:
+            orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
+            total = sum(orig_section)  # 32
+            t_size = 2
+        xyz_size = (total - t_size) // 3
+        new_section = [t_size, xyz_size, xyz_size, xyz_size]
+        config.text_config.rope_scaling["mrope_section"] = new_section
+        log.info(
+            f"mrope_section -> {new_section}  sum={sum(new_section)}  "
+            f"(4D M-RoPE: {t_size} for t, {xyz_size} each for x/y/z; "
+            f"partial_rotary={'1.0 (full)' if full_rotary else '0.25 (default)'})"
+        )
+
+        spa = SpaForConditionalGeneration.from_pretrained(
+            model_path,
+            config              = config,
+            torch_dtype         = torch.bfloat16,
+            attn_implementation = "sdpa",
+        )
 
     if freeze_vision:
         for p in spa.model.visual.parameters():
@@ -154,6 +194,12 @@ def build_model(
     )
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
+
+    # Patch attention layers for decouple mode (after LoRA) so each self_attn
+    # sees the XYZ RoPE frequencies in the pass-through 66 dims.
+    if decouple:
+        n = patch_attention_layers_dec(spa)
+        log.info(f"Wrapped {n} attention layers with SpaDecAttentionWrapper.")
 
     # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
     spa.gradient_checkpointing_enable(
@@ -242,11 +288,21 @@ def train(args: argparse.Namespace) -> None:
         coord_weight       = args.coord_weight,
         polar              = args.polar,
         full_rotary        = args.full,
+        decouple           = args.decouple,
     )
     log.info("Using CoordinateModel (camera transform prediction removed)")
 
-    # Toggle visual-interleave RoPE layout (t at high-freq end, x/y/z round-robin)
-    if args.interleave_vision:
+    # Toggle visual-interleave RoPE layout (t at high-freq end, x/y/z round-robin).
+    # Only meaningful for the 4D M-RoPE path; has no effect with --decouple
+    # (which keeps Qwen's original 3D M-RoPE in the rotary region and puts
+    # XYZ RoPE in pass-through — both already symmetric).
+    if args.interleave_vision and args.decouple:
+        log.warning(
+            "--interleave_vision has no effect with --decouple "
+            "(Qwen original 3D M-RoPE in rotary region; XYZ RoPE in pass-through "
+            "has its own symmetric spectrum)."
+        )
+    elif args.interleave_vision:
         # PEFT-wrapped path: model.spa_model.model.model.language_model.rotary_emb
         # Fall back to shallower paths if structure differs.
         _rotary = None
@@ -763,6 +819,17 @@ def parse_args() -> argparse.Namespace:
              "(e.g. 32 -> 128 for head_dim=256, giving [2, 42, 42, 42]). "
              "Breaks Qwen's pretrained content/position split; only LoRA can "
              "adapt. Use with caution — expect degraded LM loss initially.",
+    )
+    p.add_argument(
+        "--decouple",
+        action="store_true",
+        help="Decoupled position embedding (mirrors train_correspondence.py "
+             "--decouple): keep Qwen original 3D M-RoPE [11,11,10] in the "
+             "rotary 64 dims (UNCHANGED) and add a NEW XYZ RoPE (66 dims, "
+             "sequential x|y|z each 11 bands, rope_theta=10000) in pass-through "
+             "dims 64..129, fed with Cartesian xyz. Text tokens default to "
+             "xyz=(0,0,0) → identity rotation. Mutually exclusive with "
+             "--polar / --full.",
     )
     # -- WandB -----------------------------------------------------------------
     p.add_argument("--wandb_project",  default="", help="WandB project name.")

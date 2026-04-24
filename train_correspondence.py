@@ -57,7 +57,9 @@ from src.models import (
     AnswerRelativeModel,
     SpaForConditionalGeneration,
     SpaRelativeForConditionalGeneration,
+    SpaDecForConditionalGeneration,
     patch_attention_layers,
+    patch_attention_layers_dec,
 )
 from src.dataset import (
     MindCube_Train_Dataset,
@@ -104,21 +106,53 @@ def build_model(
     vanilla:       bool = False,
     polar:         bool = False,
     relative:      bool = False,
+    decouple:      bool = False,
 ) -> nn.Module:
     """
     Load backbone, patch M-RoPE, apply LoRA, return an answer model.
 
     vanilla=False  → 4D M-RoPE (t, x, y, z) with image_xyz spatial embedding
     vanilla=True   → original 3D M-RoPE, no image_xyz
-    polar=True     → convert (x, y, z) → spherical (ρ, θ, α) for vision-token RoPE
-                     (only effective when vanilla=False)
+    polar=True     → use the decouple architecture (Qwen 3D M-RoPE in the
+                     rotary 64 dims + new XYZ RoPE in pass-through dims
+                     64..129) BUT feed log-spherical (log r, θ, α) into the
+                     XYZ RoPE. Matches xyz_to_polar convention:
+                         log r = log||xyz||,
+                         θ     = atan2(y, x) ∈ [-π, π],
+                         α     = atan2(√(x²+y²), z) ∈ [0, π].
+                     Text tokens stay xyz=(0,0,0) → identity rotation.
+                     Mutually exclusive with --vanilla and --decouple.
     relative=True  → per-query-frame coordinate transform (SpaRelativeForConditionalGeneration);
                      dataset must return image_xyz_relative instead of image_xyz;
                      incompatible with vanilla; defaults to polar coordinates
+    decouple=True  → keep Qwen original 3D M-RoPE [11,11,10] in the rotary 64
+                     dims (UNCHANGED) and add a NEW XYZ RoPE in dims 64..129
+                     (66 dims, sequential x|y|z, rope_theta=10000) with
+                     **Cartesian** xyz. Text tokens get xyz=(0,0,0). For
+                     log-spherical input, use --polar (which is mutually
+                     exclusive with --decouple). Mutually exclusive with
+                     --vanilla / --relative / --polar.
     """
     if relative and vanilla:
         raise ValueError("--relative and --vanilla are mutually exclusive.")
+    if polar and vanilla:
+        raise ValueError("--polar and --vanilla are mutually exclusive.")
+    if decouple and (vanilla or relative):
+        raise ValueError(
+            "--decouple is mutually exclusive with --vanilla / --relative."
+        )
+    if polar and decouple:
+        raise ValueError(
+            "--polar already implies the decouple architecture (with log-spherical "
+            "XYZ RoPE); don't combine it with --decouple. Use --polar alone for "
+            "log-spherical or --decouple alone for Cartesian."
+        )
 
+    # --polar implies the decouple architecture with log-spherical XYZ RoPE in
+    # the pass-through region. --decouple alone uses Cartesian xyz. The two
+    # are mutually exclusive.
+    use_decouple = decouple or polar
+    polar_xyz    = polar
     effective_polar = polar or relative
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
@@ -133,6 +167,45 @@ def build_model(
             torch_dtype        = torch.bfloat16,
             attn_implementation= "sdpa",
         )
+    elif use_decouple:
+        # ── decouple: keep Qwen original 3D M-RoPE in the rotary 64 dims,
+        #             add new XYZ RoPE in pass-through dims 64..129.
+        # If polar_xyz=True (triggered by --polar), the XYZ RoPE consumes
+        # log-spherical (log r, θ, α) instead of raw Cartesian xyz. ──────────
+        # Theta choice:
+        #   decouple + Cartesian (--decouple): θ = 10000 — wider spectrum for
+        #       raw meters (wavelength 6.3..29K ≈ covers 0.06m..300m at scale=100).
+        #   decouple + log-spherical (--polar): θ = 1000 — narrower spectrum;
+        #       polar's effective dynamic range (log r ≈ O(1-3), angles ≤ 2π) is
+        #       smaller, so a tighter ladder keeps more of the 11 bands in the
+        #       useful region.
+        _xyz_theta = 1000.0 if polar_xyz else 10000.0
+        _mode = "log-spherical (log r, θ, α)" if polar_xyz else "Cartesian (x, y, z)"
+        log.info(
+            f"mrope_section: {orig_section} (UNCHANGED — Qwen original 3D M-RoPE) "
+            f"+ new XYZ RoPE (66 dims, rope_theta={_xyz_theta:g}) in pass-through region "
+            f"[input: {_mode}]"
+        )
+        spa = SpaDecForConditionalGeneration.from_pretrained(
+            model_path,
+            config             = config,
+            torch_dtype        = torch.bfloat16,
+            attn_implementation= "sdpa",
+        )
+        # Swap in the right theta for this mode. xyz_rotary_emb is not a
+        # trainable module (no params, only an inv_freq buffer), so replacing
+        # it post-from_pretrained is safe and happens before LoRA wrapping.
+        if _xyz_theta != 10000.0:
+            from src.models.spa_emb_dec import SpaXYZRotaryEmbedding
+            _lm = spa.model.language_model
+            _old = _lm.xyz_rotary_emb
+            _new = SpaXYZRotaryEmbedding(
+                xyz_dim             = _old.xyz_dim,
+                rope_theta          = _xyz_theta,
+                default_coord_scale = _old.default_coord_scale,
+            )
+            _lm.xyz_rotary_emb = _new.to(next(_lm.parameters()).device)
+            log.info(f"[XYZ RoPE] theta swapped to {_xyz_theta:g} for polar mode")
     else:
         # ── 4D M-RoPE ────────────────────────────────────────────────────────
         total = sum(orig_section)                       # e.g. 32
@@ -177,6 +250,11 @@ def build_model(
         n = patch_attention_layers(spa)
         log.info(f"Wrapped {n} attention layers with SpaRelativeAttentionWrapper.")
 
+    # ── patch attention layers for decouple mode (after LoRA) ────────────────
+    if use_decouple:
+        n = patch_attention_layers_dec(spa)
+        log.info(f"Wrapped {n} attention layers with SpaDecAttentionWrapper.")
+
     # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
     spa.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -189,15 +267,29 @@ def build_model(
         lm.gradient_checkpointing = True
         log.info("Manually set gradient_checkpointing=True on language_model")
 
+    # All modes use the same coord_scale = 100 convention
+    # (4D / polar: cm-equivalent for M-RoPE position; decouple: cm-equivalent for
+    # the pass-through XYZ RoPE → wavelength range 0.063m .. 272m at θ=10000)
+    _coord_scale = 100.0
+
     if relative:
         log.info(
-            f"AnswerRelativeModel (per-query-frame relative coords, polar={effective_polar})"
+            f"AnswerRelativeModel (per-query-frame relative coords, polar={effective_polar}, "
+            f"coord_scale={_coord_scale})"
         )
-        return AnswerRelativeModel(spa, polar=effective_polar)
+        return AnswerRelativeModel(spa, polar=effective_polar, coord_scale=_coord_scale)
 
     use_xyz = not vanilla
-    log.info(f"AnswerOnlyModel (use_xyz={use_xyz}, polar={effective_polar and use_xyz})")
-    return AnswerOnlyModel(spa, use_xyz=use_xyz, polar=effective_polar and use_xyz)
+    log.info(
+        f"AnswerOnlyModel (use_xyz={use_xyz}, polar={effective_polar and use_xyz}, "
+        f"decouple={use_decouple}, coord_scale={_coord_scale})"
+    )
+    return AnswerOnlyModel(
+        spa,
+        use_xyz     = use_xyz,
+        polar       = effective_polar and use_xyz,
+        coord_scale = _coord_scale,
+    )
 
 
 # ── training loop ─────────────────────────────────────────────────────────────
@@ -234,7 +326,36 @@ def train(args: argparse.Namespace) -> None:
         vanilla        = args.vanilla,
         polar          = args.polar,
         relative       = args.relative,
+        decouple       = args.decouple,
     )
+
+    # Toggle visual-interleave RoPE layout (t at high-freq end, x/y/z round-robin).
+    # Only meaningful for the 4D M-RoPE path. --polar and --decouple both use
+    # the Qwen original 3D M-RoPE in the rotary 64 dims (plus a separate XYZ
+    # RoPE in pass-through), so interleave has no effect there.
+    _uses_4d_mrope = not (args.vanilla or args.decouple or args.polar)
+    if args.interleave_vision and _uses_4d_mrope:
+        _rotary = None
+        for _name, _mod in model.spa_model.named_modules():
+            if _name.endswith("language_model.rotary_emb"):
+                _rotary = _mod
+                break
+        if _rotary is None:
+            raise RuntimeError("Could not find language_model.rotary_emb on spa_model")
+        _rotary.visual_interleave = True
+        rank0_print(
+            "[RoPE] visual_interleave=True: t at high-freq end (bands 0..s0-1), "
+            "x/y/z round-robin through remaining bands."
+        )
+    elif args.interleave_vision and args.vanilla:
+        log.warning("--interleave_vision has no effect with --vanilla (3D M-RoPE).")
+    elif args.interleave_vision and (args.decouple or args.polar):
+        log.warning(
+            "--interleave_vision has no effect with --decouple / --polar "
+            "(Qwen original 3D M-RoPE in rotary region; XYZ RoPE in pass-through "
+            "has its own symmetric spectrum)."
+        )
+
     model = model.to(device)
 
     # ── resolve spatial_merge_size from vision config ─────────────────────────
@@ -508,7 +629,8 @@ def train(args: argparse.Namespace) -> None:
                         if ds_name in test_samplers and test_samplers[ds_name] is not None:
                             test_samplers[ds_name].set_epoch(global_step)
                         local_loss_sum = 0.0
-                        local_count = 0
+                        local_acc_sum  = 0.0
+                        local_count    = 0
                         for test_batch in loader:
                             t_ids   = test_batch["input_ids"].to(device)
                             t_mask  = test_batch["attention_mask"].to(device)
@@ -538,6 +660,16 @@ def train(args: argparse.Namespace) -> None:
                                         ignore_index=-100,
                                     )
                                     local_loss_sum += lm_loss.item()
+
+                                    # Top-1 accuracy on first answer token
+                                    # (matches coordinate_llm.py convention).
+                                    _mask  = shift_labels[0] != -100
+                                    _sl_m  = shift_logits[0, _mask]
+                                    _sb_m  = shift_labels[0, _mask]
+                                    if _sl_m.numel() > 0:
+                                        _pred = _sl_m[0].argmax(-1).item()
+                                        _tgt  = int(_sb_m[0].item())
+                                        local_acc_sum += 1.0 if _pred == _tgt else 0.0
                                     local_count += 1
                             except Exception as exc:
                                 log.debug(f"Eval skip ({ds_name}): {exc}")
@@ -546,26 +678,33 @@ def train(args: argparse.Namespace) -> None:
                         # Aggregate across all ranks
                         if world_size > 1:
                             stats = torch.tensor(
-                                [local_loss_sum, local_count],
+                                [local_loss_sum, local_acc_sum, local_count],
                                 dtype=torch.float64, device=device,
                             )
                             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                            total_loss = stats[0].item()
-                            total_count = int(stats[1].item())
+                            total_loss  = stats[0].item()
+                            total_acc   = stats[1].item()
+                            total_count = int(stats[2].item())
                         else:
-                            total_loss = local_loss_sum
+                            total_loss  = local_loss_sum
+                            total_acc   = local_acc_sum
                             total_count = local_count
 
                         if total_count > 0 and local_rank == 0:
-                            avg = total_loss / total_count
+                            avg_loss = total_loss / total_count
+                            avg_acc  = total_acc  / total_count
                             log.info(
                                 f"[eval] global_step={global_step:05d}  "
-                                f"{ds_name}_lm_loss={avg:.4f}  "
+                                f"{ds_name}_lm_loss={avg_loss:.4f}  "
+                                f"{ds_name}_acc={avg_acc:.4f}  "
                                 f"(n={total_count} samples, aggregated across {world_size} GPU{'s' if world_size > 1 else ''})"
                             )
                             if use_wandb:
                                 wandb.log(
-                                    {f"eval/{ds_name}_lm_loss": avg},
+                                    {
+                                        f"eval/{ds_name}_lm_loss": avg_loss,
+                                        f"eval/{ds_name}_acc":     avg_acc,
+                                    },
                                     step=global_step,
                                 )
 
@@ -666,10 +805,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--polar",
         action="store_true",
-        help="Convert per-patch Cartesian (x, y, z) → spherical (ρ, θ, α) for the "
-             "4D M-RoPE vision-token position embedding. "
-             "ρ=||xyz||, θ∈[0,π] (polar), α∈[-π,π] (azimuthal). "
+        help="Convert per-patch Cartesian (x, y, z) → log-spherical (log ρ, θ, α) "
+             "for the 4D M-RoPE vision-token position embedding. "
+             "log ρ = log||xyz|| (scale-invariant; RoPE pos-diff = log(ρ_i/ρ_j)), "
+             "θ = atan2(y,x) ∈ [-π,π] (azimuth), "
+             "α = atan2(√(x²+y²), z) ∈ [0,π] (inclination). "
+             "Matches train_coordinate.py polar convention. "
              "No effect when --vanilla is set. In --relative mode, polar is on by default.",
+    )
+    p.add_argument(
+        "--interleave_vision",
+        action="store_true",
+        help="Use interleaved M-RoPE layout for visual tokens: t keeps its "
+             "mrope_section[0] bands at the high-freq end, then x/y/z round-robin "
+             "through the remaining bands so each spans the full freq range. "
+             "Independent of --polar; combinable with --polar / --relative. "
+             "No effect when --vanilla or --decouple is set.",
+    )
+    p.add_argument(
+        "--decouple",
+        action="store_true",
+        help="Decoupled position embedding: keep Qwen original 3D M-RoPE [11,11,10] "
+             "in the rotary 64 dims (UNCHANGED) and add a NEW XYZ RoPE (66 dims, "
+             "sequential x|y|z each 11 bands, rope_theta=1000) in pass-through "
+             "dims 64..129. Text tokens default to xyz=(0,0,0) → identity rotation. "
+             "Mutually exclusive with --vanilla / --polar / --relative.",
     )
     # ── WandB ─────────────────────────────────────────────────────────────────
     p.add_argument(

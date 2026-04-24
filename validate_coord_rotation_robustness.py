@@ -189,6 +189,9 @@ def _worker(
     max_new_tokens: int,
     output_dir: str,
     log_file: Optional[str],
+    no_coord_head: bool = False,
+    decouple: bool = False,
+    polar: bool = False,
 ) -> None:
     if log_file:
         logging.basicConfig(
@@ -208,6 +211,7 @@ def _worker(
     # Load SPA model + coord head ONCE per worker
     spa_model, spa_proc = load_spa_model(
         model_path, ckpt, device, vanilla=False,
+        decouple=decouple, polar=polar,
     )
     cfg_path = Path(model_path) / "config.json"
     with open(cfg_path) as f:
@@ -215,7 +219,11 @@ def _worker(
     spatial_merge_size = int(_vcfg.get("spatial_merge_size", 2))
 
     image_token_id = spa_proc.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-    coord_head = _load_coord_head(ckpt, device, expect_relative=None)
+    if no_coord_head:
+        coord_head = None
+        logger.info("[coord_head] skipped (--no_coord_head) — QA-only run")
+    else:
+        coord_head = _load_coord_head(ckpt, device, expect_relative=None)
     rot_grid = build_rotation_grid()
 
     all_rows: List[Dict] = []
@@ -313,7 +321,19 @@ def main() -> None:
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--output_dir", default=None,
                     help="Default: <ckpt>/R_sweep/")
+    ap.add_argument("--no_coord_head", action="store_true",
+                    help="Skip coord_head loading; only report QA accuracy "
+                         "(use when ckpt has no coord_head.pt/dpt_head.pt).")
+    ap.add_argument("--decouple", action="store_true",
+                    help="Ckpt was trained with train_correspondence.py --decouple: "
+                         "keep original 3D M-RoPE in rotary 64 dims, add XYZ RoPE "
+                         "in pass-through dims 64..129.")
+    ap.add_argument("--polar", action="store_true",
+                    help="Ckpt was trained with --polar (log-spherical XYZ RoPE, "
+                         "theta=1000). Implies decouple architecture.")
     args = ap.parse_args()
+    if args.polar:
+        args.decouple = True
 
     ckpt_dir = Path(args.ckpt).resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir \
@@ -385,6 +405,9 @@ def main() -> None:
                 args.max_new_tokens,
                 str(output_dir),
                 str(log_file),
+                args.no_coord_head,
+                args.decouple,
+                args.polar,
             ),
         )
         p.start()

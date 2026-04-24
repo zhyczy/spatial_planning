@@ -7,11 +7,17 @@
 #   - Per-patch 3D coordinate loss (coord head reads vision-token hidden states)
 #
 # Usage:
-#   bash scripts/train_coordinate.sh [num_gpus] [--polar] [--skip_layers LAYER] [--max_samples N] [--coord_scale_xyz SX SY SZ]
+#   bash scripts/train_coordinate.sh [num_gpus] [--polar] [--decouple] [--skip_layers LAYER] [--max_samples N] [--coord_scale_xyz SX SY SZ]
 #
 #   num_gpus            — first positional arg, number of GPUs (default: all)
 #   --polar             — use log-spherical (log r, θ=azimuth, α=inclination)
 #                         for both coord-loss target and visual-token 4D M-RoPE
+#   --decouple          — decoupled position embedding: Qwen original 3D M-RoPE
+#                         [11,11,10] in rotary 64 dims (UNCHANGED) + new XYZ
+#                         RoPE (66 dims, Cartesian, rope_theta=10000) in
+#                         pass-through dims 64..129. Mirrors
+#                         train_correspondence.py --decouple. Mutually
+#                         exclusive with --polar / --full.
 #   --skip_layers LAYER — layer for coord head (default: -1 = last layer)
 #                         -1 = Layer 32 (post-norm), -2 = Layer 31, etc.
 #   --max_samples N     — truncate dataset to N entries (default: all)
@@ -24,6 +30,7 @@
 #                         through the remaining bands so each spans the full
 #                         freq range. Makes x/y/z symmetric under a single
 #                         scalar scale (no need for per-axis scaling).
+#                         No effect with --decouple.
 #   --full              — force partial_rotary_factor=1.0 so every head_dim
 #                         dimension gets RoPE (vs. default 0.25). Rebuilds
 #                         mrope_section to sum=head_dim//2 (32 -> 128 for
@@ -57,12 +64,15 @@ SKIP_LAYERS_ARG=""
 COORD_SCALE_XYZ_ARG=""
 INTERLEAVE_FLAG=""
 FULL_FLAG=""
+DECOUPLE_FLAG=""
 _positional=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --polar)
             POLAR_FLAG="--polar"; shift ;;
+        --decouple)
+            DECOUPLE_FLAG="--decouple"; shift ;;
         --skip_layers)
             SKIP_LAYERS_ARG="$2"; shift 2 ;;
         --max_samples)
@@ -136,9 +146,10 @@ SKIP_LAYERS_DISPLAY="$(layer_name "$SKIP_LAYERS")"
 SKIP_LAYERS_FLAG="--skip_layers ${SKIP_LAYERS}"
 
 _polar_suffix="${POLAR_FLAG:+_polar}"
+_decouple_suffix="${DECOUPLE_FLAG:+_decouple}"
 
-RUN_NAME="coordinate_mindcube${_polar_suffix}"
-WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}${_polar_suffix}"
+RUN_NAME="coordinate_mindcube${_polar_suffix}${_decouple_suffix}"
+WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}${_polar_suffix}${_decouple_suffix}"
 
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
@@ -155,6 +166,7 @@ echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] Polar coord GT       = ${POLAR_FLAG:-disabled}"
+echo "[INFO] Decouple XYZ RoPE    = ${DECOUPLE_FLAG:-disabled}"
 echo "[INFO] Coord scale xyz      = ${COORD_SCALE_XYZ_ARG:-default scalar 100}"
 echo "[INFO] Interleave vision    = ${INTERLEAVE_FLAG:-disabled (sequential)}"
 echo "[INFO] Full rotary          = ${FULL_FLAG:-disabled (partial=0.25)}"
@@ -201,6 +213,7 @@ $TORCHRUN \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
     $SKIP_LAYERS_FLAG                                  \
     $POLAR_FLAG                                        \
+    $DECOUPLE_FLAG                                     \
     $COORD_SCALE_XYZ_ARG                               \
     $INTERLEAVE_FLAG                                   \
     $FULL_FLAG                                         \

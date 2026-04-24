@@ -6,6 +6,12 @@ from .spa_emb_relative import (
     SpaRelativeAttentionWrapper,
     patch_attention_layers,
 )
+from .spa_emb_dec import (
+    SpaDecForConditionalGeneration,
+    SpaDecAttentionWrapper,
+    SpaXYZRotaryEmbedding,
+    patch_attention_layers_dec,
+)
 from .coordinate_llm import (
     DepthPredictionTransformer,
     CoordinateModel,

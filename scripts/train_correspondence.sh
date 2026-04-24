@@ -10,21 +10,35 @@
 # Pass --relative to enable per-query-frame coordinate transforms.
 #
 # Usage:
-#   bash scripts/train_correspondence.sh [num_gpus] [--polar] [--vanilla] [--relative] [--max_samples N]
+#   bash scripts/train_correspondence.sh [num_gpus] [--polar] [--vanilla] [--relative] [--decouple] [--interleave_vision] [--max_samples N]
 #
-#   num_gpus        — first positional arg, number of GPUs (default: all)
-#   --polar         — convert per-patch xyz → spherical (ρ,θ,α) for M-RoPE; default: off
-#   --vanilla       — use original Qwen 3D M-RoPE (no image_xyz); disables --polar/--relative
-#   --relative      — per-query-frame coord transform: Q from frame f sees all K in frame-f coords
-#   --max_samples N — truncate dataset to N entries (default: all)
+#   num_gpus            — first positional arg, number of GPUs (default: all)
+#   --polar             — use the decouple architecture (Qwen 3D M-RoPE in
+#                         rotary 64 + new XYZ RoPE in pass-through 64..129)
+#                         BUT feed log-spherical (log r, θ=atan2(y,x),
+#                         α=atan2(√(x²+y²),z)) into the XYZ RoPE. Mutually
+#                         exclusive with --vanilla and --decouple.
+#   --vanilla           — use original Qwen 3D M-RoPE (no image_xyz);
+#                         disables --polar / --relative / --interleave_vision / --decouple
+#   --relative          — per-query-frame coord transform: Q from frame f sees all K in frame-f coords
+#   --decouple          — Qwen 3D M-RoPE [11,11,10] in rotary 64 (UNCHANGED)
+#                         + new XYZ RoPE in pass-through dims 64..129 with
+#                         **Cartesian** xyz. For log-spherical input, use
+#                         --polar instead. Mutually exclusive with --vanilla
+#                         / --relative / --polar.
+#   --interleave_vision — interleaved visual M-RoPE: t at high-freq end, x/y/z round-robin
+#                         (only meaningful for the 4D M-RoPE path; no effect
+#                         with --vanilla / --decouple / --polar)
+#   --max_samples N     — truncate dataset to N entries (default: all)
 #
 # Examples:
-#   bash scripts/train_correspondence.sh                        # all GPUs, 4D M-RoPE
-#   bash scripts/train_correspondence.sh 2                      # 2 GPUs, 4D M-RoPE
-#   bash scripts/train_correspondence.sh 2 --polar              # 2 GPUs, spherical coords
-#   bash scripts/train_correspondence.sh 2 --vanilla            # vanilla 3D M-RoPE
-#   bash scripts/train_correspondence.sh 2 --relative           # relative per-frame coords
-#   bash scripts/train_correspondence.sh 1 --max_samples 6      # single GPU, 6 samples
+#   bash scripts/train_correspondence.sh                                  # all GPUs, 4D M-RoPE (Cartesian)
+#   bash scripts/train_correspondence.sh 2                                # 2 GPUs, 4D M-RoPE
+#   bash scripts/train_correspondence.sh 2 --polar                        # decouple + log-spherical XYZ RoPE
+#   bash scripts/train_correspondence.sh 2 --decouple                     # decouple + Cartesian XYZ RoPE
+#   bash scripts/train_correspondence.sh 2 --vanilla                      # vanilla 3D M-RoPE
+#   bash scripts/train_correspondence.sh 2 --relative                     # relative per-frame coords
+#   bash scripts/train_correspondence.sh 1 --max_samples 6                # single GPU, 6 samples
 # =============================================================================
 
 set -euo pipefail
@@ -43,6 +57,8 @@ MAX_SAMPLES=""
 VANILLA_FLAG=""
 RELATIVE_FLAG=""
 POLAR_FLAG=""
+INTERLEAVE_FLAG=""
+DECOUPLE_FLAG=""
 _positional=0
 
 while [ $# -gt 0 ]; do
@@ -53,6 +69,10 @@ while [ $# -gt 0 ]; do
             RELATIVE_FLAG="--relative"; shift ;;
         --polar)
             POLAR_FLAG="--polar"; shift ;;
+        --interleave_vision)
+            INTERLEAVE_FLAG="--interleave_vision"; shift ;;
+        --decouple)
+            DECOUPLE_FLAG="--decouple"; shift ;;
         --max_samples)
             MAX_SAMPLES="$2"; shift 2 ;;
         *)
@@ -101,9 +121,11 @@ WANDB_ENTITY="actmrv"
 _vanilla_suffix="${VANILLA_FLAG:+_vanilla}"
 _relative_suffix="${RELATIVE_FLAG:+_relative}"
 _polar_suffix="${POLAR_FLAG:+_polar}"
+_interleave_suffix="${INTERLEAVE_FLAG:+_interleave}"
+_decouple_suffix="${DECOUPLE_FLAG:+_decouple}"
 
-RUN_NAME="correspondence_mindcube${_relative_suffix}${_polar_suffix}${_vanilla_suffix}"
-WANDB_RUN_NAME="corr_mindcube_r${LORA_RANK}_ep${EPOCHS}${_relative_suffix}${_polar_suffix}${_vanilla_suffix}"
+RUN_NAME="correspondence_mindcube${_relative_suffix}${_polar_suffix}${_interleave_suffix}${_decouple_suffix}${_vanilla_suffix}"
+WANDB_RUN_NAME="corr_mindcube_r${LORA_RANK}_ep${EPOCHS}${_relative_suffix}${_polar_suffix}${_interleave_suffix}${_decouple_suffix}${_vanilla_suffix}"
 
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
@@ -119,9 +141,11 @@ echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
-echo "[INFO] Mode                 = ${VANILLA_FLAG:+vanilla (3D M-RoPE)}${VANILLA_FLAG:-4D M-RoPE (image_xyz)}"
+echo "[INFO] Mode                 = ${VANILLA_FLAG:+vanilla (3D M-RoPE)}${DECOUPLE_FLAG:+decoupled (3D + new XYZ RoPE)}${VANILLA_FLAG:-${DECOUPLE_FLAG:-4D M-RoPE (image_xyz)}}"
 echo "[INFO] Relative coords      = ${RELATIVE_FLAG:-disabled}"
-echo "[INFO] Polar coords (M-RoPE)= ${POLAR_FLAG:-disabled}"
+echo "[INFO] Polar coords (M-RoPE)= ${POLAR_FLAG:-disabled (Cartesian)}"
+echo "[INFO] Interleave vision    = ${INTERLEAVE_FLAG:-disabled (sequential)}"
+echo "[INFO] Decouple position    = ${DECOUPLE_FLAG:-disabled}"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -161,6 +185,8 @@ $TORCHRUN \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
     $RELATIVE_FLAG                                     \
     $POLAR_FLAG                                        \
+    $INTERLEAVE_FLAG                                   \
+    $DECOUPLE_FLAG                                     \
     $VANILLA_FLAG                                      \
     $MAX_SAMPLES_FLAG
 

@@ -11,11 +11,18 @@ class AnswerOnlyModel(nn.Module):
       - vanilla: uses original 3D M-RoPE (no image_xyz)
     """
 
-    def __init__(self, spa_model: nn.Module, use_xyz: bool = True, polar: bool = False):
+    def __init__(
+        self,
+        spa_model:   nn.Module,
+        use_xyz:     bool  = True,
+        polar:       bool  = False,
+        coord_scale: float = 100.0,
+    ):
         super().__init__()
-        self.spa_model = spa_model
-        self.use_xyz = use_xyz
-        self.polar = polar
+        self.spa_model   = spa_model
+        self.use_xyz     = use_xyz
+        self.polar       = polar
+        self.coord_scale = coord_scale
 
     def forward(
         self,
@@ -24,10 +31,13 @@ class AnswerOnlyModel(nn.Module):
         pixel_values:   torch.Tensor | None,
         image_grid_thw: torch.Tensor | None,
         image_xyz:      list | None = None,
-        coord_scale:    float = 100.0,
+        coord_scale:    float | None = None,
         labels:         torch.Tensor | None = None,
         **kwargs,
     ):
+        if coord_scale is None:
+            coord_scale = self.coord_scale
+
         fwd_kwargs = dict(
             input_ids            = input_ids,
             attention_mask       = attention_mask,
@@ -68,10 +78,16 @@ class AnswerRelativeModel(nn.Module):
     routes it to the backbone so per-query-frame M-RoPE can be applied.
     """
 
-    def __init__(self, spa_model: nn.Module, polar: bool = False):
+    def __init__(
+        self,
+        spa_model:   nn.Module,
+        polar:       bool  = False,
+        coord_scale: float = 100.0,
+    ):
         super().__init__()
-        self.spa_model = spa_model
-        self.polar = polar
+        self.spa_model   = spa_model
+        self.polar       = polar
+        self.coord_scale = coord_scale
 
     def forward(
         self,
@@ -80,10 +96,13 @@ class AnswerRelativeModel(nn.Module):
         pixel_values:        torch.Tensor | None,
         image_grid_thw:      torch.Tensor | None,
         image_xyz_relative:  list | None = None,
-        coord_scale:         float = 100.0,
+        coord_scale:         float | None = None,
         labels:              torch.Tensor | None = None,
         **kwargs,
     ):
+        if coord_scale is None:
+            coord_scale = self.coord_scale
+
         fwd_kwargs = dict(
             input_ids            = input_ids,
             attention_mask       = attention_mask,

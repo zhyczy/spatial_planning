@@ -319,6 +319,8 @@ def load_spa_model(
     device: str = "cuda:0",
     vanilla: bool = False,
     interleaving: bool = False,
+    decouple: bool = False,
+    polar: bool = False,
 ) -> Tuple[Any, Any]:
     """Load SPA model with LoRA adapter.
 
@@ -344,6 +346,9 @@ def load_spa_model(
     config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
 
+    if vanilla and decouple:
+        raise ValueError("[spa] --vanilla and --decouple are mutually exclusive.")
+
     if vanilla:
         # vanilla ablation: keep original 3D M-RoPE, use stock Qwen3.5 model
         logger.info(f"[spa] mrope_section: {orig_section} (original 3D M-RoPE, vanilla)")
@@ -353,6 +358,37 @@ def load_spa_model(
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa",
         )
+    elif decouple:
+        # decouple: keep original 3D M-RoPE in the rotary 64 dims (UNCHANGED)
+        # and add a new XYZ RoPE in pass-through dims 64..129 (66 dims).
+        # Must match train_correspondence.py --decouple (Cartesian, θ=10000) or
+        # --polar (log-spherical, θ=1000).
+        from src.models.spa_emb_dec import (
+            SpaDecForConditionalGeneration,
+            SpaXYZRotaryEmbedding,
+        )
+        _xyz_theta = 1000.0 if polar else 10000.0
+        _mode = "log-spherical (log r, θ, α)" if polar else "Cartesian (x, y, z)"
+        logger.info(
+            f"[spa] mrope_section: {orig_section} (UNCHANGED — decouple) "
+            f"+ XYZ RoPE (pass-through 66 dims, theta={_xyz_theta:g}) [{_mode}]"
+        )
+        spa = SpaDecForConditionalGeneration.from_pretrained(
+            base_model_path,
+            config=config,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        if _xyz_theta != 10000.0:
+            _lm = spa.model.language_model
+            _old = _lm.xyz_rotary_emb
+            _new = SpaXYZRotaryEmbedding(
+                xyz_dim             = _old.xyz_dim,
+                rope_theta          = _xyz_theta,
+                default_coord_scale = _old.default_coord_scale,
+            )
+            _lm.xyz_rotary_emb = _new.to(next(_lm.parameters()).device)
+            logger.info(f"[spa] XYZ RoPE theta swapped to {_xyz_theta:g}")
     else:
         # 4D M-RoPE for normal / plus / no_cam
         total = sum(orig_section)
@@ -409,6 +445,13 @@ def load_spa_model(
     spa = spa.merge_and_unload()
     logger.info("[spa] LoRA adapter merged.")
 
+    # 5b. For decouple mode, wrap every self_attn with SpaDecAttentionWrapper
+    # (mirror of train_correspondence.py — must be AFTER LoRA merge).
+    if decouple:
+        from src.models.spa_emb_dec import patch_attention_layers_dec
+        n_wrapped = patch_attention_layers_dec(spa)
+        logger.info(f"[spa] Wrapped {n_wrapped} attention layers with SpaDecAttentionWrapper.")
+
     spa = spa.to(device).eval()
 
     # Toggle visual-interleave M-RoPE layout (must match training-time setting).
@@ -417,6 +460,11 @@ def load_spa_model(
         if vanilla:
             logger.warning(
                 "[spa] --interleaving has no effect with vanilla (3D M-RoPE); ignoring."
+            )
+        elif decouple:
+            logger.warning(
+                "[spa] --interleaving has no effect with --decouple (rotary region "
+                "keeps original 3D M-RoPE unchanged); ignoring."
             )
         else:
             _rotary = None
