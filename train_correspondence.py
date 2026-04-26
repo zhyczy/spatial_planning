@@ -106,6 +106,7 @@ def build_model(
     polar:         bool = False,
     relative:      bool = False,
     decouple:      bool = False,
+    xyz_rope_dim:  int  = 66,
 ) -> nn.Module:
     """
     Load backbone, patch M-RoPE, apply LoRA, return an answer model.
@@ -146,6 +147,11 @@ def build_model(
             "XYZ RoPE); don't combine it with --decouple. Use --polar alone for "
             "log-spherical or --decouple alone for Cartesian."
         )
+    if xyz_rope_dim % 6 != 0 or xyz_rope_dim <= 0 or xyz_rope_dim > 192:
+        raise ValueError(
+            f"--xyz_rope_dim must be a positive multiple of 6 ≤ 192 "
+            f"(pass-through region); got {xyz_rope_dim}."
+        )
 
     # --polar implies the decouple architecture with log-spherical XYZ RoPE in
     # the pass-through region. --decouple alone uses Cartesian xyz. The two
@@ -182,7 +188,7 @@ def build_model(
         _mode = "log-spherical (log r, θ, α)" if polar_xyz else "Cartesian (x, y, z)"
         log.info(
             f"mrope_section: {orig_section} (UNCHANGED — Qwen original 3D M-RoPE) "
-            f"+ new XYZ RoPE (66 dims, rope_theta={_xyz_theta:g}) in pass-through region "
+            f"+ new XYZ RoPE ({xyz_rope_dim} dims, rope_theta={_xyz_theta:g}) in pass-through region "
             f"[input: {_mode}]"
         )
         spa = SpaDecForConditionalGeneration.from_pretrained(
@@ -191,20 +197,24 @@ def build_model(
             torch_dtype        = torch.bfloat16,
             attn_implementation= "sdpa",
         )
-        # Swap in the right theta for this mode. xyz_rotary_emb is not a
-        # trainable module (no params, only an inv_freq buffer), so replacing
-        # it post-from_pretrained is safe and happens before LoRA wrapping.
-        if _xyz_theta != 10000.0:
+        # Swap in the requested xyz_dim / theta. xyz_rotary_emb has no trainable
+        # params (only an inv_freq buffer), so replacing it post-from_pretrained
+        # is safe and happens before LoRA wrapping. SpaDecAttentionWrapper reads
+        # xyz_dim from cos.shape[-1] at runtime, so no other change needed.
+        if _xyz_theta != 10000.0 or xyz_rope_dim != 66:
             from src.models.spa_emb_dec import SpaXYZRotaryEmbedding
             _lm = spa.model.language_model
             _old = _lm.xyz_rotary_emb
             _new = SpaXYZRotaryEmbedding(
-                xyz_dim             = _old.xyz_dim,
+                xyz_dim             = xyz_rope_dim,
                 rope_theta          = _xyz_theta,
                 default_coord_scale = _old.default_coord_scale,
             )
             _lm.xyz_rotary_emb = _new.to(next(_lm.parameters()).device)
-            log.info(f"[XYZ RoPE] theta swapped to {_xyz_theta:g} for polar mode")
+            log.info(
+                f"[XYZ RoPE] xyz_dim={xyz_rope_dim} (n_per_axis={xyz_rope_dim // 6}), "
+                f"theta={_xyz_theta:g}"
+            )
     else:
         # ── 4D M-RoPE ────────────────────────────────────────────────────────
         total = sum(orig_section)                       # e.g. 32
@@ -311,6 +321,34 @@ def train(args: argparse.Namespace) -> None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         log.info("Single-GPU / CPU mode")
 
+    # ── logging to file (set up BEFORE build_model so its logs land in train.log) ─
+    os.makedirs(args.output_dir, exist_ok=True)
+    rank_log_file = os.path.join(
+        args.output_dir,
+        f"train_rank{local_rank}.log" if world_size > 1 else "train.log"
+    )
+    rank_handler = logging.FileHandler(rank_log_file, mode="w", encoding="utf-8")
+    rank_handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    log.addHandler(rank_handler)
+    if world_size > 1 and local_rank == 0:
+        summary_log_file = os.path.join(args.output_dir, "train.log")
+        summary_handler = logging.FileHandler(summary_log_file, mode="w", encoding="utf-8")
+        summary_handler.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)s  %(message)s",
+            datefmt="%H:%M:%S"
+        ))
+        log.addHandler(summary_handler)
+        rank0_print(f"Per-rank logs: train_rank*.log  |  Summary log: {summary_log_file}")
+    else:
+        rank0_print(f"Logging to {rank_log_file}")
+
+    # Stamp the full CLI args once so train.log captures every config knob
+    # (xyz_rope_dim, decouple, polar, lora_rank, etc.) regardless of mode.
+    log.info(f"[CONFIG] {vars(args)}")
+
     # ── processor + tokeniser ─────────────────────────────────────────────────
     processor = AutoProcessor.from_pretrained(
         args.model_path, trust_remote_code=True
@@ -326,6 +364,7 @@ def train(args: argparse.Namespace) -> None:
         polar          = args.polar,
         relative       = args.relative,
         decouple       = args.decouple,
+        xyz_rope_dim   = args.xyz_rope_dim,
     )
 
     # Toggle visual-interleave RoPE layout (t at high-freq end, x/y/z round-robin).
@@ -867,6 +906,15 @@ def parse_args() -> argparse.Namespace:
              "sequential x|y|z each 11 bands, rope_theta=1000) in pass-through "
              "dims 64..129. Text tokens default to xyz=(0,0,0) → identity rotation. "
              "Mutually exclusive with --vanilla / --polar / --relative.",
+    )
+    p.add_argument(
+        "--xyz_rope_dim",
+        type=int, default=66,
+        help="Total head_dim units allocated to the XYZ RoPE in the pass-through "
+             "region under --decouple / --polar (each axis x/y/z gets xyz_rope_dim/6 "
+             "frequency bands). Must be a positive multiple of 6 ≤ 192 "
+             "(pass-through region size). Default 66 (= 11 bands per axis). "
+             "No effect without --decouple / --polar.",
     )
     # ── WandB ─────────────────────────────────────────────────────────────────
     p.add_argument(

@@ -31,6 +31,12 @@
 #                         values get stamped into RUN_NAME (_cw<W>).
 #   --lora_rank R       — override LoRA rank (default: 16). Non-default values
 #                         get stamped into RUN_NAME (_r<R>).
+#   --xyz_rope_dim N    — total head_dim units for the XYZ RoPE under
+#                         --decouple / --polar (each axis x/y/z gets N/6 freq
+#                         bands). Must be a positive multiple of 6 ≤ 192.
+#                         Default 66 (= 11 bands per axis). Non-default values
+#                         get stamped into RUN_NAME (_xrd<N>). No effect
+#                         without --decouple / --polar.
 #   --max_samples N     — truncate dataset to N entries (default: all)
 #   --interleave_vision — switch visual M-RoPE layout to interleaved: t keeps
 #                         bands 0..s0-1 (high freq), then x/y/z round-robin
@@ -64,6 +70,7 @@ INTERLEAVE_FLAG=""
 DECOUPLE_FLAG=""
 COORD_WEIGHT_ARG=""
 LORA_RANK_ARG=""
+XYZ_ROPE_DIM=""
 _positional=0
 
 while [ $# -gt 0 ]; do
@@ -82,6 +89,8 @@ while [ $# -gt 0 ]; do
             COORD_WEIGHT_ARG="$2"; shift 2 ;;
         --lora_rank)
             LORA_RANK_ARG="$2"; shift 2 ;;
+        --xyz_rope_dim)
+            XYZ_ROPE_DIM="$2"; shift 2 ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -160,8 +169,16 @@ _cw_suffix=""
 _sl_suffix=""
 [ "$SKIP_LAYERS"  != "-1"  ] && _sl_suffix="_sl${SKIP_LAYERS}"
 
-RUN_NAME="coordinate_mindcube${_polar_suffix}${_decouple_suffix}${_r_suffix}${_cw_suffix}${_sl_suffix}"
-WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}${_polar_suffix}${_decouple_suffix}${_sl_suffix}"
+# Stamp xyz_rope_dim into RUN_NAME only when overridden and the dim is in effect
+# (--decouple or --polar). Default 66 → no suffix to keep legacy run names stable.
+_xrd_suffix=""
+if [ -n "$XYZ_ROPE_DIM" ] && [ "$XYZ_ROPE_DIM" != "66" ] \
+   && { [ -n "$DECOUPLE_FLAG" ] || [ -n "$POLAR_FLAG" ]; }; then
+    _xrd_suffix="_xrd${XYZ_ROPE_DIM}"
+fi
+
+RUN_NAME="coordinate_mindcube${_polar_suffix}${_decouple_suffix}${_r_suffix}${_cw_suffix}${_sl_suffix}${_xrd_suffix}"
+WANDB_RUN_NAME="coord_mindcube_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}${_polar_suffix}${_decouple_suffix}${_sl_suffix}${_xrd_suffix}"
 
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
@@ -179,6 +196,11 @@ echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] Polar coord GT       = ${POLAR_FLAG:-disabled}"
 echo "[INFO] Decouple XYZ RoPE    = ${DECOUPLE_FLAG:-disabled}"
+if [ -n "$DECOUPLE_FLAG" ] || [ -n "$POLAR_FLAG" ]; then
+    echo "[INFO] xyz_rope_dim         = ${XYZ_ROPE_DIM:-66 (default)}"
+else
+    echo "[INFO] xyz_rope_dim         = N/A (no --decouple / --polar)"
+fi
 echo "[INFO] Interleave vision    = ${INTERLEAVE_FLAG:-disabled (sequential)}"
 echo "[INFO] Coord Head at        = $SKIP_LAYERS_DISPLAY"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
@@ -191,6 +213,11 @@ echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 MAX_SAMPLES_FLAG=""
 if [ -n "$MAX_SAMPLES" ]; then
     MAX_SAMPLES_FLAG="--max_samples $MAX_SAMPLES"
+fi
+
+XYZ_ROPE_DIM_FLAG=""
+if [ -n "$XYZ_ROPE_DIM" ]; then
+    XYZ_ROPE_DIM_FLAG="--xyz_rope_dim $XYZ_ROPE_DIM"
 fi
 
 # =============================================================================
@@ -225,6 +252,7 @@ $TORCHRUN \
     $POLAR_FLAG                                        \
     $DECOUPLE_FLAG                                     \
     $INTERLEAVE_FLAG                                   \
+    $XYZ_ROPE_DIM_FLAG                                 \
     $MAX_SAMPLES_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

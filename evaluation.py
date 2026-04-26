@@ -344,6 +344,7 @@ def load_spa_model(
     decouple: bool = False,
     polar: bool = False,
     relative: bool = False,
+    xyz_rope_dim: int = 66,
 ) -> Tuple[Any, Any]:
     """Load SPA model with LoRA adapter.
 
@@ -409,11 +410,16 @@ def load_spa_model(
             SpaDecForConditionalGeneration,
             SpaXYZRotaryEmbedding,
         )
+        if xyz_rope_dim % 6 != 0 or xyz_rope_dim <= 0 or xyz_rope_dim > 192:
+            raise ValueError(
+                f"[spa] xyz_rope_dim must be a positive multiple of 6 ≤ 192 "
+                f"(pass-through region); got {xyz_rope_dim}."
+            )
         _xyz_theta = 1000.0 if polar else 10000.0
         _mode = "log-spherical (log r, θ, α)" if polar else "Cartesian (x, y, z)"
         logger.info(
             f"[spa] mrope_section: {orig_section} (UNCHANGED — decouple) "
-            f"+ XYZ RoPE (pass-through 66 dims, theta={_xyz_theta:g}) [{_mode}]"
+            f"+ XYZ RoPE (pass-through {xyz_rope_dim} dims, theta={_xyz_theta:g}) [{_mode}]"
         )
         spa = SpaDecForConditionalGeneration.from_pretrained(
             base_model_path,
@@ -421,16 +427,21 @@ def load_spa_model(
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa",
         )
-        if _xyz_theta != 10000.0:
+        # Swap when either theta or xyz_dim differs from SpaDecTextModel defaults
+        # (xyz_dim=66, theta=10000). Must match training-time choice.
+        if _xyz_theta != 10000.0 or xyz_rope_dim != 66:
             _lm = spa.model.language_model
             _old = _lm.xyz_rotary_emb
             _new = SpaXYZRotaryEmbedding(
-                xyz_dim             = _old.xyz_dim,
+                xyz_dim             = xyz_rope_dim,
                 rope_theta          = _xyz_theta,
                 default_coord_scale = _old.default_coord_scale,
             )
             _lm.xyz_rotary_emb = _new.to(next(_lm.parameters()).device)
-            logger.info(f"[spa] XYZ RoPE theta swapped to {_xyz_theta:g}")
+            logger.info(
+                f"[spa] XYZ RoPE swapped: xyz_dim={xyz_rope_dim} "
+                f"(n_per_axis={xyz_rope_dim // 6}), theta={_xyz_theta:g}"
+            )
     else:
         # 4D M-RoPE for default / relative / rotation variants.
         # relative=True selects SpaRelativeForConditionalGeneration (same
@@ -1736,6 +1747,7 @@ def evaluate(
     device: str = "cuda:0",
     thinking: bool = False,
     interleaving: bool = False,
+    xyz_rope_dim: int = 66,
 ) -> Dict[str, List[Dict]]:
     """Run evaluation for the requested method(s) on *data*.
 
@@ -1805,6 +1817,7 @@ def evaluate(
             spa_base_model_path, correspondence_ckpt, device,
             vanilla=use_vanilla_arch, interleaving=interleaving,
             decouple=_use_decouple, polar=_use_polar, relative=_use_relative,
+            xyz_rope_dim=xyz_rope_dim,
         )
 
         # Resolve spatial_merge_size from base model config
@@ -2029,6 +2042,7 @@ def _worker(
     log_file: Optional[str],
     thinking: bool = False,
     interleaving: bool = False,
+    xyz_rope_dim: int = 66,
 ) -> None:
     if log_file:
         logging.basicConfig(
@@ -2054,6 +2068,7 @@ def _worker(
         device=device,
         thinking=thinking,
         interleaving=interleaving,
+        xyz_rope_dim=xyz_rope_dim,
     )
     logger.info(f"[Worker {gpu_id}] Done.")
 
@@ -2223,6 +2238,14 @@ def main() -> None:
              "--interleave_vision in train_coordinate.py). No effect with "
              "--method baseline / vanilla.",
     )
+    parser.add_argument(
+        "--xyz_rope_dim", type=int, default=66,
+        help="Total head_dim units allocated to the XYZ RoPE in the pass-through "
+             "region under --method polar / decouple. Each axis (x/y/z) gets "
+             "xyz_rope_dim/6 frequency bands. Must be a positive multiple of 6 ≤ 192. "
+             "MUST match the value used during training (default 66). "
+             "No effect for --method baseline / vanilla / position_embedding / coordinate / relative.",
+    )
 
     # ── output ────────────────────────────────────────────────────────────────
     parser.add_argument("--output_dir", type=str, default="results/eval")
@@ -2272,6 +2295,7 @@ def main() -> None:
     logger.info(f"  method              : {args.method}")
     logger.info(f"  thinking            : {args.thinking}")
     logger.info(f"  interleaving        : {args.interleaving}")
+    logger.info(f"  xyz_rope_dim        : {args.xyz_rope_dim}")
     logger.info(f"  model_path          : {args.model_path}")
     logger.info(f"  correspondence_ckpt : {args.correspondence_ckpt}")
     logger.info(f"  coord_scale         : {args.coord_scale}")
@@ -2312,6 +2336,7 @@ def main() -> None:
                 str(log_file),
                 args.thinking,
                 args.interleaving,
+                args.xyz_rope_dim,
             ),
         )
         p.start()

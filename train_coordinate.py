@@ -102,6 +102,7 @@ def build_model(
     coord_weight:       float = 1.0,
     polar:              bool  = False,
     decouple:           bool  = False,
+    xyz_rope_dim:       int   = 66,
 ) -> CoordinateModel:
     """
     Build CoordinateModel with LM + coordinate supervision.
@@ -120,6 +121,11 @@ def build_model(
     """
     if decouple and polar:
         raise ValueError("--decouple and --polar are mutually exclusive.")
+    if xyz_rope_dim % 6 != 0 or xyz_rope_dim <= 0 or xyz_rope_dim > 192:
+        raise ValueError(
+            f"--xyz_rope_dim must be a positive multiple of 6 ≤ 192 "
+            f"(pass-through region); got {xyz_rope_dim}."
+        )
 
     use_decouple = decouple or polar
     polar_xyz    = polar
@@ -135,7 +141,7 @@ def build_model(
         _mode      = "log-spherical (log r, θ, α)" if polar_xyz else "Cartesian (x, y, z)"
         log.info(
             f"mrope_section: {orig_section} (UNCHANGED — Qwen original 3D M-RoPE) "
-            f"+ new XYZ RoPE (66 dims, rope_theta={_xyz_theta:g}) in pass-through region "
+            f"+ new XYZ RoPE ({xyz_rope_dim} dims, rope_theta={_xyz_theta:g}) in pass-through region "
             f"[input: {_mode}]"
         )
         spa = SpaDecForConditionalGeneration.from_pretrained(
@@ -144,20 +150,24 @@ def build_model(
             torch_dtype         = torch.bfloat16,
             attn_implementation = "sdpa",
         )
-        # Swap in the right theta for this mode. xyz_rotary_emb is not a
-        # trainable module (no params, only an inv_freq buffer), so replacing
-        # it post-from_pretrained is safe and happens before LoRA wrapping.
-        if _xyz_theta != 10000.0:
+        # Swap in the requested xyz_dim / theta. xyz_rotary_emb has no trainable
+        # params (only an inv_freq buffer), so replacing it post-from_pretrained
+        # is safe and happens before LoRA wrapping. SpaDecAttentionWrapper reads
+        # xyz_dim from cos.shape[-1] at runtime, so no other change needed.
+        if _xyz_theta != 10000.0 or xyz_rope_dim != 66:
             from src.models.spa_emb_dec import SpaXYZRotaryEmbedding
             _lm  = spa.model.language_model
             _old = _lm.xyz_rotary_emb
             _new = SpaXYZRotaryEmbedding(
-                xyz_dim             = _old.xyz_dim,
+                xyz_dim             = xyz_rope_dim,
                 rope_theta          = _xyz_theta,
                 default_coord_scale = _old.default_coord_scale,
             )
             _lm.xyz_rotary_emb = _new.to(next(_lm.parameters()).device)
-            log.info(f"[XYZ RoPE] theta swapped to {_xyz_theta:g} for polar mode")
+            log.info(
+                f"[XYZ RoPE] xyz_dim={xyz_rope_dim} (n_per_axis={xyz_rope_dim // 6}), "
+                f"theta={_xyz_theta:g}"
+            )
     else:
         orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
         total = sum(orig_section)  # 32
@@ -285,6 +295,7 @@ def train(args: argparse.Namespace) -> None:
         coord_weight       = args.coord_weight,
         polar              = args.polar,
         decouple           = args.decouple,
+        xyz_rope_dim       = args.xyz_rope_dim,
     )
     log.info("Using CoordinateModel (camera transform prediction removed)")
 
@@ -810,6 +821,15 @@ def parse_args() -> argparse.Namespace:
              "sequential x|y|z each 11 bands, rope_theta=10000) in pass-through "
              "dims 64..129, fed with Cartesian xyz. Text tokens default to "
              "xyz=(0,0,0) → identity rotation. Mutually exclusive with --polar.",
+    )
+    p.add_argument(
+        "--xyz_rope_dim",
+        type=int, default=66,
+        help="Total head_dim units allocated to the XYZ RoPE in the pass-through "
+             "region under --decouple / --polar (each axis x/y/z gets xyz_rope_dim/6 "
+             "frequency bands). Must be a positive multiple of 6 ≤ 192 "
+             "(pass-through region size). Default 66 (= 11 bands per axis). "
+             "No effect without --decouple / --polar.",
     )
     # -- WandB -----------------------------------------------------------------
     p.add_argument("--wandb_project",  default="", help="WandB project name.")
