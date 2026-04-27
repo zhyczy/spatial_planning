@@ -7,10 +7,9 @@
 #
 # Uses AnswerOnlyModel with 4D M-RoPE (use_xyz=True) by default.
 # Pass --vanilla to use original Qwen 3D M-RoPE instead.
-# Pass --relative to enable per-query-frame coordinate transforms.
 #
 # Usage:
-#   bash scripts/train_correspondence.sh [num_gpus] [--polar] [--vanilla] [--relative] [--decouple] [--interleave_vision] [--max_samples N] [--datasets mindcube|sat|...]
+#   bash scripts/train_correspondence.sh [num_gpus] [--polar] [--vanilla] [--decouple] [--max_samples N] [--datasets mindcube|sat|...]
 #
 #   num_gpus            — first positional arg, number of GPUs (default: all)
 #   --polar             — use the decouple architecture (Qwen 3D M-RoPE in
@@ -19,16 +18,12 @@
 #                         α=atan2(√(x²+y²),z)) into the XYZ RoPE. Mutually
 #                         exclusive with --vanilla and --decouple.
 #   --vanilla           — use original Qwen 3D M-RoPE (no image_xyz);
-#                         disables --polar / --relative / --interleave_vision / --decouple
-#   --relative          — per-query-frame coord transform: Q from frame f sees all K in frame-f coords
+#                         disables --polar / --decouple
 #   --decouple          — Qwen 3D M-RoPE [11,11,10] in rotary 64 (UNCHANGED)
 #                         + new XYZ RoPE in pass-through dims 64..129 with
 #                         **Cartesian** xyz. For log-spherical input, use
 #                         --polar instead. Mutually exclusive with --vanilla
-#                         / --relative / --polar.
-#   --interleave_vision — interleaved visual M-RoPE: t at high-freq end, x/y/z round-robin
-#                         (only meaningful for the 4D M-RoPE path; no effect
-#                         with --vanilla / --decouple / --polar)
+#                         / --polar.
 #   --xyz_rope_dim N    — total head_dim units for the XYZ RoPE under
 #                         --decouple / --polar (each axis x/y/z gets N/6 freq
 #                         bands). Must be a positive multiple of 6 ≤ 192.
@@ -50,7 +45,6 @@
 #   bash scripts/train_correspondence.sh 2 --polar                        # decouple + log-spherical XYZ RoPE
 #   bash scripts/train_correspondence.sh 2 --decouple                     # decouple + Cartesian XYZ RoPE
 #   bash scripts/train_correspondence.sh 2 --vanilla                      # vanilla 3D M-RoPE
-#   bash scripts/train_correspondence.sh 2 --relative                     # relative per-frame coords
 #   bash scripts/train_correspondence.sh 2 --datasets mindcube sat        # MindCube + SAT combined
 #   bash scripts/train_correspondence.sh 2 --polar --datasets mindcube sat # combined + polar
 #   bash scripts/train_correspondence.sh 1 --max_samples 6                # single GPU, 6 samples
@@ -70,9 +64,7 @@ cd "$SPATIAL_DIR"
 NPROC=""
 MAX_SAMPLES=""
 VANILLA_FLAG=""
-RELATIVE_FLAG=""
 POLAR_FLAG=""
-INTERLEAVE_FLAG=""
 DECOUPLE_FLAG=""
 XYZ_ROPE_DIM=""
 DATASETS=()
@@ -82,12 +74,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --vanilla)
             VANILLA_FLAG="--vanilla"; shift ;;
-        --relative)
-            RELATIVE_FLAG="--relative"; shift ;;
         --polar)
             POLAR_FLAG="--polar"; shift ;;
-        --interleave_vision)
-            INTERLEAVE_FLAG="--interleave_vision"; shift ;;
         --decouple)
             DECOUPLE_FLAG="--decouple"; shift ;;
         --xyz_rope_dim)
@@ -149,9 +137,7 @@ WANDB_ENTITY="actmrv"
 # =============================================================================
 
 _vanilla_suffix="${VANILLA_FLAG:+_vanilla}"
-_relative_suffix="${RELATIVE_FLAG:+_relative}"
 _polar_suffix="${POLAR_FLAG:+_polar}"
-_interleave_suffix="${INTERLEAVE_FLAG:+_interleave}"
 _decouple_suffix="${DECOUPLE_FLAG:+_decouple}"
 
 # Stamp xyz_rope_dim into RUN_NAME only when overridden and the dim is in effect
@@ -170,8 +156,8 @@ if [ "${#DATASETS[@]}" -gt 1 ] || [ "${DATASETS[0]}" != "mindcube" ]; then
     _ds_suffix="_ds-${_ds_joined}"
 fi
 
-RUN_NAME="correspondence${_ds_suffix:-_mindcube}${_relative_suffix}${_polar_suffix}${_interleave_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
-WANDB_RUN_NAME="corr${_ds_suffix:-_mindcube}_r${LORA_RANK}_ep${EPOCHS}${_relative_suffix}${_polar_suffix}${_interleave_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
+RUN_NAME="correspondence${_ds_suffix:-_mindcube}${_polar_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
+WANDB_RUN_NAME="corr${_ds_suffix:-_mindcube}_r${LORA_RANK}_ep${EPOCHS}${_polar_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
 
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
@@ -188,9 +174,7 @@ echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] Mode                 = ${VANILLA_FLAG:+vanilla (3D M-RoPE)}${DECOUPLE_FLAG:+decoupled (3D + new XYZ RoPE)}${VANILLA_FLAG:-${DECOUPLE_FLAG:-4D M-RoPE (image_xyz)}}"
-echo "[INFO] Relative coords      = ${RELATIVE_FLAG:-disabled}"
 echo "[INFO] Polar coords (M-RoPE)= ${POLAR_FLAG:-disabled (Cartesian)}"
-echo "[INFO] Interleave vision    = ${INTERLEAVE_FLAG:-disabled (sequential)}"
 echo "[INFO] Decouple position    = ${DECOUPLE_FLAG:-disabled}"
 if [ -n "$DECOUPLE_FLAG" ] || [ -n "$POLAR_FLAG" ]; then
     echo "[INFO] xyz_rope_dim         = ${XYZ_ROPE_DIM:-66 (default)}"
@@ -241,9 +225,7 @@ $TORCHRUN \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
     --datasets               "${DATASETS[@]}"          \
-    $RELATIVE_FLAG                                     \
     $POLAR_FLAG                                        \
-    $INTERLEAVE_FLAG                                   \
     $DECOUPLE_FLAG                                     \
     $VANILLA_FLAG                                      \
     $XYZ_ROPE_DIM_FLAG                                 \

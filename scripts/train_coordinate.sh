@@ -38,10 +38,6 @@
 #                         get stamped into RUN_NAME (_xrd<N>). No effect
 #                         without --decouple / --polar.
 #   --max_samples N     — truncate dataset to N entries (default: all)
-#   --interleave_vision — switch visual M-RoPE layout to interleaved: t keeps
-#                         bands 0..s0-1 (high freq), then x/y/z round-robin
-#                         through the remaining bands so each spans the full
-#                         freq range. No effect with --decouple.
 #
 # Examples:
 #   bash scripts/train_coordinate.sh                      # all GPUs, Layer 32
@@ -66,7 +62,6 @@ NPROC=""
 MAX_SAMPLES=""
 POLAR_FLAG=""
 SKIP_LAYERS_ARG=""
-INTERLEAVE_FLAG=""
 DECOUPLE_FLAG=""
 COORD_WEIGHT_ARG=""
 LORA_RANK_ARG=""
@@ -83,8 +78,6 @@ while [ $# -gt 0 ]; do
             SKIP_LAYERS_ARG="$2"; shift 2 ;;
         --max_samples)
             MAX_SAMPLES="$2"; shift 2 ;;
-        --interleave_vision)
-            INTERLEAVE_FLAG="--interleave_vision"; shift ;;
         --coord_weight)
             COORD_WEIGHT_ARG="$2"; shift 2 ;;
         --lora_rank)
@@ -201,7 +194,6 @@ if [ -n "$DECOUPLE_FLAG" ] || [ -n "$POLAR_FLAG" ]; then
 else
     echo "[INFO] xyz_rope_dim         = N/A (no --decouple / --polar)"
 fi
-echo "[INFO] Interleave vision    = ${INTERLEAVE_FLAG:-disabled (sequential)}"
 echo "[INFO] Coord Head at        = $SKIP_LAYERS_DISPLAY"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
@@ -251,7 +243,6 @@ $TORCHRUN \
     $SKIP_LAYERS_FLAG                                  \
     $POLAR_FLAG                                        \
     $DECOUPLE_FLAG                                     \
-    $INTERLEAVE_FLAG                                   \
     $XYZ_ROPE_DIM_FLAG                                 \
     $MAX_SAMPLES_FLAG
 

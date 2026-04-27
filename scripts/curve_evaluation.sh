@@ -16,7 +16,7 @@
 #   --end       last step to evaluate       (default: 1000)
 #   --step      step stride                 (default: 50)
 #   --method    evaluation method           (default: coordinate)
-#               choices: baseline vanilla position_embedding coordinate polar decouple rotation rotation_rl
+#               choices: baseline vanilla position_embedding coordinate polar decouple rotation rotation_rl atten
 #   --datasets  comma-separated dataset list (single name OK, e.g. "mindcube")
 #               (default: mindcube,sat_real,spinbench,robospatial,
 #                         viewspatial,omnispatial_pt,embspatial)
@@ -25,10 +25,6 @@
 #   --output    output directory for results and plots
 #               (default: eval_results/curves/<ckpt_dir_basename>)
 #   --max_new_tokens  generation budget     (default: 512)
-#   --interleaving    forward --interleaving to evaluation.py: use interleaved
-#                     M-RoPE band layout for visual tokens
-#                     ([tt, x, y, z, x, y, z, ...]). Must match training-time
-#                     setting; no effect for baseline / vanilla.
 #
 # Examples:
 #   # Full sweep, 500→1000 step 50, all default datasets:
@@ -70,7 +66,6 @@ DATASETS="mindcube,sat_real,spinbench,robospatial,viewspatial,omnispatial_pt,emb
 GPUS=""
 LIMIT=""
 OUTPUT=""
-INTERLEAVING=""
 MAX_NEW_TOKENS=512
 
 # =============================================================================
@@ -88,7 +83,6 @@ while [[ $# -gt 0 ]]; do
         --gpus)          GPUS="$2";            shift 2 ;;
         --limit)         LIMIT="$2";           shift 2 ;;
         --output)        OUTPUT="$2";          shift 2 ;;
-        --interleaving)  INTERLEAVING="--interleaving"; shift  ;;
         --max_new_tokens) MAX_NEW_TOKENS="$2"; shift 2 ;;
         *)
             echo "[ERROR] Unknown argument: $1" >&2
@@ -111,7 +105,7 @@ if [[ ! -d "$CKPT_DIR" ]]; then
     exit 1
 fi
 
-VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple rotation rotation_rl"
+VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple rotation rotation_rl atten"
 if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
     echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1
@@ -160,10 +154,6 @@ if [[ -n "$OUTPUT" ]]; then
     CMD+=(--output_dir "$OUTPUT")
 fi
 
-if [[ -n "$INTERLEAVING" ]]; then
-    CMD+=($INTERLEAVING)
-fi
-
 # =============================================================================
 # Info banner
 # =============================================================================
@@ -174,9 +164,6 @@ echo "[INFO]   ckpt_dir            : $CKPT_DIR"
 echo "[INFO]   steps               : $START → $END (stride $STEP_SIZE)"
 echo "[INFO]   method              : $METHOD"
 echo "[INFO]   datasets            : $DATASETS"
-if [[ -n "$INTERLEAVING" ]]; then
-    echo "[INFO]   interleaving        : on"
-fi
 echo "[INFO]   CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<all>}"
 echo "[INFO]   Num GPUs            : $N_GPU"
 if [[ -n "$LIMIT" ]]; then

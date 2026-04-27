@@ -238,7 +238,7 @@ class SpaVisionModel(Qwen3_5VisionModel):
 
 class SpaTextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
     """
-    Extends Qwen3.5 M-RoPE from 3D to N-D using sequential (non-interleaved) frequency assignment.
+    Extends Qwen3.5 M-RoPE from 3D to N-D using sequential frequency assignment.
 
     With mrope_section = [s0, s1, ..., s_{N-1}] (sum = head_dim // 2):
         dimensions laid out sequentially: [dim_0_freqs | dim_1_freqs | ...]
@@ -270,70 +270,21 @@ class SpaTextRotaryEmbedding(Qwen3_5TextRotaryEmbedding):
         with maybe_autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
             # freqs: (N, bs, seq_len, head_dim//2)
-            freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+            # Sequential layout: t|x|y|z laid out contiguously, section-sized blocks.
+            #   band:  [0 .. s0-1 | s0 .. s0+s1-1 | ...]
+            #   dim:   [   0      |       1       | ...]
+            freqs_out_list = []
+            offset = 0
+            for dim in range(num_dims):
+                length = self.mrope_section[dim]
+                freqs_out_list.append(freqs[dim, ..., offset:offset + length])
+                offset += length
+            freqs = torch.cat(freqs_out_list, dim=-1)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-    def apply_interleaved_mrope(self, freqs, mrope_section):
-        """
-        Build per-band cos/sin from N position-axis frequency stacks.
-
-        Two layouts are supported, switched by `self.visual_interleave`:
-
-        1) Sequential (default): t|x|y|z laid out contiguously, section-sized blocks.
-             band:  [0 .. s0-1 | s0 .. s0+s1-1 | ...]
-             dim:   [   0      |       1       | ...]
-           This is the original Qwen layout.
-
-        2) Visual-interleave (`self.visual_interleave = True`): t keeps its s0
-           bands at the high-freq end; dims 1..N-1 (e.g. x, y, z) round-robin
-           through the remaining bands so each spans the full freq range.
-             band:  [0 .. s0-1 | s0 s0+1 s0+2  s0+3 s0+4 s0+5  ...]
-             dim:   [   0      |  1    2    3    1    2    3   ...]
-           x/y/z each get ≈ (total - s0) / (N-1) bands covering high→low freq.
-           Makes x/y/z symmetric under a single global scale.
-
-        Args:
-            freqs:        (N, bs, seq_len, head_dim//2)
-            mrope_section: list of N ints
-        Returns:
-            (bs, seq_len, head_dim//2)
-        """
-        num_dims = len(mrope_section)
-        n_bands = freqs.shape[-1]
-
-        if getattr(self, "visual_interleave", False) and num_dims >= 2:
-            # Cache band→dim layout per device
-            if not hasattr(self, "_interleave_layout_cache"):
-                self._interleave_layout_cache = {}
-            cache_key = (n_bands, int(mrope_section[0]), num_dims, str(freqs.device))
-            if cache_key not in self._interleave_layout_cache:
-                layout = torch.empty(n_bands, dtype=torch.long, device=freqs.device)
-                n_t = int(mrope_section[0])
-                layout[:n_t] = 0  # t at high-freq end
-                # Round-robin dims 1..N-1 for the remainder
-                rest = torch.arange(n_bands - n_t, device=freqs.device)
-                layout[n_t:] = 1 + (rest % (num_dims - 1))
-                self._interleave_layout_cache[cache_key] = layout
-            layout = self._interleave_layout_cache[cache_key]
-
-            band_idx = torch.arange(n_bands, device=freqs.device)
-            # Advanced indexing: pick freqs[layout[k], :, :, k] for each k
-            out = freqs[layout, :, :, band_idx]  # (n_bands, bs, seq_len)
-            return out.permute(1, 2, 0).contiguous()
-
-        # Sequential layout (original behavior)
-        freqs_out_list = []
-        offset = 0
-        for dim in range(num_dims):
-            length = mrope_section[dim]
-            freqs_out_list.append(freqs[dim, ..., offset:offset + length])
-            offset += length
-        freqs_out = torch.cat(freqs_out_list, dim=-1)
-        return freqs_out
 
 
 class SpaTextModel(Qwen3_5TextModel):

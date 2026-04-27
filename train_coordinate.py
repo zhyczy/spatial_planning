@@ -299,32 +299,6 @@ def train(args: argparse.Namespace) -> None:
     )
     log.info("Using CoordinateModel (camera transform prediction removed)")
 
-    # Toggle visual-interleave RoPE layout (t at high-freq end, x/y/z round-robin).
-    # Only meaningful for the 4D M-RoPE path; has no effect with --decouple
-    # or --polar (both keep Qwen's original 3D M-RoPE in the rotary region and
-    # put XYZ RoPE in pass-through — both already symmetric).
-    if args.interleave_vision and (args.decouple or args.polar):
-        log.warning(
-            "--interleave_vision has no effect with --decouple / --polar "
-            "(Qwen original 3D M-RoPE in rotary region; XYZ RoPE in pass-through "
-            "has its own symmetric spectrum)."
-        )
-    elif args.interleave_vision:
-        # PEFT-wrapped path: model.spa_model.model.model.language_model.rotary_emb
-        # Fall back to shallower paths if structure differs.
-        _rotary = None
-        for _name, _mod in model.spa_model.named_modules():
-            if _name.endswith("language_model.rotary_emb"):
-                _rotary = _mod
-                break
-        if _rotary is None:
-            raise RuntimeError("Could not find language_model.rotary_emb on spa_model")
-        _rotary.visual_interleave = True
-        rank0_print(
-            "[RoPE] visual_interleave=True: t at high-freq end (bands 0..s0-1), "
-            "x/y/z round-robin through remaining bands."
-        )
-
     model = model.to(device)
     if local_rank == 0:
         mem_gb = torch.cuda.memory_allocated(device) / 1e9
@@ -804,13 +778,6 @@ def parse_args() -> argparse.Namespace:
         "--coord_scale",
         type=float, default=100.0,
         help="Scalar multiplier applied to xyz before RoPE discretization.",
-    )
-    p.add_argument(
-        "--interleave_vision",
-        action="store_true",
-        help="Use interleaved M-RoPE layout for visual tokens: t keeps its "
-             "mrope_section[0] bands at the high-freq end, then x/y/z round-robin "
-             "through the remaining bands so each spans the full freq range.",
     )
     p.add_argument(
         "--decouple",

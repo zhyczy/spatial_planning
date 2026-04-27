@@ -151,7 +151,6 @@ def build_model(
     rot_nhead:           int   = 4,
     rot_dim_feedforward: int   = 2048,
     rot_num_layers:      int   = 2,
-    relative:            bool  = False,
     decouple:            bool  = False,
     xyz_rope_dim:        int   = 66,
 ) -> RotationRoPEModel:
@@ -160,13 +159,10 @@ def build_model(
     decouple=True  → mirrors train_alternate.py: keep Qwen original 3D M-RoPE
                      [11,11,10] in the rotary 64 dims (UNCHANGED) and add a
                      NEW XYZ RoPE in dims 64..129 (xyz_rope_dim dims, fed
-                     R-rotated Cartesian xyz). Mutually exclusive with
-                     --relative.
+                     R-rotated Cartesian xyz).
     xyz_rope_dim   → total dims for the pass-through XYZ RoPE under
                      --decouple (must be a positive multiple of 6 ≤ 192).
     """
-    if decouple and relative:
-        raise ValueError("--decouple is mutually exclusive with --relative.")
     if xyz_rope_dim % 6 != 0 or xyz_rope_dim <= 0 or xyz_rope_dim > 192:
         raise ValueError(
             f"--xyz_rope_dim must be a positive multiple of 6 ≤ 192 "
@@ -309,14 +305,11 @@ def build_model(
         f"{', decouple' if decouple else ''})"
     )
 
-    cam_dim = rotation_enc.d_model if relative else 0
     coord_head = DepthPredictionTransformer(
         hidden_dim=hidden_dim, upscale_factor=coord_upscale,
-        cam_dim=cam_dim,
     ).to(torch.bfloat16)
     log.info(
         f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}"
-        f"{f'  cam_dim={cam_dim}' if relative else ''}"
     )
 
     return RotationRoPEModel(
@@ -399,10 +392,9 @@ def _phase_a_step(
 
     inputs_embeds = _model.encode_inputs(input_ids, pixel_values, image_grid_thw)
 
-    R        = None
-    cam_feat = None
+    R = None
     if use_rot_enc and image_xyz is not None and image_grid_thw is not None:
-        logits, residual_all, cam_feat = _model._call_rotation_enc(
+        logits, residual_all, _ = _model._call_rotation_enc(
             inputs_embeds.detach(), input_ids,
             image_xyz, image_grid_thw, args.coord_scale,
         )
@@ -420,9 +412,7 @@ def _phase_a_step(
         labels              = labels,
         coord_scale         = args.coord_scale,
         use_coord_loss      = not args.no_coord,
-        use_relative        = args.relative,
         detach_coord_hidden = False,          # Phase A: coord flows normally
-        cam_feat            = cam_feat,
         compute_reward      = False,
     )
 
@@ -474,7 +464,7 @@ def _phase_b_grpo_step(
           ``rotation_enc``, compute the clipped surrogate
           ``L_rl + L_ent + L_kl``, ``policy_opt.zero_grad / backward / step``.
           No feature caching — rot_bb weights change between iterations, so
-          cam_feat must be regenerated every time.
+          encoder features must be regenerated every time.
         - head_cls / rot_bb grads are clipped inside the inner loop; the
           outer grad_accum pipeline does NOT touch these params.
         - Zero-variance batch: inner loop is skipped entirely (no L_rl /
@@ -512,10 +502,10 @@ def _phase_b_grpo_step(
     # Encoder forward WITH grad — logits carries head_cls gradient back to
     # the head and encoder backbone. _call_rotation_enc dispatches between
     # 4D M-RoPE (non-decouple) and 3D M-RoPE + XYZ RoPE (decouple).
-    logits, residual_all, cam_feat = _model._call_rotation_enc(
+    logits, residual_all, _ = _model._call_rotation_enc(
         inputs_embeds.detach(), input_ids,
         image_xyz, image_grid_thw, args.coord_scale,
-    )   # logits (24,), residual_all=None (discrete), cam_feat (d_model,)
+    )   # logits (24,), residual_all=None (discrete)
 
     # ── Stage 1: 24 × no_grad reward collection ──────────────────────────
     # acc_vec is kept only for logging n_correct — the reward signal below
@@ -541,9 +531,7 @@ def _phase_b_grpo_step(
                 labels              = labels,
                 coord_scale         = args.coord_scale,
                 use_coord_loss      = False,
-                use_relative        = args.relative,
                 detach_coord_hidden = True,
-                cam_feat            = None,
                 compute_reward      = True,
             )
             acc_vec[k]   = float(_ldict_k.get("acc", 0.0))
@@ -653,7 +641,7 @@ def _phase_b_grpo_step(
     # K inner PPO epochs, each one re-forwards rotation_enc and calls
     # policy_opt.step() inline (no grad-accum on policy params).
     # NO feature caching — rot_bb weights change between iterations, so
-    # cam_feat must be regenerated every time.
+    # encoder features must be regenerated every time.
     r_mean = rewards.mean()
     r_std  = rewards.std(unbiased=False)
 
@@ -761,9 +749,7 @@ def _phase_b_grpo_step(
         labels              = labels,
         coord_scale         = args.coord_scale,
         use_coord_loss      = not args.no_coord,
-        use_relative        = args.relative,
         detach_coord_hidden = True,
-        cam_feat            = cam_feat,
         compute_reward      = False,
     )
     # Coordinate coord backward across ranks: if ANY rank has a coord
@@ -844,7 +830,6 @@ def train(args: argparse.Namespace) -> None:
         rot_nhead           = args.rot_nhead,
         rot_dim_feedforward = args.rot_dim_feedforward,
         rot_num_layers      = args.rot_num_layers,
-        relative            = args.relative,
         decouple            = args.decouple,
         xyz_rope_dim        = args.xyz_rope_dim,
     )
@@ -1002,7 +987,6 @@ def train(args: argparse.Namespace) -> None:
     log.info(f">>> w_lm           = {args.w_lm}")
     log.info(f">>> w_coord        = {args.w_coord}")
     log.info(f">>> no_coord       = {args.no_coord}")
-    log.info(f">>> relative       = {args.relative}")
     log.info(
         f">>> decouple       = {args.decouple}"
         + (f"  (xyz_rope_dim={args.xyz_rope_dim})" if args.decouple else "")
@@ -1380,7 +1364,7 @@ def _run_eval(
 
             with torch.inference_mode():
                 inputs_embeds = _model.encode_inputs(t_ids, t_pv, t_thw)
-                logits, residual_all, cam_feat = _model._call_rotation_enc(
+                logits, residual_all, _ = _model._call_rotation_enc(
                     inputs_embeds, t_ids,
                     t_xyz, t_thw, args.coord_scale,
                 )
@@ -1408,9 +1392,7 @@ def _run_eval(
                         labels              = t_labels,
                         coord_scale         = args.coord_scale,
                         use_coord_loss      = False,
-                        use_relative        = args.relative,
                         detach_coord_hidden = True,
-                        cam_feat            = None,
                         compute_reward      = True,
                     )
                     if _ld_k is not None:
@@ -1431,9 +1413,7 @@ def _run_eval(
                     labels              = t_labels,
                     coord_scale         = args.coord_scale,
                     use_coord_loss      = not args.no_coord,
-                    use_relative        = args.relative,
                     detach_coord_hidden = False,
-                    cam_feat            = cam_feat,
                     compute_reward      = True,
                 )
 
@@ -1453,9 +1433,7 @@ def _run_eval(
                             labels              = t_labels,
                             coord_scale         = args.coord_scale,
                             use_coord_loss      = False,
-                            use_relative        = args.relative,
                             detach_coord_hidden = False,
-                            cam_feat            = cam_feat,
                             compute_reward      = True,
                         )
                         if _ld_o and float(_ld_o.get("acc", 0.0)) > 0.5:
@@ -1688,13 +1666,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--answer_weight", type=float, default=1.0)
     p.add_argument("--coord_weight",  type=float, default=1.0)
     p.add_argument("--no_coord",      action="store_true")
-    p.add_argument("--relative",      action="store_true")
     p.add_argument(
         "--decouple", action="store_true",
         help="Mirror train_alternate.py --decouple: keep Qwen original 3D "
              "M-RoPE on rotary 64 dims (UNCHANGED) and add a new XYZ RoPE on "
              "the pass-through region (xyz_rope_dim dims, fed R-rotated "
-             "Cartesian xyz). Mutually exclusive with --relative.",
+             "Cartesian xyz).",
     )
     p.add_argument(
         "--xyz_rope_dim", type=int, default=66,

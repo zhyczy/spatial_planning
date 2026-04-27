@@ -6,7 +6,7 @@
 
 ## 1. Motivation
 
-Earlier modes (`default` 4D M-RoPE, `--relative`) all **modify** Qwen3.5's pretrained `mrope_section` (`[11, 11, 10]` → `[2, 10, 10, 10]`) to inject xyz into the existing 64 rotary dims. This:
+The `default` 4D M-RoPE mode **modifies** Qwen3.5's pretrained `mrope_section` (`[11, 11, 10]` → `[2, 10, 10, 10]`) to inject xyz into the existing 64 rotary dims. This:
 
 - Disrupts the pretrained allocation: `t / h / w` bands are repurposed for `t / x / y / z`
 - Forces LoRA to relearn what was already in pretraining
@@ -141,7 +141,7 @@ patch_attention_layers_dec(model)
     Replaces every self_attn with SpaDecAttentionWrapper.  Call AFTER LoRA.
 ```
 
-Side-channel design: rather than threading xyz through every forward signature, `SpaDecModel.forward` stashes `_xyz_pos` and `_coord_scale` on `language_model`, and `SpaDecTextModel.forward` reads them — same pattern as `SpaRelativeModel._pf_cache`.
+Side-channel design: rather than threading xyz through every forward signature, `SpaDecModel.forward` stashes `_xyz_pos` and `_coord_scale` on `language_model`, and `SpaDecTextModel.forward` reads them.
 
 ### 4.1 KV-cache compatibility
 
@@ -398,10 +398,9 @@ separation of the two patches, scaled by the band's frequency.
 
 ## 5. Mutual Exclusivity
 
-`--decouple` is mutually exclusive with `--vanilla`, `--polar`, `--relative`:
+`--decouple` is mutually exclusive with `--vanilla`, `--polar`:
 - `--vanilla`: keeps original 3D M-RoPE only (no xyz at all). Conflicts because decouple ALSO wants original 3D M-RoPE (in 64 dims) but ADDs xyz.
 - **`--polar`**: now also uses the decoupled architecture but feeds log-spherical input into the XYZ RoPE and uses `rope_theta=1000`. Since both modes select the same `SpaDecForConditionalGeneration` class, specifying both is redundant — mutex at the CLI prevents ambiguity. Pick one: `--decouple` for Cartesian, `--polar` for log-spherical. See [`polar_rope.md`](polar_rope.md).
-- `--relative`: per-frame xyz rotation, requires modified mrope_section. Conflicts.
 
 `--interleave_vision`: silently no-op under `--decouple` and `--polar` (interleave_vision affects the SpaTextRotaryEmbedding's mrope_section layout, which is unused when we don't touch the rotary 64 dims).
 
@@ -411,13 +410,12 @@ separation of the two patches, scaled by the band's frequency.
 |---|---|---|---|---|
 | `default` (4D) | repurposed `[2,10,10,10]` xyz | (pass-through) | Cartesian | `MindCube_Train_Dataset` |
 | `--vanilla` | original `[11,11,10]` (no xyz) | (pass-through) | ignored | same |
-| `--relative` | `[2,10,10,10]` per-frame xyz | (pass-through) | per-frame Cartesian | `MindCube_Train_Dataset_Relative` |
 | **`--decouple`** | **original `[11,11,10]` UNCHANGED** | **NEW: XYZ rotary (cs=100, θ=10000)** | **Cartesian** | `MindCube_Train_Dataset` |
 | **`--polar`** | **original `[11,11,10]` UNCHANGED** | **NEW: XYZ rotary (cs=100, θ=1000)** | **log-spherical (log r, θ, α)** | `MindCube_Train_Dataset` |
 
 ## 7. Coord Scale Plumbing
 
-`AnswerOnlyModel` / `AnswerRelativeModel` now accept `coord_scale` at `__init__` (default 100). `train_correspondence.py:build_model` passes `coord_scale = 100.0` for all modes (decouple has no special value — uses the same 100 as the others). At forward, the value flows:
+`AnswerOnlyModel` accepts `coord_scale` at `__init__` (default 100). `train_correspondence.py:build_model` passes `coord_scale = 100.0` for all modes (decouple has no special value — uses the same 100 as the others). At forward, the value flows:
 
 ```
 AnswerOnlyModel(coord_scale=100)
@@ -452,7 +450,7 @@ bash scripts/train_correspondence.sh 2 --decouple
 # Run name: correspondence_mindcube_decouple
 # WandB run: corr_mindcube_r16_ep6_decouple
 
-# Combine: --decouple is mutually exclusive with --polar/--vanilla/--relative
+# Combine: --decouple is mutually exclusive with --polar/--vanilla
 # but compatible with everything else (e.g. --max_samples N for smoke tests)
 bash scripts/train_correspondence.sh 1 --decouple --max_samples 6
 ```
@@ -484,7 +482,7 @@ The shell script auto-suffixes `_decouple` to `RUN_NAME` and `WANDB_RUN_NAME`, a
    Cleanest invariant: text-token attention is exactly unchanged from Qwen pretraining (since the new XYZ RoPE acts as identity on text). All "pretrained" semantics in text-text and text-image attention are preserved — the new channel only adds to image-image and image-text relations.
 
 7. **Why side-channel `_xyz_pos` instead of new forward arg everywhere?**  
-   Threading `xyz_position_embeddings` through every layer's forward signature would require subclassing Qwen3_5DecoderLayer. The side-channel pattern (set on language_model before forward, read inside forward) is the same trick used by `SpaRelativeModel._pf_cache` and is grad-checkpoint compatible.
+   Threading `xyz_position_embeddings` through every layer's forward signature would require subclassing Qwen3_5DecoderLayer. The side-channel pattern (set on language_model before forward, read inside forward) is grad-checkpoint compatible.
 
 8. **Cross-dataset generalization via log-spherical (now implemented as `--polar`)**  
    For true scale invariance, `(x,y,z) → (log r, θ, α)` is ideal (RoPE pos-diff = `log(r_i / r_j)` is invariant to global scaling). **This is now the `--polar` mode** — same decoupled architecture, but the XYZ RoPE consumes log-spherical input and uses `rope_theta = 1000` (tighter than Cartesian's 10000 to match polar's narrower dynamic range). The text=identity invariant is preserved via `zero_mask` (text tokens with xyz=0 stay at log_r=0, θ=0, α=0 → cos=1, sin=0). See [`polar_rope.md`](polar_rope.md).

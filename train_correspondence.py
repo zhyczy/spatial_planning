@@ -5,7 +5,7 @@ LoRA fine-tuning of SpaForConditionalGeneration (Qwen3.5-VL) to predict
 answers from multi-image prompts with optional 4D M-RoPE spatial conditioning.
 
 Architecture:
-    AnswerOnlyModel / AnswerRelativeModel
+    AnswerOnlyModel
     ├── SpaForConditionalGeneration  [backbone + LoRA adapters]
     │    ├── SpaVisionModel (ViT, frozen)
     │    └── SpaModel (LLM + 4D M-RoPE)
@@ -17,7 +17,6 @@ Training strategy:
 
 Coordinate convention:
     - For non-vanilla mode, per-patch xyz is used in vision-token M-RoPE
-    - For --relative mode, coordinates are transformed per query frame
 
 Usage:
   python train_correspondence.py \\
@@ -54,18 +53,13 @@ sys.path.insert(0, _ROOT)
 
 from src.models import (
     AnswerOnlyModel,
-    AnswerRelativeModel,
     SpaForConditionalGeneration,
-    SpaRelativeForConditionalGeneration,
     SpaDecForConditionalGeneration,
-    patch_attention_layers,
     patch_attention_layers_dec,
 )
 from src.dataset import (
     MindCube_Train_Dataset,
-    MindCube_Train_Dataset_Relative,
     SAT_Train_Dataset,
-    SAT_Train_Dataset_Relative,
     Eval_Dataset_Coord,
 )
 from torch.utils.data import ConcatDataset
@@ -107,7 +101,6 @@ def build_model(
     freeze_vision: bool = True,
     vanilla:       bool = False,
     polar:         bool = False,
-    relative:      bool = False,
     decouple:      bool = False,
     xyz_rope_dim:  int  = 66,
 ) -> nn.Module:
@@ -125,25 +118,18 @@ def build_model(
                          α     = atan2(√(x²+y²), z) ∈ [0, π].
                      Text tokens stay xyz=(0,0,0) → identity rotation.
                      Mutually exclusive with --vanilla and --decouple.
-    relative=True  → per-query-frame coordinate transform (SpaRelativeForConditionalGeneration);
-                     dataset must return image_xyz_relative instead of image_xyz;
-                     incompatible with vanilla; defaults to polar coordinates
     decouple=True  → keep Qwen original 3D M-RoPE [11,11,10] in the rotary 64
                      dims (UNCHANGED) and add a NEW XYZ RoPE in dims 64..129
                      (66 dims, sequential x|y|z, rope_theta=10000) with
                      **Cartesian** xyz. Text tokens get xyz=(0,0,0). For
                      log-spherical input, use --polar (which is mutually
                      exclusive with --decouple). Mutually exclusive with
-                     --vanilla / --relative / --polar.
+                     --vanilla / --polar.
     """
-    if relative and vanilla:
-        raise ValueError("--relative and --vanilla are mutually exclusive.")
     if polar and vanilla:
         raise ValueError("--polar and --vanilla are mutually exclusive.")
-    if decouple and (vanilla or relative):
-        raise ValueError(
-            "--decouple is mutually exclusive with --vanilla / --relative."
-        )
+    if decouple and vanilla:
+        raise ValueError("--decouple is mutually exclusive with --vanilla.")
     if polar and decouple:
         raise ValueError(
             "--polar already implies the decouple architecture (with log-spherical "
@@ -161,7 +147,7 @@ def build_model(
     # are mutually exclusive.
     use_decouple = decouple or polar
     polar_xyz    = polar
-    effective_polar = polar or relative
+    effective_polar = polar
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
@@ -228,8 +214,7 @@ def build_model(
             f"mrope_section: {orig_section} → {new_section}  "
             f"(4D M-RoPE: 2 for t, {xyz_size} each for x/y/z)"
         )
-        spa_cls = SpaRelativeForConditionalGeneration if relative else SpaForConditionalGeneration
-        spa = spa_cls.from_pretrained(
+        spa = SpaForConditionalGeneration.from_pretrained(
             model_path,
             config             = config,
             torch_dtype        = torch.bfloat16,
@@ -257,11 +242,6 @@ def build_model(
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
 
-    # ── patch attention layers for relative mode (after LoRA) ────────────────
-    if relative:
-        n = patch_attention_layers(spa)
-        log.info(f"Wrapped {n} attention layers with SpaRelativeAttentionWrapper.")
-
     # ── patch attention layers for decouple mode (after LoRA) ────────────────
     if use_decouple:
         n = patch_attention_layers_dec(spa)
@@ -283,13 +263,6 @@ def build_model(
     # (4D / polar: cm-equivalent for M-RoPE position; decouple: cm-equivalent for
     # the pass-through XYZ RoPE → wavelength range 0.063m .. 272m at θ=10000)
     _coord_scale = 100.0
-
-    if relative:
-        log.info(
-            f"AnswerRelativeModel (per-query-frame relative coords, polar={effective_polar}, "
-            f"coord_scale={_coord_scale})"
-        )
-        return AnswerRelativeModel(spa, polar=effective_polar, coord_scale=_coord_scale)
 
     use_xyz = not vanilla
     log.info(
@@ -365,37 +338,9 @@ def train(args: argparse.Namespace) -> None:
         freeze_vision  = not args.train_vision,
         vanilla        = args.vanilla,
         polar          = args.polar,
-        relative       = args.relative,
         decouple       = args.decouple,
         xyz_rope_dim   = args.xyz_rope_dim,
     )
-
-    # Toggle visual-interleave RoPE layout (t at high-freq end, x/y/z round-robin).
-    # Only meaningful for the 4D M-RoPE path. --polar and --decouple both use
-    # the Qwen original 3D M-RoPE in the rotary 64 dims (plus a separate XYZ
-    # RoPE in pass-through), so interleave has no effect there.
-    _uses_4d_mrope = not (args.vanilla or args.decouple or args.polar)
-    if args.interleave_vision and _uses_4d_mrope:
-        _rotary = None
-        for _name, _mod in model.spa_model.named_modules():
-            if _name.endswith("language_model.rotary_emb"):
-                _rotary = _mod
-                break
-        if _rotary is None:
-            raise RuntimeError("Could not find language_model.rotary_emb on spa_model")
-        _rotary.visual_interleave = True
-        rank0_print(
-            "[RoPE] visual_interleave=True: t at high-freq end (bands 0..s0-1), "
-            "x/y/z round-robin through remaining bands."
-        )
-    elif args.interleave_vision and args.vanilla:
-        log.warning("--interleave_vision has no effect with --vanilla (3D M-RoPE).")
-    elif args.interleave_vision and (args.decouple or args.polar):
-        log.warning(
-            "--interleave_vision has no effect with --decouple / --polar "
-            "(Qwen original 3D M-RoPE in rotary region; XYZ RoPE in pass-through "
-            "has its own symmetric spectrum)."
-        )
 
     model = model.to(device)
 
@@ -419,14 +364,10 @@ def train(args: argparse.Namespace) -> None:
 
     # ── dataset / loader ──────────────────────────────────────────────────────
     # --datasets controls which sources are concatenated. Default: mindcube only.
-    # Each source uses its own (json_path, results_dir) pair from CLI args, and
-    # the per-mode dataset class (MindCube_*_Train_Dataset[_Relative] vs
-    # SAT_Train_Dataset[_Relative]) handles format-specific parsing.
+    # Each source uses its own (json_path, results_dir) pair from CLI args.
     _ds_classes = {
-        ("mindcube", False): MindCube_Train_Dataset,
-        ("mindcube", True):  MindCube_Train_Dataset_Relative,
-        ("sat",      False): SAT_Train_Dataset,
-        ("sat",      True):  SAT_Train_Dataset_Relative,
+        "mindcube": MindCube_Train_Dataset,
+        "sat":      SAT_Train_Dataset,
     }
     _ds_paths = {
         "mindcube": (args.json_path,     args.mindcube_results_dir),
@@ -444,7 +385,7 @@ def train(args: argparse.Namespace) -> None:
     for _name in _build_order:
         if _name not in _ds_paths:
             raise ValueError(f"Unknown dataset '{_name}'. Choices: mindcube, sat.")
-        _cls     = _ds_classes[(_name, args.relative)]
+        _cls     = _ds_classes[_name]
         _jp, _rd = _ds_paths[_name]
         rank0_print(f"Loading {_cls.__name__} from {_jp} (results: {_rd})")
         # SAT classes use json_path (JSON list); MindCube classes use jsonl_path.
@@ -499,7 +440,7 @@ def train(args: argparse.Namespace) -> None:
     # ── test datasets (for periodic LM loss + first-token acc evaluation) ─────
     # Uses Eval_Dataset_Coord so that image_xyz is loaded from pts3d and passed
     # to the model at eval time — matching the training input distribution for
-    # all xyz-using modes (default 4D / polar / relative / decouple).
+    # all xyz-using modes (default 4D / polar / decouple).
     # coord_upscale=1 to skip the unused image_xyz_hires (save memory).
     _eval_dir = os.path.join(_ROOT, "datasets/evaluation")
     test_loaders = {}
@@ -525,7 +466,6 @@ def train(args: argparse.Namespace) -> None:
                 coord_upscale      = 1,
                 question_key       = _q_key,
                 answer_key         = _a_key,
-                relative           = args.relative,
             )
             _eval_sampler = (
                 DistributedSampler(ds, num_replicas=world_size,
@@ -621,34 +561,19 @@ def train(args: argparse.Namespace) -> None:
             if image_xyz is not None:
                 image_xyz = [xyz.to(device) for xyz in image_xyz]
 
-            # Relative mode: per-frame xyz (list of (N_frames, H, W, 3) tensors)
-            image_xyz_relative = batch.get("image_xyz_relative")
-            if image_xyz_relative is not None:
-                image_xyz_relative = [xyz.to(device) for xyz in image_xyz_relative]
-
             labels = batch.get("labels")
             if labels is not None:
                 labels = labels.to(device)
 
             # ── forward + loss ────────────────────────────────────────────────
-            if args.relative:
-                _, loss, loss_dict = model(
-                    input_ids          = input_ids,
-                    attention_mask     = attention_mask,
-                    pixel_values       = pixel_values,
-                    image_grid_thw     = image_grid_thw,
-                    image_xyz_relative = image_xyz_relative,
-                    labels             = labels,
-                )
-            else:
-                _, loss, loss_dict = model(
-                    input_ids      = input_ids,
-                    attention_mask = attention_mask,
-                    pixel_values   = pixel_values,
-                    image_grid_thw = image_grid_thw,
-                    image_xyz      = image_xyz,
-                    labels         = labels,
-                )
+            _, loss, loss_dict = model(
+                input_ids      = input_ids,
+                attention_mask = attention_mask,
+                pixel_values   = pixel_values,
+                image_grid_thw = image_grid_thw,
+                image_xyz      = image_xyz,
+                labels         = labels,
+            )
             
             if loss is None:
                 log.warning(f"[rank{local_rank}] Step {step}: loss is None, skipping.")
@@ -741,7 +666,6 @@ def train(args: argparse.Namespace) -> None:
                             t_thw   = test_batch.get("image_grid_thw")
                             t_labels = test_batch.get("labels")
                             t_xyz     = test_batch.get("image_xyz")
-                            t_xyz_rel = test_batch.get("image_xyz_relative")
                             if t_pv is not None:
                                 t_pv = t_pv.to(device, dtype=torch.bfloat16)
                             if t_thw is not None:
@@ -750,12 +674,9 @@ def train(args: argparse.Namespace) -> None:
                                 t_labels = t_labels.to(device)
                             if t_xyz is not None:
                                 t_xyz = [x.to(device) for x in t_xyz]
-                            if t_xyz_rel is not None:
-                                t_xyz_rel = [x.to(device) for x in t_xyz_rel]
                             try:
                                 # Match training input distribution per mode:
                                 #   vanilla       — no xyz kwargs (stock Qwen)
-                                #   --relative    — image_xyz_relative (per-frame)
                                 #   --polar       — image_xyz + polar=True (xyz→log-spherical in M-RoPE)
                                 #   default/decouple — image_xyz
                                 _eval_fwd_kwargs = dict(
@@ -765,9 +686,7 @@ def train(args: argparse.Namespace) -> None:
                                     kv_cache=(ds_name == "spinbench"),
                                 )
                                 if not args.vanilla:
-                                    if args.relative and t_xyz_rel is not None:
-                                        _eval_fwd_kwargs["image_xyz_relative"] = t_xyz_rel
-                                    elif t_xyz is not None:
+                                    if t_xyz is not None:
                                         _eval_fwd_kwargs["image_xyz"] = t_xyz
                                     if args.polar:
                                         _eval_fwd_kwargs["polar"] = True
@@ -935,15 +854,6 @@ def parse_args() -> argparse.Namespace:
              "only LM answer loss.",
     )
     p.add_argument(
-        "--relative",
-        action="store_true",
-        help="Enable relative mode: per-query-frame coordinate transformation in "
-             "4D M-RoPE. Q from frame f sees ALL K tokens' xyz in frame-f camera "
-             "coordinates. Uses MindCube_Train_Dataset_Relative and "
-             "SpaRelativeForConditionalGeneration. Incompatible with --vanilla. "
-             "Polar coordinates are enabled by default in this mode.",
-    )
-    p.add_argument(
         "--polar",
         action="store_true",
         help="Convert per-patch Cartesian (x, y, z) → log-spherical (log ρ, θ, α) "
@@ -952,16 +862,7 @@ def parse_args() -> argparse.Namespace:
              "θ = atan2(y,x) ∈ [-π,π] (azimuth), "
              "α = atan2(√(x²+y²), z) ∈ [0,π] (inclination). "
              "Matches train_coordinate.py polar convention. "
-             "No effect when --vanilla is set. In --relative mode, polar is on by default.",
-    )
-    p.add_argument(
-        "--interleave_vision",
-        action="store_true",
-        help="Use interleaved M-RoPE layout for visual tokens: t keeps its "
-             "mrope_section[0] bands at the high-freq end, then x/y/z round-robin "
-             "through the remaining bands so each spans the full freq range. "
-             "Independent of --polar; combinable with --polar / --relative. "
-             "No effect when --vanilla or --decouple is set.",
+             "No effect when --vanilla is set.",
     )
     p.add_argument(
         "--decouple",
@@ -970,7 +871,7 @@ def parse_args() -> argparse.Namespace:
              "in the rotary 64 dims (UNCHANGED) and add a NEW XYZ RoPE (66 dims, "
              "sequential x|y|z each 11 bands, rope_theta=1000) in pass-through "
              "dims 64..129. Text tokens default to xyz=(0,0,0) → identity rotation. "
-             "Mutually exclusive with --vanilla / --polar / --relative.",
+             "Mutually exclusive with --vanilla / --polar.",
     )
     p.add_argument(
         "--xyz_rope_dim",

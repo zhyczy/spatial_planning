@@ -112,20 +112,19 @@ With θ=1000, the 11 bands span roughly natural Δ from 0.03 (band 1 useful floo
 
 ## 5. Mutual exclusivity
 
-`--polar` raises `ValueError` when combined with `--vanilla`, `--relative`, or `--decouple`. (`--polar` already implies the decouple architecture; `--decouple` specifies the Cartesian variant — so `--polar --decouple` is redundant and disallowed.)
+`--polar` raises `ValueError` when combined with `--vanilla` or `--decouple`. (`--polar` already implies the decouple architecture; `--decouple` specifies the Cartesian variant — so `--polar --decouple` is redundant and disallowed.)
 
 ```
 [train_correspondence.py] build_model:
-    if polar and vanilla:   raise ValueError(...)
-    if decouple and relative: raise ValueError(...)
-    if polar and decouple:  raise ValueError("--polar already implies decouple ...")
+    if polar and vanilla:  raise ValueError(...)
+    if decouple and vanilla: raise ValueError(...)
+    if polar and decouple: raise ValueError("--polar already implies decouple ...")
 ```
 
 | Flag combination | Architecture | XYZ channel input |
 |------------------|--------------|-------------------|
 | (none) | `SpaForConditionalGeneration` 4D M-RoPE | Cartesian on rotary 64 |
 | `--vanilla` | `Qwen3_5ForConditionalGeneration` | — |
-| `--relative` | `SpaRelativeForConditionalGeneration` | per-frame polar on rotary 64 |
 | `--decouple` | `SpaDecForConditionalGeneration` θ=10000 | Cartesian on dims 64..129 |
 | **`--polar`** | `SpaDecForConditionalGeneration` θ=1000 | **log-spherical on dims 64..129** |
 

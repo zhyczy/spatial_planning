@@ -12,7 +12,6 @@ Relation to other scripts:
 |---|---|---|---|
 | `train_correspondence.py` | LM only | none | `--decouple` / `--polar` / `--vanilla` / default 4D |
 | `train_coordinate.py` | LM + per-patch xyz regression | `DepthPredictionTransformer` | same set (`--decouple` / `--polar` / default 4D) |
-| `train_geo.py` | LM + multi-view triplet + xyz-image match | `nn.Linear(2,)` match head | `--decouple` only |
 
 ## 2. Loss
 
@@ -212,4 +211,4 @@ bash scripts/train_coordinate.sh 1 --decouple --max_samples 6
 ## 9. Related docs
 
 - Position-embedding path: [decouple_xyz_rope.md](decouple_xyz_rope.md), [polar_rope.md](polar_rope.md)
-- Motivation for moving beyond coord regression: [../discussion/learning_real_3d_geometry.md](../discussion/learning_real_3d_geometry.md) — argues the coord head is **vision-driven** (it cheats), and proposes multi-view contrastive / xyz-match as shortcut-resistant alternatives (implemented in `train_geo.py`).
+- Motivation for moving beyond coord regression: [../discussion/learning_real_3d_geometry.md](../discussion/learning_real_3d_geometry.md) — argues the coord head is **vision-driven** (it cheats), and proposes multi-view contrastive / xyz-match as shortcut-resistant alternatives.

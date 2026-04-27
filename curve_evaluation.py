@@ -130,7 +130,6 @@ def run_evaluation(
     limit: int | None,
     gpus: str,
     max_new_tokens: int,
-    interleaving: bool = False,
 ) -> Path | None:
     """Run evaluation.py for one (step, dataset) and return the output sub-dir."""
     ckpt_path = ckpt_dir / f"step_{step}"
@@ -171,8 +170,6 @@ def run_evaluation(
     ]
     if limit is not None:
         cmd += ["--limit", str(limit)]
-    if interleaving:
-        cmd += ["--interleaving"]
 
     env = os.environ.copy()
     if gpus:
@@ -279,7 +276,6 @@ def _save_summary(
             "step_size":    args.step_size,
             "method":       args.method,
             "datasets":     datasets,
-            "interleaving": getattr(args, "interleaving", False),
         },
         "by_dataset": {
             ds: {str(s): a for s, a in step_acc.items()}
@@ -314,7 +310,7 @@ def main() -> None:
     parser.add_argument(
         "--method", type=str, default="coordinate",
         choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
-                 "decouple", "rotation", "rotation_rl"],
+                 "decouple", "rotation", "rotation_rl", "atten"],
         help="Evaluation method (default: coordinate).",
     )
     parser.add_argument(
@@ -338,12 +334,6 @@ def main() -> None:
     parser.add_argument(
         "--max_new_tokens", type=int, default=512,
         help="Max new tokens for generation (default: 512).",
-    )
-    parser.add_argument(
-        "--interleaving", action="store_true", default=False,
-        help="Forward --interleaving to evaluation.py: use interleaved M-RoPE "
-             "band layout for visual tokens ([tt, x, y, z, x, y, z, ...]). "
-             "Must match the training-time setting of the checkpoint.",
     )
     args = parser.parse_args()
 
@@ -372,7 +362,6 @@ def main() -> None:
     logger.info(f"  steps        : {steps}")
     logger.info(f"  datasets     : {datasets}")
     logger.info(f"  method       : {args.method}")
-    logger.info(f"  interleaving : {args.interleaving}")
     logger.info(f"  output_dir   : {output_dir}")
     logger.info("=" * 60)
 
@@ -414,7 +403,6 @@ def main() -> None:
                 limit=args.limit,
                 gpus=args.gpus,
                 max_new_tokens=args.max_new_tokens,
-                interleaving=args.interleaving,
             )
 
             if run_dir is None:

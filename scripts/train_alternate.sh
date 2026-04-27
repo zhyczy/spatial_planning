@@ -31,7 +31,7 @@
 # Usage:
 #   bash scripts/train_alternate.sh [num_gpus] [--train_data NAME] \
 #       [--max_samples N] [--coord_weight W] [--coord_scale S] \
-#       [--no_coord] [--relative] [--decouple] [--xyz_rope_dim D] \
+#       [--no_coord] [--decouple] [--xyz_rope_dim D] \
 #       [--lr_phase_a LR] [--lr_phase_b LR]
 #
 #   num_gpus         — first positional arg, number of GPUs (default: all)
@@ -40,14 +40,10 @@
 #   --coord_weight W — weight for coordinate L1 loss (default: 1.0)
 #   --coord_scale S  — XYZ discretization multiplier, must match MLLM (default: 100.0)
 #   --no_coord       — disable coord loss / coord_head forward entirely
-#   --relative       — coord_head predicts original (un-rotated) xyz with
-#                      detached cam_feat conditioning from rotation_enc.
-#                      Mutually exclusive with --decouple.
 #   --decouple       — Decoupled XYZ RoPE: keep Qwen original 3D M-RoPE
 #                      [11,11,10] in rotary 64 dims, add separate XYZ RoPE in
 #                      pass-through dims 64..129 fed with R-rotated Cartesian
 #                      xyz. Mirrors --decouple in train_correspondence.py.
-#                      Mutually exclusive with --relative.
 #   --xyz_rope_dim D — XYZ RoPE dim under --decouple (positive multiple of
 #                      6 ≤ 192; default 66). No effect without --decouple.
 #   --lr_phase_a LR  — base LR for Phase A (LoRA + coord_head); independent
@@ -98,7 +94,6 @@ MAX_SAMPLES=""
 COORD_WEIGHT=""
 COORD_SCALE=""
 NO_COORD_CLI=false
-RELATIVE_CLI=false
 DECOUPLE_CLI=false
 XYZ_ROPE_DIM_CLI=""
 LR_PHASE_A_CLI=""
@@ -121,8 +116,6 @@ while [ $# -gt 0 ]; do
             COORD_SCALE="$2"; shift 2 ;;
         --no_coord)
             NO_COORD_CLI=true; shift ;;
-        --relative)
-            RELATIVE_CLI=true; shift ;;
         --decouple)
             DECOUPLE_CLI=true; shift ;;
         --xyz_rope_dim)
@@ -183,12 +176,9 @@ EPOCHS=6
 NO_COORD=$NO_COORD_CLI  # true → disable coord loss / coord_head entirely
                         # (LM loss only; coord_head frozen by no-grad)
                         # toggle via `--no_coord` CLI flag
-RELATIVE=$RELATIVE_CLI  # true → coord_head predicts original (un-rotated) xyz
-                        # with detached cam_feat conditioning; toggle via `--relative`
 DECOUPLE=$DECOUPLE_CLI  # true → SpaDec backbone with stock 3D M-RoPE in rotary
                         # 64 dims + separate XYZ RoPE in pass-through 64..129
                         # fed with R-rotated xyz; toggle via `--decouple`
-                        # (mutually exclusive with --relative)
 XYZ_ROPE_DIM="${XYZ_ROPE_DIM_CLI:-66}"  # XYZ RoPE dim under --decouple
                                         # (positive multiple of 6 ≤ 192)
 REG=$REG_CLI            # true → Phase A lm_loss replaced by composite loss
@@ -238,9 +228,6 @@ _METHOD="rotation_alternate"
 if [ "$NO_COORD" = "true" ]; then
     _METHOD="${_METHOD}_no_coord"
 fi
-if [ "$RELATIVE" = "true" ]; then
-    _METHOD="${_METHOD}_relative"
-fi
 if [ "$DECOUPLE" = "true" ]; then
     _METHOD="${_METHOD}_decouple"
 fi
@@ -274,7 +261,6 @@ echo "[INFO] RESULTS_DIR          = $RESULTS_DIR"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EPOCHS               = $EPOCHS"
 echo "[INFO] NO_COORD             = $NO_COORD"
-echo "[INFO] RELATIVE             = $RELATIVE"
 echo "[INFO] DECOUPLE             = $DECOUPLE"
 if [ "$DECOUPLE" = "true" ]; then
     echo "[INFO]   xyz_rope_dim       = $XYZ_ROPE_DIM"
@@ -304,11 +290,6 @@ fi
 NO_COORD_FLAG=""
 if [ "$NO_COORD" = "true" ]; then
     NO_COORD_FLAG="--no_coord"
-fi
-
-RELATIVE_FLAG=""
-if [ "$RELATIVE" = "true" ]; then
-    RELATIVE_FLAG="--relative"
 fi
 
 DECOUPLE_FLAG=""
@@ -367,7 +348,6 @@ $TORCHRUN \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
     $MAX_SAMPLES_FLAG \
     $NO_COORD_FLAG \
-    $RELATIVE_FLAG \
     $DECOUPLE_FLAG \
     $LR_PHASE_A_FLAG \
     $LR_PHASE_B_FLAG \

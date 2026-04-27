@@ -26,7 +26,6 @@ class DepthPredictionTransformer(nn.Module):
         dim_feedforward: int   = 2048,
         upscale_factor:  int   = 4,
         dropout:         float = 0.0,
-        cam_dim:         int   = 0,
     ):
         super().__init__()
         self.upscale_factor = upscale_factor
@@ -34,14 +33,6 @@ class DepthPredictionTransformer(nn.Module):
 
         self.input_proj  = nn.Linear(hidden_dim, d_model)
 
-        # Optional projection for camera conditioning token (--relative mode).
-        # When cam_dim > 0, a detached cam_feat from the rotation encoder is
-        # projected to d_model and prepended to the token sequence before the
-        # transformer.  The cam token is stripped after the transformer so it
-        # does not affect PixelShuffle output shape.
-        self.cam_proj: nn.Linear | None = None
-        if cam_dim > 0:
-            self.cam_proj = nn.Linear(cam_dim, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model        = d_model,
             nhead          = nhead,
@@ -90,33 +81,18 @@ class DepthPredictionTransformer(nn.Module):
         hidden: torch.Tensor,   # (h*w, hidden_dim)
         h: int,
         w: int,
-        cam_feat: torch.Tensor | None = None,   # (cam_dim,) detached cam token
     ) -> torch.Tensor:
         """
         Args:
             hidden:   (h*w, hidden_dim) — vision token hidden states
             h:        LLM patch grid height
             w:        LLM patch grid width
-            cam_feat: optional camera conditioning token from rotation encoder
-                      (detached). Projected and prepended before the transformer,
-                      then stripped so it does not affect the output grid.
         Returns:
             (h*upscale, w*upscale, 3) — predicted xyz at sub-pixel resolution
         """
         x  = self.input_proj(hidden)                                    # (h*w, d_model)
         x  = x + self._sinusoidal_2d_pe(h, w, x.device, x.dtype)       # add 2D PE
-
-        # Optionally prepend camera conditioning token
-        if cam_feat is not None and self.cam_proj is not None:
-            cam_tok = self.cam_proj(cam_feat).unsqueeze(0)              # (1, d_model)
-            x = torch.cat([cam_tok.to(dtype=x.dtype), x], dim=0)       # (1+h*w, d_model)
-
-        x  = self.transformer(x.unsqueeze(0)).squeeze(0)                # (N, d_model)
-
-        # Strip camera token if it was prepended
-        if cam_feat is not None and self.cam_proj is not None:
-            x = x[1:]                                                   # (h*w, d_model)
-
+        x  = self.transformer(x.unsqueeze(0)).squeeze(0)                # (h*w, d_model)
         x  = self.output_proj(x)                                        # (h*w, 3*up²)
         x  = x.view(1, h, w, -1).permute(0, 3, 1, 2)                   # (1, 3*up², h, w)
         x  = self.pixel_shuffle(x)                                      # (1, 3, h*up, w*up)

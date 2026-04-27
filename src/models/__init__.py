@@ -1,11 +1,6 @@
 from .correspondence_llm import rot6d_to_rotmat
-from .answer_llm import AnswerOnlyModel, AnswerRelativeModel
+from .answer_llm import AnswerOnlyModel
 from .spa_emb import SpaForConditionalGeneration
-from .spa_emb_relative import (
-    SpaRelativeForConditionalGeneration,
-    SpaRelativeAttentionWrapper,
-    patch_attention_layers,
-)
 from .spa_emb_dec import (
     SpaDecForConditionalGeneration,
     SpaDecAttentionWrapper,
@@ -20,4 +15,11 @@ from .rotation_rope_llm import (
     CameraTokenRotationEncoder,
     CameraTokenRotationEncoderRL,
     RotationRoPEModel,
+)
+from .spatial_attention_block import SpatialAttentionBias
+from .spatial_attention_llm import (
+    SpatialAttnWrapper,
+    SpatialAttnVanillaTextModel,
+    SpatialAttnVanillaModel,
+    patch_attention_layers_spatial,
 )

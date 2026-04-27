@@ -1,11 +1,30 @@
 # Evaluation Datasets — Task Taxonomy & Rotation Coverage
 
-**Date:** 2026-04-22
+**Date:** 2026-04-22 (last updated 2026-04-27)
 **Scope:** `spatial_planning/datasets/evaluation/`
 
 Cross-references:
 - Training side: [train_datasets.md](train_datasets.md)
 - Rotation anchor details: [rotation_axes.md](rotation_axes.md)
+- Spatial-attention model design: [../model_design/spatial_attention.md](../model_design/spatial_attention.md)
+
+---
+
+## 0. Evaluation pipeline composition
+
+`evaluation.py` supports **11 datasets** via `--dataset`. Driver scripts
+(`scripts/evaluate.sh`, `curve_evaluation.{py,sh}`) default to a 7-dataset
+sweep:
+`mindcube · sat_real · spinbench · robospatial · viewspatial · omnispatial_pt · embspatial`.
+The other 4 (`mmsibench · sat · sparbench_{multi_view,single_view,mv}`) are
+opt-in via `--datasets`.
+
+`All_Angles_Bench` is present on disk and covered in §2.1 for taxonomy /
+rotation-coverage analysis but is **not** wired into `evaluation.py`.
+Three datasets that are wired into `evaluation.py` — `viewspatial`,
+`omnispatial_pt`, `embspatial`, plus the combined `sparbench_mv` —
+do not yet have entries in §2 (only their answer-format properties are
+covered in §7).
 
 ---
 
@@ -21,7 +40,6 @@ Cross-references:
 | SPARBench (mv) | `sparbench_multi_view.json` | 1,462 |
 | SPARBench (sv) | `sparbench_single_view.json` | 1,038 |
 | spinbench | `test.jsonl` | 2,739 |
-| vsibench | `test.jsonl` | 5,130 |
 
 ---
 
@@ -128,34 +146,17 @@ By `metadata.task_type` (top families):
 
 **Largest rotation-focused eval** (~1,100 yaw-related samples) but strictly yaw / view-azimuth. No pitch/roll.
 
-### 2.8 vsibench (N = 5,130) — video spatial understanding
-
-| N | question_type | Task |
-|---:|---|---|
-| 953 | object_size_estimation | Object dimension (cm) |
-| 834 | object_abs_distance | Object-object distance (m) |
-| 710 | object_rel_distance | Closest object to X |
-| 618 | obj_appearance_order | First-appearance order in video |
-| 565 | object_counting | Count objects |
-| 378 | object_rel_direction_medium | left/right/back (≥135° threshold) |
-| 373 | object_rel_direction_hard | front-left / front-right / back-left / back-right |
-| 288 | room_size_estimation | Room area |
-| 217 | object_rel_direction_easy | Binary left/right |
-| 194 | route_planning | Fill-in turn back / left / right |
-
-96% is metric/counting/direction-word; 194 `route_planning` is the only yaw-like block.
-
 ---
 
-## 3. Capability dimensions (pooled across all 9 evals)
+## 3. Capability dimensions (pooled across the 8 evals in §1)
 
 | Dimension | Approx N | Typical datasets |
 |---|---:|---|
 | Continuous-angle yaw reasoning (N°) | ~3,500 | SAT val 2,136; spinbench ≈1,100; MMSIBench ≈150 |
-| Discrete direction words (front/back/left/right/up/down) | ~7,000 | vsibench 968; MMSIBench 527; SPARBench 2,500 |
+| Discrete direction words (front/back/left/right/up/down) | ~6,000 | MMSIBench 527; SPARBench 2,500 |
 | Cross-view identity / canonical-view selection | ~1,500 | All_Angles_Bench 735; spinbench ≈400; SPARBench imagination 701 |
-| Translation / motion direction | ~17,500 | MindCube 17,000; MMSIBench 150; SAT obj_movement 647; vsibench 194 |
-| Metric (size / distance / count) | ~5,000 | vsibench 3,368; All_Angles_Bench 745; RoboSpatial 105 |
+| Translation / motion direction | ~17,500 | MindCube 17,000; MMSIBench 150; SAT obj_movement 647 |
+| Metric (size / distance / count) | ~1,650 | All_Angles_Bench 745; RoboSpatial 105 |
 | Pointing / yes-no / attributes | ~700 | RoboSpatial 350; MMSIBench 130; SAT subsets |
 
 ---
@@ -174,7 +175,6 @@ Regex conventions: yaw = {turn/rotate left|right, clockwise/counterclockwise, he
 | SPARBench mv | 1,462 | 0 | 0 | 0 |
 | SPARBench sv | 1,038 | 0 | 0 | 0 |
 | spinbench | 2,739 | 377 | 0 | 0 |
-| vsibench | 5,130 | 194 | 0 | 0 |
 
 † 3 hits are scene-context descriptions ("standing on stairs, looking down"), not prediction labels.
 
@@ -182,7 +182,7 @@ Regex conventions: yaw = {turn/rotate left|right, clockwise/counterclockwise, he
 
 ## 5. Rotation-axis coverage in eval
 
-Across **all 9 evaluation benchmarks, the only rotation axis probed is yaw**. Zero pitch / roll prediction tasks exist. Consequences:
+Across **all 8 evaluation benchmarks, the only rotation axis probed is yaw**. Zero pitch / roll prediction tasks exist. Consequences:
 
 1. Even if training data grows pitch/roll labels (e.g. full SPAR_7M `view_change_infer`), there is no held-out eval to measure generalization.
 2. `CameraTokenRotationEncoderRL`'s 24-anchor head can collapse its non-yaw bins (15 / 24 mixed-axis anchors) to a constant without any eval penalty — consistent with the dataset-constant-R finding in [../rotation_diversity_analysis.md](../rotation_diversity_analysis.md).
@@ -201,3 +201,43 @@ The 6,327 yaw-keyword hits in MindCube are misleading. Breakdown:
 | Actual "which way did I rotate" style | 0 | Not present in MindCube eval |
 
 The dominant eval task in MindCube (~17,000 samples under `0/1/2/3_frame` etc.) asks for **translation direction**, not rotation. See [train_datasets.md §1.2](train_datasets.md#12-what-each-bucket-actually-learns) for the training-side A-bucket counterpart.
+
+---
+
+## 7. Answer formats (verified empirically against on-disk files)
+
+Every dataset wired into `evaluation.py` emits the loader's `answer` field in
+one of two shapes — single ASCII letter, or numeric string. `evaluation.py`
+dispatches scoring via the per-sample `format_type` field
+(`select` → `extract_answer_letter` + exact match;
+ `fill` → `extract_answer_number` + `_mra_score`).
+
+| Dataset | n | format | Verification |
+|---|---:|---|---|
+| mmsibench             | 1,000 | 100% single A/B/C/D | 265 A · 255 C · 250 B · 230 D |
+| mindcube (tinybench)  | 1,050 | 100% single A/B/C/D | 361 B · 342 A · 210 C · 137 D |
+| spinbench             | 2,739 | 100% single A/B/C/D | 1131 B · 1130 A · 391 C · 87 D |
+| sat                   |   150 | 100% single letter (all 'A' — likely a pruned subset) | suspicious distribution |
+| sparbench_multi_view  | 1,462 | 100% single A/B/C/D | 382 A · 361 B · 361 C · 358 D |
+| sparbench_single_view | 1,038 | 100% single A/B/C/D | 273 D · 257 B · 254 A · 254 C |
+| sparbench_mv          | 3,152 | **mixed** — 1,798 `select` + 1,354 `fill` | letters A–D for select; numerics like `1.2`, `2.6` for fill |
+| viewspatial           | 5,712 | 100% single A/B/C/D | letter parsed from `"X. text"` answer string |
+| omnispatial_pt        |   561 | 100% single A/B/C/D | derived from int answer-index |
+| embspatial            | 3,640 | 100% single A/B/C/D | derived from int answer-index over 4 options |
+| robospatial           |   350 | yes/no + (x,y) pointing | dispatched via `format_type="robospatial"` |
+
+**MindCube + SpinBench** are also the two datasets the inline eval inside
+[../../train_atten.py](../../train_atten.py) runs after each `eval_steps`. The
+inline eval reports `{ds}_acc` as **first-token argmax accuracy** —
+implicitly assumes the answer is exactly one token. Since every
+MindCube/SpinBench answer is a single capital letter and Qwen tokenizes
+A/B/C/D as single tokens, **first-token accuracy ≡ answer accuracy**
+on these two datasets. This equivalence breaks if a future eval is wired in
+where answers are multi-token (e.g. parenthesized `(A)`, free-form text,
+multi-digit numerics, or any tokenizer that introduces a leading-space
+variant) — at that point switch to all-position match or `.generate()` +
+exact match. See [../model_design/spatial_attention.md §10](../model_design/spatial_attention.md#10-open-questions--future-work).
+
+`evaluation.py` itself does NOT have this issue — it always uses
+`.generate()` followed by regex extraction, so multi-token answers are
+handled correctly when present.

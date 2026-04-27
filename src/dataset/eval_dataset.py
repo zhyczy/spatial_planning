@@ -92,7 +92,6 @@ class Eval_Dataset_Coord(Dataset):
         max_samples:        int | None = None,
         question_key:       str = "question",
         answer_key:         str = "gt_answer",
-        relative:           bool = False,
     ):
         raw = []
         with open(jsonl_path) as fh:
@@ -117,12 +116,10 @@ class Eval_Dataset_Coord(Dataset):
         self.coord_upscale      = coord_upscale
         self.question_key       = question_key
         self.answer_key         = answer_key
-        self.relative           = relative
         self.log                = log
         log.info(
             f"Eval_Dataset_Coord: {len(self.samples)} valid entries "
             f"(out of {len(raw)} total) from {jsonl_path}"
-            f"{'  [relative=True]' if relative else ''}"
         )
 
     def __len__(self):
@@ -131,10 +128,9 @@ class Eval_Dataset_Coord(Dataset):
     def __getitem__(self, idx):
         entry, sample_dir = self.samples[idx]
 
-        # ── load images, per-pixel xyz, camera poses ─────────────────────────
+        # ── load images, per-pixel xyz ───────────────────────────────────────
         view_dirs = sorted(d for d in os.listdir(sample_dir) if d.startswith("view_"))
         images, xyz_raw_list, mask_raw_list = [], [], []
-        poses = []
         for vd in view_dirs[: self.max_images]:
             img_path = os.path.join(sample_dir, vd, "image.png")
             try:
@@ -150,12 +146,6 @@ class Eval_Dataset_Coord(Dataset):
             mask_raw_list.append(
                 np.load(mask_path) if os.path.exists(mask_path) else None
             )
-            if self.relative:
-                pose_path = os.path.join(sample_dir, vd, "camera_pose.npy")
-                poses.append(
-                    np.load(pose_path).astype(np.float64)
-                    if os.path.exists(pose_path) else None
-                )
 
         N = len(images)
 
@@ -211,56 +201,10 @@ class Eval_Dataset_Coord(Dataset):
         except Exception as exc:
             self.log.debug(f"pts3d load failed for {sample_dir}: {exc}")
 
-        # ── per-frame relative xyz (only when self.relative=True) ────────────
-        image_xyz_relative = None
-        if self.relative:
-            try:
-                w2c_list = []
-                for f in range(N):
-                    if f < len(poses) and poses[f] is not None:
-                        try:
-                            w2c_list.append(np.linalg.inv(poses[f]).astype(np.float32))
-                        except np.linalg.LinAlgError:
-                            w2c_list.append(None)
-                    else:
-                        w2c_list.append(None)
-
-                thw_all = proc_out["image_grid_thw"]
-                sms     = self.spatial_merge_size
-                xyz_rel_list = []
-                for k in range(N):
-                    xyz_raw  = xyz_raw_list[k]
-                    mask_raw = mask_raw_list[k]
-                    thw_k    = thw_all[k]
-                    llm_h    = int(thw_k[1]) // sms
-                    llm_w    = int(thw_k[2]) // sms
-                    if xyz_raw is None:
-                        xyz_rel_list.append(torch.zeros(N, llm_h, llm_w, 3))
-                        continue
-                    xyz_world      = resize_xyz(xyz_raw, llm_h, llm_w, valid=mask_raw)
-                    xyz_world_flat = xyz_world.reshape(-1, 3).numpy().astype(np.float32)
-                    frames_for_k   = []
-                    for f in range(N):
-                        w2c = w2c_list[f]
-                        if w2c is None:
-                            frames_for_k.append(torch.zeros(llm_h, llm_w, 3))
-                            continue
-                        R_wc = w2c[:3, :3]
-                        t_wc = w2c[:3,  3]
-                        xyz_cam = (xyz_world_flat @ R_wc.T) + t_wc
-                        frames_for_k.append(
-                            torch.from_numpy(xyz_cam).reshape(llm_h, llm_w, 3)
-                        )
-                    xyz_rel_list.append(torch.stack(frames_for_k, dim=0))
-                image_xyz_relative = xyz_rel_list
-            except Exception as exc:
-                self.log.debug(f"image_xyz_relative computation failed for {sample_dir}: {exc}")
-
         return {
             **proc_out,
             "image_xyz":          image_xyz,
             "image_xyz_hires":    image_xyz_hires,
-            "image_xyz_relative": image_xyz_relative,
             "labels":             labels,
         }
 
@@ -272,7 +216,9 @@ def load_testing_dataset(
 ) -> List[Dict[str, Any]]:
     """Load evaluation dataset.
 
-    Supports: mmsibench | mindcube | sat | vsibench
+    Supports: mmsibench | mindcube | sat | sat_real | sparbench_multi_view |
+              sparbench_single_view | sparbench_mv | spinbench | robospatial |
+              viewspatial | omnispatial_pt | embspatial
     Image paths are resolved to absolute paths.
     """
     data_dir = Path(data_dir)
@@ -355,26 +301,6 @@ def load_testing_dataset(
                 "question": question_text,
                 "answer": answer_letter,
                 "category": item.get("question_type", item.get("type", "unknown")),
-                "thought": "",
-                "data_dir": str(data_dir),
-            })
-
-    elif dataset == "vsibench":
-        jsonl_file = data_dir / "test.jsonl"
-        if not jsonl_file.exists():
-            raise FileNotFoundError(f"Dataset file not found: {jsonl_file}")
-        with open(jsonl_file, "r", encoding="utf-8") as f:
-            raw = [json.loads(line) for line in f if line.strip()]
-        if limit is not None:
-            raw = raw[:limit]
-        for item in raw:
-            image_paths = [str((data_dir / p).resolve()) for p in item.get("images", [])]
-            samples.append({
-                "index": item.get("id", len(samples)),
-                "image": image_paths,
-                "question": item.get("question", ""),
-                "answer": item.get("answer", item.get("gt_answer", "")),
-                "category": item.get("type", "unknown"),
                 "thought": "",
                 "data_dir": str(data_dir),
             })
@@ -626,7 +552,7 @@ def load_testing_dataset(
     else:
         raise ValueError(
             f"Unknown dataset '{dataset}'. "
-            "Choose: mmsibench | mindcube | sat | sat_real | vsibench | "
+            "Choose: mmsibench | mindcube | sat | sat_real | "
             "sparbench_multi_view | sparbench_single_view | sparbench_mv | "
             "spinbench | robospatial | viewspatial | omnispatial_pt | embspatial"
         )

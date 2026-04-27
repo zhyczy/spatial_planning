@@ -146,7 +146,6 @@ def build_model(
     rot_nhead:          int   = 4,
     rot_dim_feedforward: int  = 2048,
     rot_num_layers:     int   = 2,
-    relative:           bool  = False,
     decouple:           bool  = False,
     xyz_rope_dim:       int   = 66,
 ) -> RotationRoPEModel:
@@ -159,12 +158,9 @@ def build_model(
                      fed with **R-rotated Cartesian xyz**. R is still predicted
                      by rotation_enc (gradient flows through the XYZ RoPE
                      since SpaXYZRotaryEmbedding has no @torch.no_grad).
-                     Mutually exclusive with --relative.
     xyz_rope_dim   → total dims for the pass-through XYZ RoPE (must be a
                      positive multiple of 6 ≤ 192). Only used with --decouple.
     """
-    if decouple and relative:
-        raise ValueError("--decouple is mutually exclusive with --relative.")
     if xyz_rope_dim % 6 != 0 or xyz_rope_dim <= 0 or xyz_rope_dim > 192:
         raise ValueError(
             f"--xyz_rope_dim must be a positive multiple of 6 ≤ 192 "
@@ -319,14 +315,10 @@ def build_model(
         f"dim_feedforward={rot_dim_feedforward}  num_layers={rot_num_layers}"
     )
 
-    cam_dim = rotation_enc.d_model if relative else 0
     coord_head = DepthPredictionTransformer(
         hidden_dim=hidden_dim, upscale_factor=coord_upscale,
-        cam_dim=cam_dim,
     ).to(torch.bfloat16)
-    log.info(f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}"
-             f"  cam_dim={cam_dim}" if relative else
-             f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}")
+    log.info(f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}")
 
     return RotationRoPEModel(
         spa_model          = spa,
@@ -461,9 +453,7 @@ def _phase_a_reg_step(
                 labels              = labels,
                 coord_scale         = args.coord_scale,
                 use_coord_loss      = False,
-                use_relative        = args.relative,
                 detach_coord_hidden = True,
-                cam_feat            = None,
                 compute_reward      = False,
             )
             L_k_vals_S.append(
@@ -482,9 +472,7 @@ def _phase_a_reg_step(
             labels              = labels,
             coord_scale         = args.coord_scale,
             use_coord_loss      = False,
-            use_relative        = args.relative,
             detach_coord_hidden = True,
-            cam_feat            = None,
             compute_reward      = False,
         )
         L_opt_val = (
@@ -532,9 +520,7 @@ def _phase_a_reg_step(
         labels              = labels,
         coord_scale         = args.coord_scale,
         use_coord_loss      = (not args.no_coord),
-        use_relative        = args.relative,
         detach_coord_hidden = False,
-        cam_feat            = None,
         compute_reward      = False,
     )
     step_loss_opt = torch.zeros((), device=device)
@@ -565,9 +551,7 @@ def _phase_a_reg_step(
             labels              = labels,
             coord_scale         = args.coord_scale,
             use_coord_loss      = False,
-            use_relative        = args.relative,
             detach_coord_hidden = True,
-            cam_feat            = None,
             compute_reward      = False,
         )
         if lm_k_g is None:
@@ -652,7 +636,6 @@ def train(args: argparse.Namespace) -> None:
         rot_nhead           = args.rot_nhead,
         rot_dim_feedforward = args.rot_dim_feedforward,
         rot_num_layers      = args.rot_num_layers,
-        relative            = args.relative,
         decouple            = args.decouple,
         xyz_rope_dim        = args.xyz_rope_dim,
     )
@@ -813,12 +796,6 @@ def train(args: argparse.Namespace) -> None:
         + ("(coord_loss + coord_head DISABLED for entire run)"
            if args.no_coord
            else "(coord_loss active)")
-    )
-    log.info(
-        f">>> relative    = {args.relative}  "
-        + ("(coord GT = original xyz, cam_feat conditioning ON)"
-           if args.relative
-           else "(coord GT = R @ xyz, default)")
     )
     log.info(
         f">>> decouple    = {args.decouple}  "
@@ -1044,7 +1021,6 @@ def train(args: argparse.Namespace) -> None:
                         coord_scale         = args.coord_scale,
                         use_rotation_enc    = use_rot_enc,
                         use_coord_loss      = not args.no_coord,
-                        use_relative        = args.relative,
                         detach_coord_hidden = detach_coord_hidden,
                     )
 
@@ -1218,10 +1194,9 @@ def train(args: argparse.Namespace) -> None:
                                     inputs_embeds = _model.encode_inputs(
                                         t_ids, t_pv, t_thw,
                                     )
-                                    R_pred   = None
-                                    cam_feat = None
+                                    R_pred = None
                                     if use_rot_enc and t_xyz is not None and t_thw is not None:
-                                        R_pred, cam_feat = _model._call_rotation_enc(
+                                        R_pred, _ = _model._call_rotation_enc(
                                             inputs_embeds  = inputs_embeds,
                                             input_ids      = t_ids,
                                             image_xyz      = t_xyz,
@@ -1240,9 +1215,7 @@ def train(args: argparse.Namespace) -> None:
                                         labels              = t_labels,
                                         coord_scale         = args.coord_scale,
                                         use_coord_loss      = not args.no_coord,
-                                        use_relative        = args.relative,
                                         detach_coord_hidden = detach_coord_hidden,
-                                        cam_feat            = cam_feat,
                                         compute_reward      = True,
                                     )
                                 if lm_loss is None and coord_loss is None:
@@ -1465,17 +1438,11 @@ def parse_args() -> argparse.Namespace:
              "gradient and is effectively frozen.",
     )
     p.add_argument(
-        "--relative", action="store_true",
-        help="Relative coordinate prediction: coord_head predicts original "
-             "(un-rotated) xyz with detached cam_feat as conditioning.",
-    )
-    p.add_argument(
         "--decouple", action="store_true",
         help="Decoupled XYZ RoPE architecture: keep Qwen original 3D M-RoPE "
              "[11,11,10] in the rotary 64 dims (UNCHANGED) and add a separate "
              "XYZ RoPE in pass-through dims 64..129 fed with R-rotated "
-             "Cartesian xyz. Mirrors --decouple in train_correspondence.py. "
-             "Mutually exclusive with --relative.",
+             "Cartesian xyz. Mirrors --decouple in train_correspondence.py.",
     )
     p.add_argument(
         "--xyz_rope_dim", type=int, default=66,

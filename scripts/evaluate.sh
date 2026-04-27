@@ -10,7 +10,7 @@
 #   bash scripts/evaluate.sh [options]
 #
 # Options:
-#   --method    baseline | vanilla | position_embedding | coordinate | polar | decouple | rotation | rotation_rl | both
+#   --method    baseline | vanilla | position_embedding | coordinate | polar | decouple | rotation | rotation_rl | atten | both
 #               (default: both = baseline + coordinate)
 #   --ckpt      path to SPA LoRA checkpoint dir
 #               (required when method != baseline)
@@ -27,11 +27,6 @@
 #   --output    base output directory (default: train_records/eval_results)
 #   --run_name  optional sub-folder name (default: auto timestamp per dataset)
 #   --max_new_tokens  generation budget (default: 512)
-#   --interleaving    use interleaved M-RoPE band layout for visual tokens
-#                     ([tt, x, y, z, x, y, z, ...] — t at high-freq end,
-#                      x/y/z round-robin through remaining bands).
-#                     Must match the training-time setting; no effect for
-#                     baseline / vanilla.
 #
 # Method descriptions:
 #   baseline           — stock Qwen3.5-VL, no LoRA
@@ -50,6 +45,10 @@
 #                        Requires ckpt trained by train_alternate.py.
 #   rotation_rl        — same as rotation, but for train_rl.py ckpts
 #                        (rotation_enc has head_cls/head_res; R = compose_R(argmax logits, residual)).
+#   atten              — Qwen3.5-VL + LoRA + per-layer SpatialAttentionBias on V↔V attention.
+#                        Original 3D M-RoPE UNCHANGED; per-pair edge feature (n_x, n_y, n_z, d)
+#                        → per-layer 2-MLP → per-head bias. Requires spatial_bias.pt in ckpt.
+#                        Matches train_atten.py.
 #   both               — baseline + coordinate
 #
 # Examples:
@@ -103,7 +102,6 @@ LIMIT=""
 OUTPUT_BASE="$SPATIAL_DIR/eval_results"
 RUN_NAME=""
 THINKING=""
-INTERLEAVING=""
 MAX_NEW_TOKENS=512
 
 # All supported datasets (in evaluation order)
@@ -139,7 +137,6 @@ while [[ $# -gt 0 ]]; do
         --output)        OUTPUT_BASE="$2";     shift 2 ;;
         --run_name)      RUN_NAME="$2";        shift 2 ;;
         --thinking)      THINKING="--thinking";       shift  ;;
-        --interleaving)  INTERLEAVING="--interleaving"; shift  ;;
         --max_new_tokens) MAX_NEW_TOKENS="$2";    shift 2 ;;
         *)
             echo "[ERROR] Unknown argument: $1" >&2
@@ -152,7 +149,7 @@ done
 # Validate arguments
 # =============================================================================
 
-VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple rotation rotation_rl both"
+VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple rotation rotation_rl atten both"
 if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
     echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1
@@ -221,10 +218,6 @@ if [[ -n "$THINKING" ]]; then
     COMMON_FLAGS+=($THINKING)
 fi
 
-if [[ -n "$INTERLEAVING" ]]; then
-    COMMON_FLAGS+=($INTERLEAVING)
-fi
-
 if [[ -n "$LIMIT" ]]; then
     COMMON_FLAGS+=(--limit "$LIMIT")
 fi
@@ -239,9 +232,6 @@ echo "=========================================================="
 echo "[INFO] evaluate.sh"
 echo "[INFO]   Method              : $METHOD"
 echo "[INFO]   Datasets            : $DATASETS"
-if [[ -n "$INTERLEAVING" ]]; then
-    echo "[INFO]   Interleaving        : on"
-fi
 echo "[INFO]   CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<all>}"
 echo "[INFO]   Num GPUs            : $N_GPU"
 if [[ -n "$CKPT" ]]; then
