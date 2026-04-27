@@ -13,7 +13,7 @@ Typical usage:
 
 Architecture notes:
     * Dataset layout: reuses the same per-sample 3d_results roots that
-      train_rotation.py / evaluation.py already produce, so there's no second
+      train_alternate.py / evaluation.py already produce, so there's no second
       copy of data.
     * VGGT features (`vggt.npz`) are pre-extracted once per sample with a
       fixed (392, 518) input so every sample yields L=1036 patches (one of

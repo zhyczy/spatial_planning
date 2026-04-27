@@ -36,15 +36,6 @@ Multi-method QA evaluation:
       Input : images + question
       3D pos: precomputed Cartesian XYZ → XYZ RoPE on image patches
 
-  relative
-      Model : SpaRelativeForConditionalGeneration + LoRA  (trained with --relative,
-              correspondence-only; not to be confused with rotation_relative)
-              [4D M-RoPE; self_attn wrapped by SpaRelativeAttentionWrapper for
-               per-query-frame coordinate transforms]
-      Input : images + question
-      3D pos: precomputed Cartesian XYZ + per-frame relative xyz
-              (image_xyz_relative: list[(N_frames, llm_H, llm_W, 3)] per image)
-
   rotation
       Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
               + CameraTokenRotationEncoder (predicts canonical R)
@@ -53,19 +44,11 @@ Multi-method QA evaluation:
       3D pos: R = rotation_enc(merged_embeds, token_txyz_int);
               rotated_xyz = R @ xyz_world → 4D M-RoPE on image patches
       Coord : predicted in rotated frame; GT = R @ gt_xyz before MAE
-      Ckpt  : coord_head.pt must NOT contain cam_proj.* weights
-              (trained by train_rotation.py WITHOUT --relative).
-
-  rotation_relative
-      Same architecture as `rotation` at inference time, but paired with a
-      checkpoint trained by train_rotation.py --relative, i.e. the coord head
-      has an extra cam_proj (cam_dim = rotation_enc.d_model). cam_proj weights
-      are loaded but currently unused in forward (matches training).
-      Ckpt  : coord_head.pt MUST contain cam_proj.* weights.
+      Ckpt  : coord_head.pt must NOT contain cam_proj.* weights.
 
   rotation_rl
       Same architecture as `rotation` at inference time, but rotation_enc is a
-      CameraTokenRotationEncoderRL trained by train_rl.py (without --relative).
+      CameraTokenRotationEncoderRL trained by train_rl.py.
       Inference picks R via anchor argmax + residual:
           k = argmax(logits), R = R_bins[k] @ exp(hat(clamp·tanh(residual[k])))
       Ckpt  : rotation_enc.pt contains head_cls.* / head_res.* (NOT rot_head.*).
@@ -132,13 +115,9 @@ from peft import PeftModel
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 from src.models import (
     SpaForConditionalGeneration,
-    SpaRelativeForConditionalGeneration,
     DepthPredictionTransformer,
     CameraTokenRotationEncoder,
     CameraTokenRotationEncoderRL,
-)
-from src.models.spa_emb_relative import (
-    patch_attention_layers as _patch_relative_attention_layers,
 )
 from src.models.rotation_rope_llm import (
     _build_token_txyz_int,
@@ -343,7 +322,6 @@ def load_spa_model(
     interleaving: bool = False,
     decouple: bool = False,
     polar: bool = False,
-    relative: bool = False,
     xyz_rope_dim: int = 66,
 ) -> Tuple[Any, Any]:
     """Load SPA model with LoRA adapter.
@@ -354,9 +332,6 @@ def load_spa_model(
                        new XYZ RoPE in pass-through dims 64..129);
                        polar=True swaps XYZ RoPE θ from 10000 → 1000 and the
                        RoPE consumes log-spherical (log r, θ, α) at forward time.
-      relative=True  → SpaRelativeForConditionalGeneration (4D M-RoPE [2,10,10,10]
-                       + SpaRelativeAttentionWrapper on every self_attn; expects
-                       per-query-frame image_xyz_relative at inference time).
       else           → SpaForConditionalGeneration (4D M-RoPE [2,10,10,10]).
 
     interleaving=True sets language_model.rotary_emb.visual_interleave = True
@@ -367,23 +342,16 @@ def load_spa_model(
     ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=False)
     logger.info(
         f"[spa] Loading SPA model: base={base_model_path}  ckpt={ckpt_dir}  "
-        f"vanilla={vanilla} decouple={decouple} polar={polar} relative={relative}"
+        f"vanilla={vanilla} decouple={decouple} polar={polar}"
     )
 
     config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
 
     # Mutex checks — enforce the same mutual exclusions as training scripts.
-    if vanilla and (decouple or relative or polar):
+    if vanilla and (decouple or polar):
         raise ValueError(
-            "[spa] --vanilla is mutually exclusive with --decouple / --polar / --relative."
-        )
-    if decouple and relative:
-        raise ValueError("[spa] --decouple and --relative are mutually exclusive.")
-    if polar and relative:
-        raise ValueError(
-            "[spa] --polar implies the decouple architecture and is mutually "
-            "exclusive with --relative."
+            "[spa] --vanilla is mutually exclusive with --decouple / --polar."
         )
     if polar and not decouple:
         raise ValueError(
@@ -443,22 +411,16 @@ def load_spa_model(
                 f"(n_per_axis={xyz_rope_dim // 6}), theta={_xyz_theta:g}"
             )
     else:
-        # 4D M-RoPE for default / relative / rotation variants.
-        # relative=True selects SpaRelativeForConditionalGeneration (same
-        # mrope_section, adds SpaRelativeAttentionWrapper after LoRA merge).
+        # 4D M-RoPE for default / coordinate / rotation variants.
         total = sum(orig_section)
         xyz_size = (total - 2) // 3
         new_section = [2, xyz_size, xyz_size, xyz_size]
         config.text_config.rope_scaling["mrope_section"] = new_section
-        _spa_cls = (
-            SpaRelativeForConditionalGeneration if relative
-            else SpaForConditionalGeneration
-        )
         logger.info(
-            f"[spa] mrope_section: {orig_section} → {new_section}  "
-            f"({_spa_cls.__name__})"
+            f"[spa] mrope_section: {orig_section} → {new_section} "
+            "(SpaForConditionalGeneration)"
         )
-        spa = _spa_cls.from_pretrained(
+        spa = SpaForConditionalGeneration.from_pretrained(
             base_model_path,
             config=config,
             torch_dtype=torch.bfloat16,
@@ -514,12 +476,6 @@ def load_spa_model(
         n_wrapped = patch_attention_layers_dec(spa)
         logger.info(f"[spa] Wrapped {n_wrapped} attention layers with SpaDecAttentionWrapper.")
 
-    # 5c. For relative mode, wrap every self_attn with SpaRelativeAttentionWrapper
-    # (mirror of train_correspondence.py --relative — must be AFTER LoRA merge).
-    if relative:
-        n_wrapped = _patch_relative_attention_layers(spa)
-        logger.info(f"[spa] Wrapped {n_wrapped} attention layers with SpaRelativeAttentionWrapper.")
-
     spa = spa.to(device).eval()
 
     # Toggle visual-interleave M-RoPE layout (must match training-time setting).
@@ -568,8 +524,7 @@ def _load_coord_head(
 
     expect_relative:
         None  — auto (accept both with/without cam_proj).
-        True  — require cam_proj.* in state dict (method='rotation_relative').
-        False — require cam_proj.* absent in state dict (method='rotation').
+        False — require cam_proj.* absent in state dict (method='rotation' / 'rotation_rl').
     """
     logger = logging.getLogger(__name__)
     ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=True)
@@ -593,21 +548,16 @@ def _load_coord_head(
     # output_proj.weight shape: (3 * upscale^2, d_model)
     proj_out = state["output_proj.weight"].shape[0]
     upscale_factor = int(round((proj_out / 3) ** 0.5))
-    # cam_proj.weight shape: (d_model, cam_dim) — present only when trained with
-    # --relative (rotation checkpoint); infer cam_dim so strict load succeeds.
+    # cam_proj.weight shape: (d_model, cam_dim) — only present in legacy ckpts
+    # trained with cam-conditioned coord heads; modern rotation/coordinate ckpts
+    # have no cam_proj.* so cam_dim defaults to 0.
     has_cam_proj = "cam_proj.weight" in state
     cam_dim = int(state["cam_proj.weight"].shape[1]) if has_cam_proj else 0
 
-    if expect_relative is True and not has_cam_proj:
-        raise RuntimeError(
-            f"[rotation_relative] {coord_head_path} has no cam_proj.* — this is a "
-            "non-relative rotation checkpoint. Use --method rotation instead, or "
-            "retrain with train_rotation.py --relative."
-        )
     if expect_relative is False and has_cam_proj:
         raise RuntimeError(
             f"[rotation] {coord_head_path} contains cam_proj.* — this is a "
-            "relative rotation checkpoint. Use --method rotation_relative instead."
+            "cam-conditioned (relative-style) coord head, no longer supported."
         )
 
     coord_head = DepthPredictionTransformer(
@@ -635,7 +585,7 @@ def _load_rotation_enc(
     """Load rotation encoder (RL or non-RL) from checkpoint directory.
 
     Auto-detects the architecture from state-dict keys:
-      - non-RL (train_rotation.py) → CameraTokenRotationEncoder (has rot_head.*)
+      - non-RL (train_alternate.py) → CameraTokenRotationEncoder (has rot_head.*)
       - RL     (train_rl.py)       → CameraTokenRotationEncoderRL (has head_cls.* / head_res.*)
 
     Infers architecture (hidden_dim, d_model, dim_feedforward, num_layers) from
@@ -661,8 +611,8 @@ def _load_rotation_enc(
     if expect_rl is True and not is_rl:
         raise RuntimeError(
             f"[rotation_rl] {rot_path} has no head_cls.* — this is a non-RL rotation "
-            "encoder (trained by train_rotation.py). Use --method rotation (or "
-            "rotation_relative) instead, or retrain with train_rl.py."
+            "encoder (trained by train_alternate.py). Use --method rotation instead, "
+            "or retrain with train_rl.py."
         )
     if expect_rl is False and is_rl:
         raise RuntimeError(
@@ -744,8 +694,8 @@ def _compute_rotation_R(
       - CameraTokenRotationEncoderRL → R = compose_R(argmax logits, residual)
 
     Returns (R (3,3), cam_feat (d_model,)) or (None, None) on missing inputs.
-    cam_feat is needed by DepthPredictionTransformer when the ckpt was trained
-    with train_rotation.py --relative (method='rotation_relative').
+    cam_feat is returned but unused by current methods (rotation / rotation_rl
+    coord heads are non-cam-conditioned, cam_dim=0).
     """
     device = next(spa_model.parameters()).device
     inputs_dev = {
@@ -804,7 +754,7 @@ def _get_coord_predictions(
     spatial_merge_size: int,
     image_xyz: List[torch.Tensor],   # llm-resolution GT, used as xyz for 4D RoPE
     coord_scale: float,
-    cam_feat: Optional[torch.Tensor] = None,   # only used by rotation_relative
+    cam_feat: Optional[torch.Tensor] = None,   # legacy: cam-conditioned coord heads only
 ) -> Optional[List[torch.Tensor]]:
     """Single forward pass (no generation) → coord head predictions at vision tokens.
 
@@ -1057,89 +1007,6 @@ def build_image_xyz(
     return xyz_list
 
 
-def build_image_xyz_relative(
-    coord_results: List[Dict],
-    image_grid_thw: torch.Tensor,
-    spatial_merge_size: int = 2,
-) -> List[torch.Tensor]:
-    """Build per-frame relative xyz for --method relative.
-
-    Mirrors Eval_Dataset_Coord._build_image_xyz_relative (eval_dataset.py:214-257).
-
-    For each image k and each reference frame f, produces the 3D coordinates of
-    image-k's patches expressed in frame-f's camera space:
-
-        P^{frame-f}_i = w2c_f · [P^{world}_i ; 1]
-
-    where w2c_f = inv(camera_pose_f) and P^{world} = first-frame-aligned pts3d
-    (same world frame as build_image_xyz, i.e. aligned to frame 0 via T0_inv).
-
-    Returns:
-        List of N_images tensors, each shape (N_frames, llm_H, llm_W, 3), with
-        xyz_rel[k][0] ≈ image_xyz[k] (world = first-cam frame).
-    """
-    N = image_grid_thw.shape[0]
-    if N == 0 or not coord_results:
-        return []
-
-    T0_inv = np.linalg.inv(coord_results[0]["camera_pose"].astype(np.float64))  # (4,4)
-
-    # Per-frame w2c expressed in the shared (first-cam) world frame.
-    # world = T0_inv · pose_frame · cam_f  ⇒  w2c_f (world→cam_f) = inv(T0_inv · pose_f)
-    w2c_list: List[Optional[np.ndarray]] = []
-    for f in range(N):
-        if f >= len(coord_results):
-            w2c_list.append(None)
-            continue
-        pose_f = coord_results[f]["camera_pose"].astype(np.float64)  # cam→world (orig frame)
-        try:
-            c2w_shared = T0_inv @ pose_f  # cam_f → first-cam-world
-            w2c_f = np.linalg.inv(c2w_shared).astype(np.float32)
-            w2c_list.append(w2c_f)
-        except np.linalg.LinAlgError:
-            w2c_list.append(None)
-
-    xyz_rel_list: List[torch.Tensor] = []
-    for k in range(N):
-        thw_k = image_grid_thw[k]
-        llm_h = int(thw_k[1]) // spatial_merge_size
-        llm_w = int(thw_k[2]) // spatial_merge_size
-
-        if k >= len(coord_results):
-            xyz_rel_list.append(torch.zeros(N, llm_h, llm_w, 3))
-            continue
-
-        r    = coord_results[k]
-        pts  = r["pts3d"].astype(np.float64)
-        mask = r["mask"]
-        H, W = pts.shape[:2]
-
-        # Align pts to shared (first-cam) world frame — same as build_image_xyz.
-        pts_flat = pts.reshape(-1, 3)
-        ones     = np.ones((H * W, 1), dtype=np.float64)
-        pts_hom  = np.concatenate([pts_flat, ones], axis=1)
-        pts_ff   = (T0_inv @ pts_hom.T).T[:, :3].reshape(H, W, 3).astype(np.float32)
-
-        xyz_world_patch = _resize_xyz(pts_ff, llm_h, llm_w, valid=mask)  # (llm_h, llm_w, 3) torch
-        xyz_world_flat  = xyz_world_patch.reshape(-1, 3).numpy().astype(np.float32)
-
-        frames_for_k: List[torch.Tensor] = []
-        for f in range(N):
-            w2c_f = w2c_list[f]
-            if w2c_f is None:
-                frames_for_k.append(torch.zeros(llm_h, llm_w, 3))
-                continue
-            R_wc = w2c_f[:3, :3]
-            t_wc = w2c_f[:3,  3]
-            xyz_cam = (xyz_world_flat @ R_wc.T) + t_wc
-            frames_for_k.append(
-                torch.from_numpy(xyz_cam).reshape(llm_h, llm_w, 3)
-            )
-        xyz_rel_list.append(torch.stack(frames_for_k, dim=0))  # (N_frames, llm_h, llm_w, 3)
-
-    return xyz_rel_list
-
-
 # ===========================================================================
 # Inference helpers — baseline
 # ===========================================================================
@@ -1247,10 +1114,9 @@ def prepare_batch_spa(
     coord_scale: float,
     thinking: bool = False,
     load_xyz: bool = False,
-    load_xyz_relative: bool = False,
-) -> Tuple[Dict, str, Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]]:
-    """Tokenise one sample and build image_xyz (and optionally image_xyz_relative)
-    for SPA model inference.
+    strict_xyz: bool = False,
+) -> Tuple[Dict, str, Optional[List[torch.Tensor]]]:
+    """Tokenise one sample and build image_xyz for SPA model inference.
 
     The prompt matches training format exactly:
             [images] + question
@@ -1262,20 +1128,20 @@ def prepare_batch_spa(
     Either `use_coord=True` or `load_xyz=True` triggers loading image_xyz for
     the 4D M-RoPE. They are synonyms; both kept for backward compatibility.
 
-    `load_xyz_relative=True` (for --method relative) additionally builds
-    image_xyz_relative: list[(N_frames, llm_H, llm_W, 3)] per image, using the
-    per-view camera_pose.npy files already loaded by load_precomputed_coords.
+    `strict_xyz=True` (recommended for any non-baseline / non-vanilla method)
+    raises RuntimeError when xyz is requested but cannot be loaded
+    (no 3d_results/<index>/, missing pts3d.npy, etc.) — instead of returning
+    image_xyz=None and letting SpaModel silently zero-fill, which would
+    produce meaningless accuracy.
 
     No system prompt, no answer instruction — identical to train_dataset.py.
 
     Returns
     -------
-    inputs             : processor output dict (input_ids, attention_mask,
-                         pixel_values, image_grid_thw)
-    prompt_str         : prompt text (used for logging)
-    image_xyz          : list of (llm_H, llm_W, 3) tensors, or None
-    image_xyz_relative : list of (N_frames, llm_H, llm_W, 3) tensors, or None
-                         (only built when load_xyz_relative=True)
+    inputs     : processor output dict (input_ids, attention_mask,
+                 pixel_values, image_grid_thw)
+    prompt_str : prompt text (used for logging)
+    image_xyz  : list of (llm_H, llm_W, 3) tensors, or None
     """
     from qwen_vl_utils import process_vision_info
 
@@ -1302,37 +1168,52 @@ def prepare_batch_spa(
         padding=False,
     )
 
-    # Build image_xyz (and optionally image_xyz_relative) from precomputed 3d_results
+    # Build image_xyz from precomputed 3d_results
     image_xyz: Optional[List[torch.Tensor]] = None
-    image_xyz_relative: Optional[List[torch.Tensor]] = None
-    if (use_coord or load_xyz or load_xyz_relative) and item["image"]:
+    if (use_coord or load_xyz) and item["image"]:
+        coord_results = None
+        load_exc: Optional[Exception] = None
         try:
             coord_results = load_precomputed_coords(item)
-            image_grid_thw = inputs.get("image_grid_thw")
-            if coord_results is not None and image_grid_thw is not None and len(coord_results) > 0:
-                image_xyz = build_image_xyz(
-                    coord_results,
-                    image_grid_thw,
-                    spatial_merge_size=spatial_merge_size,
-                )
-                if load_xyz_relative:
-                    image_xyz_relative = build_image_xyz_relative(
-                        coord_results,
-                        image_grid_thw,
-                        spatial_merge_size=spatial_merge_size,
-                    )
-            else:
-                logging.getLogger(__name__).warning(
-                    f"No precomputed 3D coords for sample {item.get('index')} "
-                    f"(data_dir={item.get('data_dir')}). Falling back to zero xyz."
-                )
         except Exception as exc:
+            load_exc = exc
+
+        image_grid_thw = inputs.get("image_grid_thw")
+        if (load_exc is None
+                and coord_results is not None
+                and image_grid_thw is not None
+                and len(coord_results) > 0):
+            image_xyz = build_image_xyz(
+                coord_results,
+                image_grid_thw,
+                spatial_merge_size=spatial_merge_size,
+            )
+        else:
+            # xyz unavailable. In strict mode, raise so the caller doesn't
+            # silently run inference on zero-filled positions.
+            sample_dir = (
+                Path(item["data_dir"]) / "3d_results" / str(item.get("index", "?"))
+                if item.get("data_dir") is not None else "?"
+            )
+            reason = (
+                f"load_precomputed_coords raised: {load_exc!r}" if load_exc is not None
+                else "no pts3d.npy under "
+                     f"{sample_dir}"
+            )
+            msg = (
+                f"sample idx={item.get('index')} (data_dir={item.get('data_dir')}): "
+                f"3D coords unavailable — {reason}"
+            )
+            if strict_xyz:
+                raise RuntimeError(
+                    f"[xyz-required] {msg}. Refusing to run inference with "
+                    f"zero-filled xyz on a method that needs it."
+                )
             logging.getLogger(__name__).warning(
-                f"Failed to load precomputed coords for sample {item.get('index')}: {exc}. "
-                "Falling back to zero xyz."
+                f"{msg}. Falling back to zero xyz (non-strict mode)."
             )
 
-    return inputs, prompt_text, image_xyz, image_xyz_relative
+    return inputs, prompt_text, image_xyz
 
 
 def run_inference_spa(
@@ -1345,8 +1226,6 @@ def run_inference_spa(
     vanilla: bool = False,
     polar: bool = False,
     decouple: bool = False,
-    relative: bool = False,
-    image_xyz_relative: Optional[List[torch.Tensor]] = None,
 ) -> str:
     """Run generation with SPA model (or stock Qwen3.5 for vanilla ablation).
 
@@ -1355,9 +1234,6 @@ def run_inference_spa(
 
     When vanilla=True, the model is a stock Qwen3_5ForConditionalGeneration
     with original 3D M-RoPE — no custom get_rope_index or image_xyz needed.
-
-    When relative=True, image_xyz_relative is passed through to
-    SpaRelativeForConditionalGeneration for per-query-frame attention.
     """
     device = next(model.parameters()).device
     inputs_dev = {
@@ -1396,23 +1272,25 @@ def run_inference_spa(
         model.model.language_model._coord_scale = float(coord_scale)
         model.model.language_model._polar       = bool(polar)
 
+        # SpaDecForConditionalGeneration.forward has coord_scale=100.0 / polar=False
+        # defaults; without passing them through gen_kwargs, every generate() step
+        # would re-set language_model._coord_scale=100.0 / _polar=False and clobber
+        # the values we just stashed. Pass them explicitly so the user's values win.
         gen_kwargs: Dict[str, Any] = dict(
             **inputs_dev,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=processor.tokenizer.eos_token_id,
+            coord_scale=coord_scale,
+            polar=polar,
         )
         # HF rejects these: prefill already consumed them into _xyz_pos.
         gen_kwargs.pop("mm_token_type_ids", None)
     else:
-        # Move image_xyz (and image_xyz_relative) to device
+        # Move image_xyz to device
         xyz_on_device = None
         if image_xyz is not None:
             xyz_on_device = [xyz.to(device) for xyz in image_xyz]
-
-        xyz_rel_on_device = None
-        if relative and image_xyz_relative is not None:
-            xyz_rel_on_device = [xyz.to(device) for xyz in image_xyz_relative]
 
         # Pre-compute 5D position_ids (seq, t, x, y, z) so that generate()'s
         # _prepare_position_ids_for_generation is bypassed.  Without this,
@@ -1420,22 +1298,17 @@ def run_inference_spa(
         # inspect.signature can't see "position_ids", so accepts_position_ids=False
         # and the model falls back to compute_3d_position_ids() → 3D → shape
         # mismatch in Spa4DRotaryEmbedding ("4 vs 3" error).
-        _rope_kwargs: Dict[str, Any] = dict(
-            input_ids=inputs_dev["input_ids"],
-            mm_token_type_ids=inputs_dev["mm_token_type_ids"],
-            image_grid_thw=inputs_dev.get("image_grid_thw"),
-            video_grid_thw=inputs_dev.get("video_grid_thw"),
-            attention_mask=inputs_dev.get("attention_mask"),
-            image_xyz=xyz_on_device,
-            coord_scale=coord_scale,
-            polar=polar,
-        )
-        if relative:
-            # SpaRelativeModel.get_rope_index accepts image_xyz_relative and
-            # stashes per-frame position_ids in language_model._pf_cache.
-            _rope_kwargs["image_xyz_relative"] = xyz_rel_on_device
         with torch.no_grad():
-            position_ids, _ = model.model.get_rope_index(**_rope_kwargs)
+            position_ids, _ = model.model.get_rope_index(
+                input_ids=inputs_dev["input_ids"],
+                mm_token_type_ids=inputs_dev["mm_token_type_ids"],
+                image_grid_thw=inputs_dev.get("image_grid_thw"),
+                video_grid_thw=inputs_dev.get("video_grid_thw"),
+                attention_mask=inputs_dev.get("attention_mask"),
+                image_xyz=xyz_on_device,
+                coord_scale=coord_scale,
+                polar=polar,
+            )
 
         gen_kwargs: Dict[str, Any] = dict(
             **inputs_dev,
@@ -1453,8 +1326,6 @@ def run_inference_spa(
             gen_kwargs["image_xyz"] = xyz_on_device
         if polar:
             gen_kwargs["polar"] = True
-        if relative and xyz_rel_on_device is not None:
-            gen_kwargs["image_xyz_relative"] = xyz_rel_on_device
 
     with torch.no_grad():
         generated_ids = model.generate(**gen_kwargs)
@@ -1636,7 +1507,7 @@ def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
         metrics["coord_mae_mean"] = float(np.mean(coord_maes))
         metrics["coord_mae_std"]  = float(np.std(coord_maes))
         metrics["coord_mae_n"]    = len(coord_maes)
-    # Aggregate rotation angle (deg) when present (rotation / rotation_relative)
+    # Aggregate rotation angle (deg) when present (rotation / rotation_rl)
     angles = [
         r["rotation_angle_deg"] for r in results
         if r.get("rotation_angle_deg") is not None
@@ -1753,19 +1624,18 @@ def evaluate(
 
     method choices:
       baseline           — stock Qwen3.5-VL
-        vanilla            — SPA LoRA + 3D M-RoPE
-        position_embedding — SPA LoRA + 4D M-RoPE
+      vanilla            — SPA LoRA + 3D M-RoPE
+      position_embedding — SPA LoRA + 4D M-RoPE
       coordinate         — SPA LoRA + 4D M-RoPE + coord head (vision-token readout); no_cam variant (Cartesian)
-      polar              — SPA LoRA + 4D M-RoPE, XYZ → log-spherical (log ρ,θ,α) for RoPE;
-                       matches --polar in train_correspondence.py
+      polar              — SpaDec + LoRA: 3D M-RoPE unchanged + log-spherical XYZ RoPE in pass-through, θ=1000;
+                           matches train_correspondence.py / train_coordinate.py --polar
+      decouple           — SpaDec + LoRA: 3D M-RoPE unchanged + Cartesian XYZ RoPE in pass-through, θ=10000;
+                           matches train_correspondence.py / train_coordinate.py --decouple
       rotation           — SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder
-                       + coord head (rotated frame, cam_dim=0);
-                       matches train_rotation.py (no --relative)
-      rotation_relative  — same as rotation, but paired with a --relative
-                       checkpoint (coord head has extra cam_proj; cam_dim>0)
+                           + coord head (rotated frame, cam_dim=0); matches train_alternate.py
       rotation_rl        — same as rotation, but with an RL-trained
-                       CameraTokenRotationEncoderRL (train_rl.py, no --relative);
-                       R = compose_R(argmax(head_cls), head_res)
+                           CameraTokenRotationEncoderRL (train_rl.py);
+                           R = compose_R(argmax(head_cls), head_res)
       both               — baseline + coordinate
 
     Returns dict mapping method name → list of result dicts.
@@ -1778,15 +1648,41 @@ def evaluate(
     run_coordinate = method in ("coordinate", "both")
     run_polar = method == "polar"
     run_decouple = method == "decouple"
-    run_relative = method == "relative"
     run_rotation = method == "rotation"
-    run_rotation_relative = method == "rotation_relative"
     run_rotation_rl = method == "rotation_rl"
-    run_any_rotation = run_rotation or run_rotation_relative or run_rotation_rl
+    run_any_rotation = run_rotation or run_rotation_rl
     run_spa = (
         run_vanilla or run_position_embedding or run_coordinate
-        or run_polar or run_decouple or run_relative or run_any_rotation
+        or run_polar or run_decouple or run_any_rotation
     )
+
+    # Methods whose RoPE / coord head depends on real per-patch xyz from
+    # 3d_results/. Without xyz, SpaModel silently falls back to zeros, which
+    # degrades 4D M-RoPE to a 1D-text RoPE — meaningless accuracy. Refuse to
+    # proceed if the dataset has no 3d_results at all.
+    methods_needing_xyz = (
+        run_position_embedding or run_coordinate
+        or run_polar or run_decouple or run_any_rotation
+    )
+    if methods_needing_xyz and len(data) > 0:
+        # Check the first few samples; if NONE has 3d_results/, abort upfront.
+        n_check = min(10, len(data))
+        n_with = sum(
+            1 for it in data[:n_check]
+            if it.get("data_dir") is not None and it.get("index") is not None
+            and (Path(it["data_dir"]) / "3d_results" / str(it["index"])).exists()
+        )
+        if n_with == 0:
+            sample = data[0]
+            raise RuntimeError(
+                f"Method '{method}' requires precomputed 3D coords "
+                f"(<data_dir>/3d_results/<index>/), but none of the first "
+                f"{n_check} samples in this dataset have them. "
+                f"Example missing path: "
+                f"{Path(sample.get('data_dir', '?')) / '3d_results' / str(sample.get('index', '?'))}. "
+                f"Either compute them with src/data_process/ or use --method "
+                f"baseline / vanilla (no xyz needed)."
+            )
 
     # Lazy-load only what we need
     baseline_model = baseline_proc = None
@@ -1809,14 +1705,12 @@ def evaluate(
         # Architecture flags routed to load_spa_model (must match training):
         #   polar    → SpaDec + log-spherical XYZ RoPE (decouple=True, polar=True)
         #   decouple → SpaDec + Cartesian XYZ RoPE     (decouple=True, polar=False)
-        #   relative → SpaRelative                     (relative=True)
         _use_decouple = run_polar or run_decouple
         _use_polar    = run_polar
-        _use_relative = run_relative
         spa_model, spa_proc = load_spa_model(
             spa_base_model_path, correspondence_ckpt, device,
             vanilla=use_vanilla_arch, interleaving=interleaving,
-            decouple=_use_decouple, polar=_use_polar, relative=_use_relative,
+            decouple=_use_decouple, polar=_use_polar,
             xyz_rope_dim=xyz_rope_dim,
         )
 
@@ -1834,62 +1728,50 @@ def evaluate(
 
         # Load DepthPredictionTransformer for coordinate / rotation checkpoints
         if run_coordinate or run_any_rotation:
-            # rotation          → expect no cam_proj (strict)
-            # rotation_relative → expect cam_proj (strict)
-            # rotation_rl       → expect no cam_proj (strict)
-            # coordinate        → auto (no constraint)
-            if run_rotation or run_rotation_rl:
-                _expect_rel = False
-            elif run_rotation_relative:
-                _expect_rel = True
-            else:
-                _expect_rel = None
+            # rotation / rotation_rl → expect no cam_proj (strict)
+            # coordinate             → auto (no constraint)
+            _expect_rel = False if run_any_rotation else None
             spa_coord_head = _load_coord_head(
                 correspondence_ckpt, device, expect_relative=_expect_rel,
             )
 
         # Load rotation encoder (RL or non-RL) for rotation checkpoint
         if run_any_rotation:
-            # rotation / rotation_relative → non-RL encoder (has rot_head.*)
-            # rotation_rl                  → RL encoder      (has head_cls.*)
+            # rotation    → non-RL encoder (has rot_head.*)
+            # rotation_rl → RL encoder     (has head_cls.*)
             _expect_rl = True if run_rotation_rl else False
             spa_rotation_enc = _load_rotation_enc(
                 correspondence_ckpt, spa_model, device, expect_rl=_expect_rl,
             )
 
     # Determine which SPA variants to run.
-    # Tuple: (name, use_coord, is_polar, is_rotation, is_decouple, is_relative)
+    # Tuple: (name, use_coord, is_polar, is_rotation, is_decouple)
     #   vanilla            : stock Qwen3.5 (3D M-RoPE, no xyz)
     #   position_embedding : 4D M-RoPE Cartesian on vision tokens
     #   coordinate (no_cam): 4D M-RoPE Cartesian + coord head (vision-token readout)
     #   polar              : SpaDec + log-spherical XYZ RoPE (θ=1000)
     #   decouple           : SpaDec + Cartesian XYZ RoPE (θ=10000)
-    #   relative           : SpaRelative + per-query-frame coords
-    #   rotation / rotation_relative / rotation_rl : 4D Cartesian RoPE on
-    #       rotation_enc-rotated xyz + coord head
-    spa_variants: List[Tuple[str, bool, bool, bool, bool, bool]] = []
+    #   rotation / rotation_rl : 4D Cartesian RoPE on rotation_enc-rotated xyz
+    #       + coord head
+    spa_variants: List[Tuple[str, bool, bool, bool, bool]] = []
     if run_vanilla:
-        spa_variants.append(("vanilla",            False, False, False, False, False))
+        spa_variants.append(("vanilla",            False, False, False, False))
     if run_position_embedding:
-        spa_variants.append(("position_embedding", False, False, False, False, False))
+        spa_variants.append(("position_embedding", False, False, False, False))
     if run_coordinate:
-        spa_variants.append(("coordinate",         True,  False, False, False, False))
+        spa_variants.append(("coordinate",         True,  False, False, False))
     if run_polar:
-        spa_variants.append(("polar",              False, True,  False, True,  False))
+        spa_variants.append(("polar",              False, True,  False, True))
     if run_decouple:
-        spa_variants.append(("decouple",           False, False, False, True,  False))
-    if run_relative:
-        spa_variants.append(("relative",           False, False, False, False, True))
+        spa_variants.append(("decouple",           False, False, False, True))
     if run_rotation:
-        spa_variants.append(("rotation",           False, False, True,  False, False))
-    if run_rotation_relative:
-        spa_variants.append(("rotation_relative",  False, False, True,  False, False))
+        spa_variants.append(("rotation",           False, False, True,  False))
     if run_rotation_rl:
-        spa_variants.append(("rotation_rl",        False, False, True,  False, False))
+        spa_variants.append(("rotation_rl",        False, False, True,  False))
 
     active_methods = (
         (["baseline"] if run_baseline else [])
-        + [name for name, _, __, ___, ____, _____ in spa_variants]
+        + [name for name, _, __, ___, ____ in spa_variants]
     )
     results_map: Dict[str, List[Dict]] = {m: [] for m in active_methods}
 
@@ -1914,27 +1796,25 @@ def evaluate(
 
         # ---- SPA variants ----
         for (
-            spa_method_name, use_coord, is_polar, is_rotation,
-            is_decouple, is_relative_arch,
+            spa_method_name, use_coord, is_polar, is_rotation, is_decouple,
         ) in spa_variants:
-            inputs, prompt, image_xyz, image_xyz_relative = prepare_batch_spa(
+            # All methods except `vanilla` rely on per-patch xyz from 3d_results
+            # to produce meaningful position embeddings / coord supervision.
+            # When xyz is required (strict_xyz=True) but unavailable, prepare_batch_spa
+            # raises instead of silently falling back to zeros.
+            _needs_xyz = spa_method_name != "vanilla"
+            inputs, prompt, image_xyz = prepare_batch_spa(
                 item, spa_proc,
                 spatial_merge_size, use_coord, coord_scale,
                 thinking=thinking,
-                # polar/decouple/rotation need xyz for RoPE even without coord sentences;
-                # relative also needs xyz (frame 0) + per-frame xyz_relative.
-                load_xyz=(is_polar or is_decouple or is_rotation or is_relative_arch),
-                load_xyz_relative=is_relative_arch,
+                load_xyz=_needs_xyz,
+                strict_xyz=_needs_xyz,
             )
 
-            # ---- Rotation: compute R (and cam_feat) and rotate image_xyz ----
-            # Mirrors train_rotation.py:
-            #   rotation          : coord GT = R @ xyz (rotated frame), cam_feat unused
-            #   rotation_relative : coord GT = original xyz,            cam_feat fed into DPT
-            is_relative = spa_method_name == "rotation_relative"
+            # ---- Rotation: compute R and rotate image_xyz ----
+            # coord GT = R @ xyz (rotated frame); cam_feat returned but unused.
             xyz_for_rope = image_xyz
             xyz_for_mae = image_xyz
-            cam_feat_for_head: Optional[torch.Tensor] = None
             rotation_angle_deg: Optional[float] = None
             if (
                 is_rotation
@@ -1943,7 +1823,7 @@ def evaluate(
                 and image_token_id_val is not None
             ):
                 try:
-                    R_mat, cam_feat = _compute_rotation_R(
+                    R_mat, _cam_feat = _compute_rotation_R(
                         spa_model, spa_rotation_enc, inputs, image_xyz,
                         image_token_id_val, spatial_merge_size, coord_scale,
                     )
@@ -1963,12 +1843,7 @@ def evaluate(
                         xyz_for_rope = rotated
                         # Keep xyz_for_mae on CPU so it matches coord_head
                         # predictions (which _get_coord_predictions returns on CPU).
-                        if is_relative:
-                            # coord_head predicts in the ORIGINAL (un-rotated) frame
-                            xyz_for_mae = [x.detach().cpu() for x in image_xyz]
-                            cam_feat_for_head = cam_feat
-                        else:
-                            xyz_for_mae = [r.detach().cpu() for r in rotated]
+                        xyz_for_mae = [r.detach().cpu() for r in rotated]
                 except Exception as re:
                     logger.warning(
                         f"[{spa_method_name}] rotation_enc failed for idx="
@@ -1981,8 +1856,6 @@ def evaluate(
                 vanilla=use_vanilla_arch,
                 polar=is_polar,
                 decouple=is_decouple,
-                relative=is_relative_arch,
-                image_xyz_relative=image_xyz_relative,
             )
             result = _make_result(item, output, prompt, spa_method_name,
                                     thinking=thinking)
@@ -2001,7 +1874,6 @@ def evaluate(
                         spa_model, inputs,
                         image_token_id_val, spa_coord_head,
                         spatial_merge_size, xyz_for_rope, coord_scale,
-                        cam_feat=cam_feat_for_head,
                     )
                     if preds is not None:
                         result["coord_mae"] = _compute_coord_mae(preds, xyz_for_mae)
@@ -2012,7 +1884,7 @@ def evaluate(
                     )
 
             results_map[spa_method_name].append(result)
-            
+
 
     # Save per-worker partial results
     for mname, mresults in results_map.items():
@@ -2162,8 +2034,7 @@ def main() -> None:
     parser.add_argument(
         "--method", type=str, default="both",
         choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
-                 "decouple", "relative",
-                 "rotation", "rotation_relative", "rotation_rl", "both"],
+                 "decouple", "rotation", "rotation_rl", "both"],
         help=(
             "Which method(s) to run. "
             "baseline=stock Qwen3.5-VL; "
@@ -2172,10 +2043,8 @@ def main() -> None:
             "coordinate=SPA LoRA + 4D M-RoPE + coord head (vision-token readout, no_cam, Cartesian); "
             "polar=SpaDec + LoRA (3D M-RoPE unchanged + log-spherical XYZ RoPE in pass-through, θ=1000); "
             "decouple=SpaDec + LoRA (3D M-RoPE unchanged + Cartesian XYZ RoPE in pass-through, θ=10000); "
-            "relative=SpaRelative + LoRA (4D M-RoPE + per-query-frame attention; matches train_correspondence.py --relative); "
-            "rotation=SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder (canonical R) + coord head (cam_dim=0, non-relative ckpt); "
-            "rotation_relative=same as rotation but for --relative ckpts (coord head has cam_proj, cam_dim>0); "
-            "rotation_rl=same as rotation but for RL-trained ckpts (rotation_enc has head_cls/head_res; non-relative coord head); "
+            "rotation=SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder (canonical R) + coord head (cam_dim=0); "
+            "rotation_rl=same as rotation but for RL-trained ckpts (rotation_enc has head_cls/head_res); "
             "both=baseline + coordinate."
         ),
     )
@@ -2210,7 +2079,8 @@ def main() -> None:
             "mmsibench", "mindcube",
             "sat", "sat_real",
             "sparbench_multi_view", "sparbench_single_view", "sparbench_mv",
-            "vsibench", "spinbench", "robospatial",
+            "vsibench", "spinbench", "robospatial", "viewspatial",
+            "omnispatial_pt", "embspatial",
         ],
     )
     parser.add_argument("--data_dir", type=str, default="datasets/evaluation/MMSIBench")
@@ -2244,7 +2114,7 @@ def main() -> None:
              "region under --method polar / decouple. Each axis (x/y/z) gets "
              "xyz_rope_dim/6 frequency bands. Must be a positive multiple of 6 ≤ 192. "
              "MUST match the value used during training (default 66). "
-             "No effect for --method baseline / vanilla / position_embedding / coordinate / relative.",
+             "No effect for --method baseline / vanilla / position_embedding / coordinate / rotation*.",
     )
 
     # ── output ────────────────────────────────────────────────────────────────
@@ -2281,12 +2151,9 @@ def main() -> None:
     n_gpu = torch.cuda.device_count()
     if n_gpu <= 0:
         raise RuntimeError("At least one CUDA device is required.")
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    gpu_ids = (
-        [x.strip() for x in cuda_visible.split(",") if x.strip()]
-        if cuda_visible
-        else [str(i) for i in range(n_gpu)]
-    )
+    # CUDA_VISIBLE_DEVICES already remaps physical GPUs to logical 0..N-1 from
+    # PyTorch's view, so always use the logical index range.
+    gpu_ids = [str(i) for i in range(n_gpu)]
 
     # ── log config ────────────────────────────────────────────────────────────
     logger.info("=" * 60)
@@ -2319,7 +2186,21 @@ def main() -> None:
 
     # ── launch workers ────────────────────────────────────────────────────────
     shards = chunk_dataset(dataset, len(gpu_ids))
+
+    # SAFETY CHECK #1: wipe stale partial files from any prior crashed run.
+    # Without this, if a previous run crashed AFTER writing some {method}_cuda{gid}.json
+    # but BEFORE writing the merged metrics_*.json, those stale partials would silently
+    # mix into this run's merge — especially dangerous if the GPU count changed between
+    # runs (e.g. previous 4-GPU run leaves cuda2/cuda3 files; new 2-GPU run only
+    # overwrites cuda0/cuda1, and the stale ones get folded in).
+    _stale = list(output_dir.glob("*_cuda*.json"))
+    if _stale:
+        logger.info(f"Removing {len(_stale)} stale partial output files from previous run")
+        for _p in _stale:
+            _p.unlink()
+
     processes: List[mp.Process] = []
+    spawned_gpu_ids: List[str] = []   # only the GPUs that actually got a shard
 
     for gpu_id, shard in zip(gpu_ids, shards):
         p = mp.Process(
@@ -2341,22 +2222,45 @@ def main() -> None:
         )
         p.start()
         processes.append(p)
+        spawned_gpu_ids.append(gpu_id)
 
-    for p in processes:
+    # SAFETY CHECK #2: every worker must exit cleanly.
+    # Without this, an OOM-killed or segfaulted worker silently produces no
+    # (or partial) output and the merge below quietly under-counts samples.
+    failed_workers: List[Tuple[str, int]] = []
+    for p, gid in zip(processes, spawned_gpu_ids):
         p.join()
+        if p.exitcode != 0:
+            failed_workers.append((gid, int(p.exitcode) if p.exitcode is not None else -1))
+    if failed_workers:
+        details = ", ".join(f"GPU {gid}(exit={ec})" for gid, ec in failed_workers)
+        raise RuntimeError(
+            f"Worker process(es) failed: {details}. Aborting before merge to avoid "
+            f"computing accuracy on a partial sample set. Check {log_file} for traces."
+        )
 
     # ── merge results ─────────────────────────────────────────────────────────
     logger.info("Merging results from all workers…")
 
     def merge(prefix: str) -> List[Dict]:
         merged = []
-        for gpu_id in gpu_ids:
+        missing: List[str] = []
+        for gpu_id in spawned_gpu_ids:
             path = output_dir / f"{prefix}_cuda{gpu_id}.json"
             if path.exists():
                 with open(path, "r", encoding="utf-8") as f:
                     merged.extend(json.load(f))
             else:
-                logger.warning(f"Missing worker output: {path}")
+                missing.append(gpu_id)
+        if missing:
+            # Worker exited cleanly but didn't produce output for this method —
+            # likely the method was inactive in the worker (shouldn't happen for
+            # an active method in _method_names).
+            raise RuntimeError(
+                f"Method '{prefix}': missing partial output(s) from GPU(s) "
+                f"{missing} despite workers exiting cleanly. "
+                f"Expected files: {[str(output_dir / f'{prefix}_cuda{g}.json') for g in missing]}"
+            )
         merged.sort(key=lambda r: r.get("index", 0))
         return merged
 
@@ -2368,15 +2272,26 @@ def main() -> None:
         "coordinate":         args.method in ("coordinate", "both"),
         "polar":              args.method == "polar",
         "decouple":           args.method == "decouple",
-        "relative":           args.method == "relative",
         "rotation":           args.method == "rotation",
-        "rotation_relative":  args.method == "rotation_relative",
         "rotation_rl":        args.method == "rotation_rl",
     }
+    # SAFETY CHECK #3: merged sample count must match the dataset size.
+    # This catches the case where a worker wrote a partial JSON (e.g. crashed
+    # mid-stream after the first few samples) — exit-code check above might pass
+    # but the file would be truncated. We verify the totals add up.
+    expected_total = len(dataset)
     all_results: Dict[str, List[Dict]] = {}
     for mname, active in _method_names.items():
         if active:
-            all_results[mname] = merge(mname)
+            merged = merge(mname)
+            if len(merged) != expected_total:
+                raise RuntimeError(
+                    f"Method '{mname}': merge produced {len(merged)} samples but "
+                    f"the dataset has {expected_total}. Some worker(s) wrote "
+                    f"truncated output. Refusing to compute accuracy on an "
+                    f"incomplete sample set."
+                )
+            all_results[mname] = merged
 
     # ── metrics ───────────────────────────────────────────────────────────────
     _METHOD_LABELS = {
@@ -2386,9 +2301,7 @@ def main() -> None:
         "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + coord head, no_cam, Cartesian)",
         "polar":              "polar              (SpaDec + log-spherical XYZ RoPE, θ=1000)",
         "decouple":           "decouple           (SpaDec + Cartesian XYZ RoPE, θ=10000)",
-        "relative":           "relative           (SpaRelative + per-query-frame xyz, 4D M-RoPE)",
         "rotation":           "rotation           (SPA LoRA + 4D M-RoPE + rotation_enc + coord head, cam_dim=0)",
-        "rotation_relative":  "rotation_relative  (SPA LoRA + 4D M-RoPE + rotation_enc + coord head, --relative ckpt)",
         "rotation_rl":        "rotation_rl        (SPA LoRA + 4D M-RoPE + rotation_enc_rl + coord head, cam_dim=0)",
     }
     _metrics_fn = compute_metrics_robospatial if args.dataset == "robospatial" else compute_metrics
@@ -2411,9 +2324,7 @@ def main() -> None:
         ("baseline", "coordinate"),
         ("baseline", "polar"),
         ("baseline", "decouple"),
-        ("baseline", "relative"),
         ("baseline", "rotation"),
-        ("baseline", "rotation_relative"),
         ("baseline", "rotation_rl"),
         ("baseline", "position_embedding"),
         ("baseline", "vanilla"),

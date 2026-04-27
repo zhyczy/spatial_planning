@@ -4,6 +4,8 @@ from .train_dataset import (
     MindCube_Train_Dataset_Coord_Polar,
     MindCube_Train_Dataset_Relative,
     MindCube_Train_Dataset_Rotation,
+    SAT_Train_Dataset,
+    SAT_Train_Dataset_Relative,
     SAT_Train_Dataset_Rotation,
     xyz_to_polar,
 )

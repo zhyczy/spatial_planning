@@ -10,7 +10,7 @@
 #   bash scripts/evaluate.sh [options]
 #
 # Options:
-#   --method    baseline | vanilla | position_embedding | coordinate | polar | decouple | relative | rotation | rotation_relative | rotation_rl | both
+#   --method    baseline | vanilla | position_embedding | coordinate | polar | decouple | rotation | rotation_rl | both
 #               (default: both = baseline + coordinate)
 #   --ckpt      path to SPA LoRA checkpoint dir
 #               (required when method != baseline)
@@ -18,7 +18,8 @@
 #                 "mindcube,mmsibench"
 #               Available: mindcube  mmsibench  sparbench_multi_view
 #                          sparbench_single_view  sparbench_mv  sat_real
-#                          spinbench
+#                          spinbench  robospatial  viewspatial
+#                          omnispatial_pt  embspatial
 #               Default: all datasets
 #   --gpus      comma-separated GPU IDs, e.g. "0,1,2,3"
 #               Default: auto-detect all available GPUs
@@ -44,17 +45,11 @@
 #   decouple           — SpaDec + LoRA: Qwen original 3D M-RoPE unchanged
 #                        + new Cartesian XYZ RoPE in pass-through dims 64..129, θ=10000.
 #                        Matches train_correspondence.py / train_coordinate.py --decouple.
-#   relative           — SpaRelative + LoRA: 4D M-RoPE + SpaRelativeAttentionWrapper on
-#                        every self_attn (per-query-frame xyz). Matches
-#                        train_correspondence.py --relative. NOT the same as rotation_relative.
 #   rotation           — SPA LoRA + 4D M-RoPE + rotation_enc + coord head (cam_dim=0)
-#                        (predicts canonical R; xyz rotated before RoPE/MAE)
-#                        Requires ckpt trained by train_rotation.py WITHOUT --relative.
-#   rotation_relative  — same as rotation, but for train_rotation.py --relative ckpts
-#                        (coord head has extra cam_proj; cam_dim>0).
+#                        (predicts canonical R; xyz rotated before RoPE/MAE).
+#                        Requires ckpt trained by train_alternate.py.
 #   rotation_rl        — same as rotation, but for train_rl.py ckpts
-#                        (rotation_enc has head_cls/head_res; R = compose_R(argmax logits, residual);
-#                         non-relative coord head).
+#                        (rotation_enc has head_cls/head_res; R = compose_R(argmax logits, residual)).
 #   both               — baseline + coordinate
 #
 # Examples:
@@ -112,7 +107,7 @@ INTERLEAVING=""
 MAX_NEW_TOKENS=512
 
 # All supported datasets (in evaluation order)
-ALL_DATASETS="mindcube sat_real spinbench robospatial"
+ALL_DATASETS="mindcube sat_real spinbench robospatial viewspatial omnispatial_pt embspatial"
 
 # Dataset → data_dir mapping (relative to SPATIAL_DIR)
 declare -A DATASET_DIR
@@ -124,6 +119,9 @@ DATASET_DIR["sparbench_mv"]="datasets/evaluation/SPARBench"
 DATASET_DIR["sat_real"]="datasets/evaluation/SAT"
 DATASET_DIR["spinbench"]="datasets/evaluation/spinbench_data"
 DATASET_DIR["robospatial"]="datasets/evaluation/RoboSpatial"
+DATASET_DIR["viewspatial"]="datasets/evaluation/ViewSpatial-Bench"
+DATASET_DIR["omnispatial_pt"]="datasets/evaluation/OmniSpatial"
+DATASET_DIR["embspatial"]="datasets/evaluation/EmbSpatial-Bench"
 
 # =============================================================================
 # Parse arguments
@@ -154,7 +152,7 @@ done
 # Validate arguments
 # =============================================================================
 
-VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple relative rotation rotation_relative rotation_rl both"
+VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple rotation rotation_rl both"
 if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
     echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1

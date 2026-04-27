@@ -61,6 +61,7 @@ from transformers.utils.generic import maybe_autocast
 
 from .coordinate_llm import DepthPredictionTransformer
 from .correspondence_llm import rot6d_to_rotmat
+from .spa_emb_dec import _apply_xyz_rotary
 
 
 # ---------------------------------------------------------------------------
@@ -163,30 +164,192 @@ def _apply_rotation_to_xyz(
     return result
 
 
+def _build_per_token_xyz(
+    input_ids:          torch.Tensor,   # (1, seq_len)
+    image_token_id:     int,
+    image_xyz_list:     list,           # list[k]: (llm_H_k, llm_W_k, 3)
+    image_grid_thw:     torch.Tensor,
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    """Build (1, seq_len, 3) FLOAT per-token xyz tensor for the decouple path.
+
+    Text tokens                → (0, 0, 0).
+    Image patches (image_token) → corresponding entry of image_xyz_list[k]
+                                  in flat (H * W) order, repeated across t
+                                  frames (matches SpaDecModel._compute_xyz_pos).
+
+    Built with torch.cat (not slice-assignment) so gradients w.r.t.
+    image_xyz_list (e.g. R-rotated coords) flow through to the rotation
+    matrix. Output dtype follows image_xyz_list[0] (float32 for R-rotated).
+    """
+    seq_len = input_ids.shape[1]
+    device  = input_ids.device
+
+    if (image_xyz_list is not None and len(image_xyz_list) > 0
+            and image_xyz_list[0].is_floating_point()):
+        ref_dtype = image_xyz_list[0].dtype
+    else:
+        ref_dtype = torch.float32
+
+    ids = input_ids[0]
+    parts: list[torch.Tensor] = []
+    k = 0
+    i = 0
+    while i < seq_len:
+        if ids[i] != image_token_id:
+            j = i
+            while j < seq_len and ids[j] != image_token_id:
+                j += 1
+            parts.append(
+                torch.zeros(j - i, 3, dtype=ref_dtype, device=device)
+            )
+            i = j
+            continue
+
+        if (image_grid_thw is None
+                or k >= len(image_grid_thw)
+                or image_xyz_list is None
+                or k >= len(image_xyz_list)):
+            parts.append(torch.zeros(1, 3, dtype=ref_dtype, device=device))
+            i += 1
+            continue
+
+        thw_k = image_grid_thw[k]
+        n_t   = int(thw_k[0])
+        llm_h = int(thw_k[1]) // spatial_merge_size
+        llm_w = int(thw_k[2]) // spatial_merge_size
+        n_tok = llm_h * llm_w * max(n_t, 1)
+
+        xyz_k = image_xyz_list[k].reshape(-1, 3).to(
+            device=device, dtype=ref_dtype,
+        )
+        if n_t > 1:
+            xyz_k = xyz_k.repeat(n_t, 1)
+
+        n_avail   = xyz_k.shape[0]
+        n_to_copy = min(n_tok, n_avail)
+        if n_to_copy < n_tok:
+            pad = torch.zeros(
+                n_tok - n_to_copy, 3, dtype=ref_dtype, device=device,
+            )
+            parts.append(torch.cat([xyz_k[:n_to_copy], pad], dim=0))
+        else:
+            parts.append(xyz_k[:n_to_copy])
+
+        i += n_tok
+        k += 1
+
+    if not parts:
+        return torch.zeros(1, seq_len, 3, dtype=ref_dtype, device=device)
+    return torch.cat(parts, dim=0).unsqueeze(0)            # (1, seq_len, 3)
+
+
+def _build_token_thw_int(
+    input_ids:          torch.Tensor,   # (1, seq_len)
+    image_token_id:     int,
+    image_grid_thw:     torch.Tensor,   # (num_images, 3)
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    """Build (seq_len, 3) long [t, h, w] matching Qwen 3D M-RoPE convention.
+
+    Used by `CameraTokenRotationEncoder` in --decouple mode (rotation encoder
+    mirrors the LLM's stock 3D M-RoPE in the rotary 64 dims).
+
+    Position assignment (mirrors Qwen3_5Model.get_rope_index):
+      Text tokens:  t = h = w = current_pos (sequential).  Position 0 reserved
+                    for the cam token; text starts at 1.
+      Image tokens: t = current_pos shared across all patches in the image.
+                    h = current_pos + h_idx  (h_idx ∈ [0, llm_h))
+                    w = current_pos + w_idx  (w_idx ∈ [0, llm_w))
+                    current_pos advances by max(llm_h, llm_w) per image block.
+
+    Returns:
+        (seq_len, 3) long — [t, h, w] per token.
+    """
+    seq_len = input_ids.shape[1]
+    device  = input_ids.device
+    result  = torch.zeros(seq_len, 3, dtype=torch.long, device=device)
+
+    ids = input_ids[0]
+    current_pos = 1
+    k = 0
+    i = 0
+    while i < seq_len:
+        if ids[i] != image_token_id:
+            j = i
+            while j < seq_len and ids[j] != image_token_id:
+                j += 1
+            text_len = j - i
+            run = torch.arange(current_pos, current_pos + text_len,
+                               dtype=torch.long, device=device)
+            result[i:j, 0] = run
+            result[i:j, 1] = run
+            result[i:j, 2] = run
+            current_pos += text_len
+            i = j
+        else:
+            if k < len(image_grid_thw):
+                thw_k = image_grid_thw[k]
+                llm_h = int(thw_k[1]) // spatial_merge_size
+                llm_w = int(thw_k[2]) // spatial_merge_size
+                n_tok = llm_h * llm_w
+
+                h_grid = torch.arange(
+                    llm_h, dtype=torch.long, device=device
+                ).unsqueeze(1).expand(-1, llm_w).reshape(-1)        # (n_tok,)
+                w_grid = torch.arange(
+                    llm_w, dtype=torch.long, device=device
+                ).unsqueeze(0).expand(llm_h, -1).reshape(-1)        # (n_tok,)
+
+                result[i:i + n_tok, 0] = current_pos
+                result[i:i + n_tok, 1] = current_pos + h_grid
+                result[i:i + n_tok, 2] = current_pos + w_grid
+
+                current_pos += max(llm_h, llm_w)
+                i += n_tok
+                k += 1
+            else:
+                i += 1
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # M-RoPE attention + encoder layer (used only by CameraTokenRotationEncoder)
 # ---------------------------------------------------------------------------
 
 class _MRoPEAttention(nn.Module):
-    """Multi-head self-attention with 4D M-RoPE on Q and K.
+    """Multi-head self-attention with M-RoPE on Q and K.
 
-    Uses the MLLM's SpaTextRotaryEmbedding (same inv_freq, same mrope_section)
-    and the MLLM's head_dim so the rotary frequency mapping is identical.
+    Default (non-decouple): 4D M-RoPE on the rotary head_dim using
+        position_ids = (4, 1, T) integer [t, x_int, y_int, z_int].
+
+    Decouple mode: matches the LLM main-path SpaDec dual structure —
+        • rotary 64 dims  → standard 3D M-RoPE on (t, h, w) integer positions
+        • dims [xyz_offset : xyz_offset + xyz_dim]  →  XYZ RoPE on float xyz_pos
+        rope_emb's mrope_section MUST be 3D ([11,11,10]) and an
+        xyz_rotary_emb (e.g. SpaXYZRotaryEmbedding) must be supplied.
 
     Args:
-        d_model:   total model width = nhead × mllm_head_dim
-        nhead:     number of attention heads
-        rope_emb:  SpaTextRotaryEmbedding initialised from the SAME
-                   config.text_config as the MLLM (fixed buffers, no grad)
-        dropout:   attention dropout probability
+        d_model:        total model width = nhead × mllm_head_dim
+        nhead:          number of attention heads
+        rope_emb:       SpaTextRotaryEmbedding (4D in non-decouple, 3D in decouple)
+        dropout:        attention dropout probability
+        decouple:       if True, also apply a separate XYZ RoPE on dims
+                        [xyz_offset : xyz_offset + xyz_dim] of Q / K
+        xyz_rotary_emb: SpaXYZRotaryEmbedding instance (required if decouple)
+        xyz_offset:     starting dim for the XYZ RoPE slice (default 64)
     """
 
     def __init__(
         self,
-        d_model:  int,
-        nhead:    int,
-        rope_emb: nn.Module,
-        dropout:  float = 0.0,
+        d_model:        int,
+        nhead:          int,
+        rope_emb:       nn.Module,
+        dropout:        float = 0.0,
+        decouple:       bool  = False,
+        xyz_rotary_emb: nn.Module | None = None,
+        xyz_offset:     int = 64,
     ):
         super().__init__()
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
@@ -202,10 +365,22 @@ class _MRoPEAttention(nn.Module):
         self.rope_emb     = rope_emb
         self.attn_dropout = dropout
 
+        self.decouple   = bool(decouple)
+        self.xyz_offset = int(xyz_offset)
+        if self.decouple:
+            assert xyz_rotary_emb is not None, (
+                "_MRoPEAttention(decouple=True) requires xyz_rotary_emb"
+            )
+            self.xyz_rotary_emb = xyz_rotary_emb
+        else:
+            self.xyz_rotary_emb = None
+
     def forward(
         self,
-        x:            torch.Tensor,   # (1, T, d_model)
-        position_ids: torch.Tensor,   # (4, 1, T) long — [t, x_int, y_int, z_int]
+        x:            torch.Tensor,                 # (1, T, d_model)
+        position_ids: torch.Tensor,                 # (N, 1, T) long; N=4 (4D) or N=3 (decouple)
+        xyz_pos:      torch.Tensor | None = None,   # (1, T, 3) float — required if decouple
+        coord_scale:  float = 100.0,
     ) -> torch.Tensor:
         B, T, C = x.shape
 
@@ -216,6 +391,21 @@ class _MRoPEAttention(nn.Module):
         cos, sin = self.rope_emb(x, position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
+        if self.decouple:
+            assert xyz_pos is not None, (
+                "_MRoPEAttention.forward: xyz_pos required in decouple mode"
+            )
+            xyz_cos, xyz_sin = self.xyz_rotary_emb(
+                xyz_pos, coord_scale=coord_scale, polar=False,
+            )                                                   # (1, T, xyz_dim)
+            # _apply_xyz_rotary internally unsqueezes cos/sin to broadcast over
+            # heads (default unsqueeze_dim=1). Pass raw (B, T, xyz_dim) tensors.
+            q, k = _apply_xyz_rotary(
+                q, k,
+                xyz_cos.to(q.dtype), xyz_sin.to(q.dtype),
+                offset=self.xyz_offset,
+            )
+
         out = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.attn_dropout if self.training else 0.0,
@@ -225,7 +415,11 @@ class _MRoPEAttention(nn.Module):
 
 
 class _MRoPEEncoderLayer(nn.Module):
-    """Pre-norm encoder layer: M-RoPE attention + FFN."""
+    """Pre-norm encoder layer: M-RoPE attention + FFN.
+
+    In decouple mode, the attention also runs an XYZ RoPE on dims
+    [xyz_offset : xyz_offset + xyz_dim] using xyz_pos.
+    """
 
     def __init__(
         self,
@@ -234,11 +428,18 @@ class _MRoPEEncoderLayer(nn.Module):
         dim_feedforward: int,
         rope_emb:        nn.Module,
         dropout:         float = 0.0,
+        decouple:        bool  = False,
+        xyz_rotary_emb:  nn.Module | None = None,
+        xyz_offset:      int = 64,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.attn  = _MRoPEAttention(d_model, nhead, rope_emb, dropout)
+        self.attn  = _MRoPEAttention(
+            d_model, nhead, rope_emb, dropout,
+            decouple=decouple, xyz_rotary_emb=xyz_rotary_emb,
+            xyz_offset=xyz_offset,
+        )
         self.ffn   = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.GELU(),
@@ -249,10 +450,15 @@ class _MRoPEEncoderLayer(nn.Module):
 
     def forward(
         self,
-        x:            torch.Tensor,   # (1, T, d_model)
-        position_ids: torch.Tensor,   # (4, 1, T) long
+        x:            torch.Tensor,                 # (1, T, d_model)
+        position_ids: torch.Tensor,                 # (N, 1, T) long
+        xyz_pos:      torch.Tensor | None = None,   # (1, T, 3) float (decouple only)
+        coord_scale:  float = 100.0,
     ) -> torch.Tensor:
-        x = x + self.drop(self.attn(self.norm1(x), position_ids))
+        x = x + self.drop(
+            self.attn(self.norm1(x), position_ids,
+                      xyz_pos=xyz_pos, coord_scale=coord_scale)
+        )
         x = x + self.drop(self.ffn(self.norm2(x)))
         return x
 
@@ -304,12 +510,25 @@ class CameraTokenRotationEncoder(nn.Module):
         dim_feedforward: int   = 2048,
         num_layers:      int   = 2,
         dropout:         float = 0.0,
+        decouple:        bool  = False,
+        xyz_rotary_emb:  nn.Module | None = None,
+        xyz_offset:      int = 64,
     ):
         super().__init__()
         assert mllm_head_dim > 0 and nhead > 0
         self.d_model       = nhead * mllm_head_dim   # e.g. 4 × 256 = 1024
         self.nhead         = nhead
         self.mllm_head_dim = mllm_head_dim
+
+        self.decouple   = bool(decouple)
+        self.xyz_offset = int(xyz_offset)
+        if self.decouple:
+            assert xyz_rotary_emb is not None, (
+                "CameraTokenRotationEncoder(decouple=True) requires xyz_rotary_emb"
+            )
+            self.xyz_rotary_emb = xyz_rotary_emb
+        else:
+            self.xyz_rotary_emb = None
 
         self.cam_token = nn.Parameter(torch.empty(1, self.d_model))
         nn.init.normal_(self.cam_token, std=0.02)
@@ -323,6 +542,9 @@ class CameraTokenRotationEncoder(nn.Module):
                 dim_feedforward = dim_feedforward,
                 rope_emb        = rope_emb,
                 dropout         = dropout,
+                decouple        = self.decouple,
+                xyz_rotary_emb  = self.xyz_rotary_emb,
+                xyz_offset      = self.xyz_offset,
             )
             for _ in range(num_layers)
         ])
@@ -338,14 +560,16 @@ class CameraTokenRotationEncoder(nn.Module):
 
     def forward(
         self,
-        hidden_states:   torch.Tensor,   # (1, seq_len, hidden_dim)
-        token_txyz_int:  torch.Tensor,   # (seq_len, 4) long [t, x_int, y_int, z_int]
+        hidden_states:   torch.Tensor,                 # (1, seq_len, hidden_dim)
+        token_txyz_int:  torch.Tensor | None = None,   # (seq_len, 4) — non-decouple
+        token_thw_int:   torch.Tensor | None = None,   # (seq_len, 3) — decouple
+        xyz_pos:         torch.Tensor | None = None,   # (1, seq_len, 3) — decouple
+        coord_scale:     float = 100.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:
-            hidden_states:   MLLM token hidden states from pass 1 (detached)
-            token_txyz_int:  integer 4D positions matching MLLM convention.
-                             Produced by _build_token_txyz_int().
+        Args (non-decouple): pass token_txyz_int (4D `[t, x_int, y_int, z_int]`).
+        Args (decouple):     pass token_thw_int (3D `[t, h, w]`) + xyz_pos
+                             ((1, seq, 3) float, gradient-OK if needed).
         Returns:
             R:        (3, 3) float32 rotation matrix (SO(3))
             cam_feat: (d_model,) cam-token output in encoder dtype
@@ -356,14 +580,38 @@ class CameraTokenRotationEncoder(nn.Module):
 
         cam = self.cam_token.to(dtype=x.dtype, device=device)   # (1, d_model)
         x   = torch.cat([cam, x], dim=0)                        # (seq_len+1, d_model)
+        x   = x.unsqueeze(0)
 
-        cam_pos  = torch.zeros(4, 1, 1, dtype=torch.long, device=device)
-        mllm_pos = token_txyz_int.long().T.unsqueeze(1)          # (4, 1, seq_len)
-        position_ids = torch.cat([cam_pos, mllm_pos], dim=2)     # (4, 1, seq_len+1)
+        if self.decouple:
+            assert token_thw_int is not None and xyz_pos is not None, (
+                "rotation_enc(decouple=True): need token_thw_int + xyz_pos"
+            )
+            # 3D position_ids with cam-token row at (0,0,0).
+            cam_pos  = torch.zeros(3, 1, 1, dtype=torch.long, device=device)
+            mllm_pos = token_thw_int.long().T.unsqueeze(1)              # (3, 1, seq)
+            position_ids = torch.cat([cam_pos, mllm_pos], dim=2)        # (3, 1, seq+1)
 
-        x = x.unsqueeze(0)
-        for layer in self.layers:
-            x = layer(x, position_ids)
+            # xyz_pos with cam-token row = 0 → identity rotation in XYZ RoPE.
+            cam_xyz = torch.zeros(
+                1, 1, 3, dtype=xyz_pos.dtype, device=device,
+            )
+            xyz_pos_full = torch.cat([cam_xyz, xyz_pos], dim=1)         # (1, seq+1, 3)
+
+            for layer in self.layers:
+                x = layer(
+                    x, position_ids,
+                    xyz_pos=xyz_pos_full, coord_scale=coord_scale,
+                )
+        else:
+            assert token_txyz_int is not None, (
+                "rotation_enc(non-decouple): need token_txyz_int"
+            )
+            cam_pos  = torch.zeros(4, 1, 1, dtype=torch.long, device=device)
+            mllm_pos = token_txyz_int.long().T.unsqueeze(1)             # (4, 1, seq)
+            position_ids = torch.cat([cam_pos, mllm_pos], dim=2)        # (4, 1, seq+1)
+
+            for layer in self.layers:
+                x = layer(x, position_ids)
 
         cam_feat = x[0, 0]                                       # (d_model,) bf16
         r6d      = self.rot_head(cam_feat).float()               # (6,) float32
@@ -604,6 +852,7 @@ class RotationRoPEModel(nn.Module):
         spatial_merge_size: int,
         answer_weight:      float = 1.0,
         coord_weight:       float = 1.0,
+        decouple:           bool  = False,
     ):
         super().__init__()
         self.spa_model          = spa_model
@@ -613,13 +862,18 @@ class RotationRoPEModel(nn.Module):
         self.spatial_merge_size = spatial_merge_size
         self.answer_weight      = answer_weight
         self.coord_weight       = coord_weight
+        self.decouple           = bool(decouple)
 
-        # Build our differentiable RoPE from the MLLM's own rotary_emb so
-        # that inv_freq / mrope_section / attention_scaling match byte-for-byte.
-        inner       = self._unwrap()
-        spa_inner   = inner.model                            # SpaModel
-        spa_rotary  = spa_inner.language_model.rotary_emb    # SpaTextRotaryEmbedding
-        self.diff_rope = DifferentiableMRoPE.from_spa_rotary(spa_rotary)
+        # Differentiable 4D M-RoPE (only used by the non-decouple path: the
+        # decouple path runs Qwen's stock 3D M-RoPE in the rotary 64 dims and
+        # gets gradient flow through the separate XYZ RoPE in pass-through).
+        if not self.decouple:
+            inner       = self._unwrap()
+            spa_inner   = inner.model                            # SpaModel
+            spa_rotary  = spa_inner.language_model.rotary_emb    # SpaTextRotaryEmbedding
+            self.diff_rope = DifferentiableMRoPE.from_spa_rotary(spa_rotary)
+        else:
+            self.diff_rope = None
 
     # ------------------------------------------------------------------
 
@@ -633,6 +887,49 @@ class RotationRoPEModel(nn.Module):
                 break
             seen.add(id(m))
         return m
+
+    # ------------------------------------------------------------------
+
+    def _call_rotation_enc(
+        self,
+        inputs_embeds:  torch.Tensor,
+        input_ids:      torch.Tensor,
+        image_xyz:      list,
+        image_grid_thw: torch.Tensor,
+        coord_scale:    float,
+    ):
+        """Build positional inputs for rotation_enc and call it.
+
+        Branches on `self.decouple`:
+          • non-decouple → 4D `_build_token_txyz_int` (matches LLM 4D M-RoPE)
+          • decouple     → 3D `_build_token_thw_int` + per-token xyz_pos
+                           (matches LLM dual stock 3D M-RoPE + XYZ RoPE)
+        """
+        if self.decouple:
+            token_thw_int = _build_token_thw_int(
+                input_ids, self.image_token_id,
+                image_grid_thw, self.spatial_merge_size,
+            )
+            xyz_pos = _build_per_token_xyz(
+                input_ids, self.image_token_id,
+                image_xyz, image_grid_thw, self.spatial_merge_size,
+            )
+            return self.rotation_enc(
+                inputs_embeds,
+                token_thw_int = token_thw_int,
+                xyz_pos       = xyz_pos,
+                coord_scale   = float(coord_scale),
+            )
+
+        token_txyz_int = _build_token_txyz_int(
+            input_ids, self.image_token_id,
+            image_xyz, image_grid_thw, self.spatial_merge_size,
+            coord_scale,
+        )
+        return self.rotation_enc(
+            inputs_embeds,
+            token_txyz_int = token_txyz_int,
+        )
 
     # ------------------------------------------------------------------
 
@@ -707,6 +1004,66 @@ class RotationRoPEModel(nn.Module):
 
     # ------------------------------------------------------------------
 
+    def _run_text_model_decouple(
+        self,
+        text_model:        nn.Module,                  # SpaDecTextModel
+        spa_inner:         nn.Module,                  # SpaDecModel
+        inputs_embeds:     torch.Tensor,               # (bs, seq, hidden)
+        input_ids:         torch.Tensor,               # (bs, seq)
+        attention_mask:    torch.Tensor,               # (bs, seq)
+        image_grid_thw:    torch.Tensor | None,
+        rotated_image_xyz: list | None,                # list[k]: (H, W, 3)
+        coord_scale:       float,
+    ) -> torch.Tensor:
+        """Decouple-mode LLM forward (Qwen stock 3D M-RoPE + separate XYZ RoPE).
+
+        Mirrors train_correspondence.py's --decouple architecture:
+          • Rotary 64 dims  → Qwen original 3D M-RoPE on (t, h, w) integer
+                              position_ids (built via Qwen3_5Model.get_rope_index).
+          • Pass-through    → SpaXYZRotaryEmbedding on per-token (R-rotated) xyz,
+            dims 64..129     routed to SpaDecAttentionWrapper via
+                              SpaDecTextModel._xyz_pos.
+
+        Gradient w.r.t. R flows through the XYZ RoPE (SpaXYZRotaryEmbedding's
+        @torch.no_grad has been removed for train_alternate.py's purposes).
+        """
+        # mm_token_type_ids: 1 = image, 0 = text (no video).
+        mm_token_type_ids = (input_ids == self.image_token_id).int()
+
+        # Standard Qwen 3D M-RoPE position_ids — (3, bs, seq) integer.
+        position_ids, _ = spa_inner.get_rope_index(
+            input_ids         = input_ids,
+            mm_token_type_ids = mm_token_type_ids,
+            image_grid_thw    = image_grid_thw,
+            video_grid_thw    = None,
+            attention_mask    = attention_mask,
+        )
+
+        # Per-token xyz (gradient-preserving): text → (0,0,0); image → R @ xyz.
+        xyz_pos = _build_per_token_xyz(
+            input_ids,
+            self.image_token_id,
+            rotated_image_xyz if rotated_image_xyz is not None else [],
+            image_grid_thw,
+            self.spatial_merge_size,
+        )
+
+        # Stash on SpaDecTextModel — its forward picks these up to build
+        # xyz_position_embeddings and dispatches to SpaDecAttentionWrapper.
+        text_model._xyz_pos     = xyz_pos
+        text_model._coord_scale = float(coord_scale)
+        text_model._polar       = False
+
+        out = text_model(
+            inputs_embeds  = inputs_embeds,
+            attention_mask = attention_mask,
+            position_ids   = position_ids,
+            use_cache      = False,
+        )
+        return out.last_hidden_state
+
+    # ------------------------------------------------------------------
+
     def forward(
         self,
         input_ids:        torch.Tensor,              # (1, seq_len)
@@ -760,14 +1117,12 @@ class RotationRoPEModel(nn.Module):
         R = None
         cam_feat = None
         if use_rotation_enc and image_xyz is not None and image_grid_thw is not None:
-            token_txyz_int = _build_token_txyz_int(
-                input_ids, self.image_token_id,
-                image_xyz, image_grid_thw, self.spatial_merge_size,
-                coord_scale,
-            )                                              # (seq_len, 4) long
-            R, cam_feat = self.rotation_enc(
-                inputs_embeds.detach(),
-                token_txyz_int,
+            R, cam_feat = self._call_rotation_enc(
+                inputs_embeds      = inputs_embeds.detach(),
+                input_ids          = input_ids,
+                image_xyz          = image_xyz,
+                image_grid_thw     = image_grid_thw,
+                coord_scale        = coord_scale,
             )                                              # (3, 3) float32, (d_model,)
             _ldict["R_trace"] = R.trace().item()
 
@@ -777,24 +1132,34 @@ class RotationRoPEModel(nn.Module):
         else:
             rotated_xyz = image_xyz
 
-        # ── Step 4: build FLOAT 5D position_ids (no discretization) ──
-        position_ids_float = _build_float_position_ids(
-            input_ids          = input_ids,
-            attention_mask     = attention_mask,
-            image_token_id     = self.image_token_id,
-            image_xyz          = rotated_xyz,
-            image_grid_thw     = image_grid_thw,
-            spatial_merge_size = self.spatial_merge_size,
-            coord_scale        = coord_scale,
-        )                                                  # (5, bs, seq) float
-
-        # ── Step 5: manual text-model pass with differentiable RoPE ──
-        hidden2 = self._run_text_model_manual(
-            text_model          = text_model,
-            inputs_embeds       = inputs_embeds,
-            attention_mask      = attention_mask,
-            position_ids_float  = position_ids_float,
-        )                                                  # (bs, seq, hidden)
+        # ── Step 4-5: LLM forward (mode-dependent) ────────────────────────
+        if self.decouple:
+            hidden2 = self._run_text_model_decouple(
+                text_model        = text_model,
+                spa_inner         = spa_inner,
+                inputs_embeds     = inputs_embeds,
+                input_ids         = input_ids,
+                attention_mask    = attention_mask,
+                image_grid_thw    = image_grid_thw,
+                rotated_image_xyz = rotated_xyz,
+                coord_scale       = coord_scale,
+            )                                              # (bs, seq, hidden)
+        else:
+            position_ids_float = _build_float_position_ids(
+                input_ids          = input_ids,
+                attention_mask     = attention_mask,
+                image_token_id     = self.image_token_id,
+                image_xyz          = rotated_xyz,
+                image_grid_thw     = image_grid_thw,
+                spatial_merge_size = self.spatial_merge_size,
+                coord_scale        = coord_scale,
+            )                                              # (5, bs, seq) float
+            hidden2 = self._run_text_model_manual(
+                text_model          = text_model,
+                inputs_embeds       = inputs_embeds,
+                attention_mask      = attention_mask,
+                position_ids_float  = position_ids_float,
+            )                                              # (bs, seq, hidden)
         logits2 = lm_head(hidden2)                         # (bs, seq, vocab)
 
         # ── LM loss ───────────────────────────────────────────────────────
@@ -951,24 +1316,34 @@ class RotationRoPEModel(nn.Module):
         else:
             rotated_xyz = image_xyz
 
-        # Step 4: float 5D position_ids --------------------------------------
-        position_ids_float = _build_float_position_ids(
-            input_ids          = input_ids,
-            attention_mask     = attention_mask,
-            image_token_id     = self.image_token_id,
-            image_xyz          = rotated_xyz,
-            image_grid_thw     = image_grid_thw,
-            spatial_merge_size = self.spatial_merge_size,
-            coord_scale        = coord_scale,
-        )
-
-        # Step 5: manual LLM forward with differentiable RoPE ---------------
-        hidden2 = self._run_text_model_manual(
-            text_model         = text_model,
-            inputs_embeds      = inputs_embeds,
-            attention_mask     = attention_mask,
-            position_ids_float = position_ids_float,
-        )
+        # Step 4-5: LLM forward (mode-dependent) ----------------------------
+        if self.decouple:
+            hidden2 = self._run_text_model_decouple(
+                text_model        = text_model,
+                spa_inner         = spa_inner,
+                inputs_embeds     = inputs_embeds,
+                input_ids         = input_ids,
+                attention_mask    = attention_mask,
+                image_grid_thw    = image_grid_thw,
+                rotated_image_xyz = rotated_xyz,
+                coord_scale       = coord_scale,
+            )
+        else:
+            position_ids_float = _build_float_position_ids(
+                input_ids          = input_ids,
+                attention_mask     = attention_mask,
+                image_token_id     = self.image_token_id,
+                image_xyz          = rotated_xyz,
+                image_grid_thw     = image_grid_thw,
+                spatial_merge_size = self.spatial_merge_size,
+                coord_scale        = coord_scale,
+            )
+            hidden2 = self._run_text_model_manual(
+                text_model         = text_model,
+                inputs_embeds      = inputs_embeds,
+                attention_mask     = attention_mask,
+                position_ids_float = position_ids_float,
+            )
         logits2 = lm_head(hidden2)
 
         # LM loss + optional binary accuracy (reward) -----------------------
@@ -1174,6 +1549,9 @@ class CameraTokenRotationEncoderRL(nn.Module):
         dropout:         float = 0.0,
         action_space:    str   = "hybrid",
         residual_clamp:  float = math.pi / 24,
+        decouple:        bool  = False,
+        xyz_rotary_emb:  nn.Module | None = None,
+        xyz_offset:      int   = 64,
     ):
         super().__init__()
         assert action_space in ("discrete", "hybrid"), \
@@ -1184,6 +1562,16 @@ class CameraTokenRotationEncoderRL(nn.Module):
         self.mllm_head_dim  = mllm_head_dim
         self.action_space   = action_space
         self.residual_clamp = float(residual_clamp)
+
+        self.decouple   = bool(decouple)
+        self.xyz_offset = int(xyz_offset)
+        if self.decouple:
+            assert xyz_rotary_emb is not None, (
+                "CameraTokenRotationEncoderRL(decouple=True) requires xyz_rotary_emb"
+            )
+            self.xyz_rotary_emb = xyz_rotary_emb
+        else:
+            self.xyz_rotary_emb = None
 
         self.cam_token = nn.Parameter(torch.empty(1, self.d_model))
         nn.init.normal_(self.cam_token, std=0.02)
@@ -1197,6 +1585,9 @@ class CameraTokenRotationEncoderRL(nn.Module):
                 dim_feedforward = dim_feedforward,
                 rope_emb        = rope_emb,
                 dropout         = dropout,
+                decouple        = self.decouple,
+                xyz_rotary_emb  = self.xyz_rotary_emb,
+                xyz_offset      = self.xyz_offset,
             )
             for _ in range(num_layers)
         ])
@@ -1221,10 +1612,17 @@ class CameraTokenRotationEncoderRL(nn.Module):
 
     def forward(
         self,
-        hidden_states:  torch.Tensor,   # (1, seq_len, hidden_dim)
-        token_txyz_int: torch.Tensor,   # (seq_len, 4) long
+        hidden_states:   torch.Tensor,                 # (1, seq_len, hidden_dim)
+        token_txyz_int:  torch.Tensor | None = None,   # (seq_len, 4) — non-decouple
+        token_thw_int:   torch.Tensor | None = None,   # (seq_len, 3) — decouple
+        xyz_pos:         torch.Tensor | None = None,   # (1, seq_len, 3) — decouple
+        coord_scale:     float = 100.0,
     ) -> Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """
+        Args (non-decouple): pass token_txyz_int (4D `[t, x_int, y_int, z_int]`).
+        Args (decouple):     pass token_thw_int (3D `[t, h, w]`) + xyz_pos
+                             ((1, seq, 3) float, gradient-OK if needed).
+
         Returns:
             logits:       (24,) float32 — yaw-anchor classifier logits.
             residual_all: (24,) float32 raw Δyaw output (pre-clamp),
@@ -1236,14 +1634,36 @@ class CameraTokenRotationEncoderRL(nn.Module):
         x = self.input_proj(hidden_states[0])
         cam = self.cam_token.to(dtype=x.dtype, device=device)
         x   = torch.cat([cam, x], dim=0)
+        x   = x.unsqueeze(0)
 
-        cam_pos  = torch.zeros(4, 1, 1, dtype=torch.long, device=device)
-        mllm_pos = token_txyz_int.long().T.unsqueeze(1)
-        position_ids = torch.cat([cam_pos, mllm_pos], dim=2)
+        if self.decouple:
+            assert token_thw_int is not None and xyz_pos is not None, (
+                "rotation_enc(decouple=True): need token_thw_int + xyz_pos"
+            )
+            cam_pos  = torch.zeros(3, 1, 1, dtype=torch.long, device=device)
+            mllm_pos = token_thw_int.long().T.unsqueeze(1)              # (3, 1, seq)
+            position_ids = torch.cat([cam_pos, mllm_pos], dim=2)        # (3, 1, seq+1)
 
-        x = x.unsqueeze(0)
-        for layer in self.layers:
-            x = layer(x, position_ids)
+            cam_xyz = torch.zeros(
+                1, 1, 3, dtype=xyz_pos.dtype, device=device,
+            )
+            xyz_pos_full = torch.cat([cam_xyz, xyz_pos], dim=1)         # (1, seq+1, 3)
+
+            for layer in self.layers:
+                x = layer(
+                    x, position_ids,
+                    xyz_pos=xyz_pos_full, coord_scale=coord_scale,
+                )
+        else:
+            assert token_txyz_int is not None, (
+                "rotation_enc(non-decouple): need token_txyz_int"
+            )
+            cam_pos  = torch.zeros(4, 1, 1, dtype=torch.long, device=device)
+            mllm_pos = token_txyz_int.long().T.unsqueeze(1)
+            position_ids = torch.cat([cam_pos, mllm_pos], dim=2)
+
+            for layer in self.layers:
+                x = layer(x, position_ids)
 
         cam_feat = x[0, 0]
         logits   = self.head_cls(cam_feat).float()              # (24,)

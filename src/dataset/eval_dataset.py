@@ -415,6 +415,121 @@ def load_testing_dataset(
                 "data_dir": str(data_dir),
             })
 
+    elif dataset == "embspatial":
+        # EmbSpatial-Bench (ACL 2024 Findings) — single-image egocentric
+        # spatial relations on mp3d/ai2thor/scannet scenes. 3,640 Q across 6
+        # relations: close/far/left/right/above/under.
+        # Schema: data_source, question_id, question, relation, image (base64),
+        # answer_options (list of 4), answer (int 0-3), objects (list of bbox).
+        # Images are extracted to data_dir/images/ on first load (similar to
+        # robospatial); subsequent runs reuse the cache.
+        import base64, io
+        json_file = data_dir / "embspatial_bench.json"
+        if not json_file.exists():
+            raise FileNotFoundError(f"Dataset file not found: {json_file}")
+        images_cache_dir = data_dir / "images"
+        images_cache_dir.mkdir(exist_ok=True)
+        with open(json_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if limit is not None:
+            raw = raw[:limit]
+        _letters = "ABCDEFGHIJ"
+        for item in raw:
+            qid = item.get("question_id", "")
+            img_path = images_cache_dir / f"{qid}.jpg"
+            if not img_path.exists():
+                img_b64 = item.get("image", "")
+                img_bytes = base64.b64decode(img_b64)
+                # Some entries are PNG, some JPEG — let PIL re-save consistently
+                Image.open(io.BytesIO(img_bytes)).convert("RGB").save(img_path, "JPEG")
+            options = item.get("answer_options", [])
+            ans_idx = item.get("answer", -1)
+            answer_letter = _letters[ans_idx] if 0 <= ans_idx < len(options) else ""
+            choices_text = "\n".join(
+                f"{_letters[i]}. {opt}" for i, opt in enumerate(options)
+            )
+            question_text = item.get("question", "") + "\n" + choices_text
+            samples.append({
+                "index": qid,
+                "image": [str(img_path.resolve())],
+                "question": question_text,
+                "answer": answer_letter,
+                "category": item.get("relation", "unknown"),
+                "thought": "",
+                "data_dir": str(data_dir),
+            })
+
+    elif dataset == "omnispatial_pt":
+        # OmniSpatial — Perspective_Taking subset only (ICLR 2026).
+        # data.json has 1533 entries across 4 task_types; we filter to
+        # Perspective_Taking (561 Q: Allocentric 376 / Hypothetical 83 / Egocentric 102).
+        # id format "{image_number}_{question_number}" → image at
+        # Perspective_Taking/{image_number}.png. answer is int index into options.
+        json_file = data_dir / "OmniSpatial-test" / "data.json"
+        if not json_file.exists():
+            raise FileNotFoundError(f"Dataset file not found: {json_file}")
+        with open(json_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        raw = [d for d in raw if d.get("task_type") == "Perspective_Taking"]
+        if limit is not None:
+            raw = raw[:limit]
+        _letters = "ABCDEFGHIJ"
+        for item in raw:
+            qid = item.get("id", "")
+            img_num = qid.split("_")[0] if qid else ""
+            img_path = data_dir / "OmniSpatial-test" / "Perspective_Taking" / f"{img_num}.png"
+            options = item.get("options", [])
+            ans_idx = item.get("answer", -1)
+            answer_letter = _letters[ans_idx] if 0 <= ans_idx < len(options) else ""
+            choices_text = "\n".join(
+                f"{_letters[i]}. {opt}" for i, opt in enumerate(options)
+            )
+            question_text = item.get("question", "") + "\n" + choices_text
+            samples.append({
+                "index": qid,
+                "image": [str(img_path.resolve())],
+                "question": question_text,
+                "answer": answer_letter,
+                "category": item.get("sub_task_type", "unknown"),
+                "thought": "",
+                "data_dir": str(data_dir),
+            })
+
+    elif dataset == "viewspatial":
+        # ViewSpatial-Bench — perspective-taking benchmark on ScanNet+COCO.
+        # JSON file: ViewSpatial-Bench.json with 5,712 entries.
+        # Keys: question_type, image_path (list, prefixed with "ViewSpatial-Bench/"),
+        #       question, answer ("<letter>. <text>"), choices ("A. ...\nB. ...").
+        # question_type splits cleanly into:
+        #   "Camera perspective - *"  → egocentric
+        #   "Person perspective - *"  → allocentric (perspective-taking)
+        json_file = data_dir / "ViewSpatial-Bench.json"
+        if not json_file.exists():
+            raise FileNotFoundError(f"Dataset file not found: {json_file}")
+        with open(json_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if limit is not None:
+            raw = raw[:limit]
+        for idx, item in enumerate(raw):
+            # image_path entries are "ViewSpatial-Bench/<root>/..." — strip the
+            # leading "ViewSpatial-Bench/" so they resolve under data_dir.
+            image_paths = []
+            for p in item.get("image_path", []):
+                rel = p.split("/", 1)[1] if p.startswith("ViewSpatial-Bench/") else p
+                image_paths.append(str((data_dir / rel).resolve()))
+            answer_raw = item.get("answer", "").strip()
+            answer_letter = answer_raw.split(".", 1)[0].strip() if "." in answer_raw else answer_raw
+            question_text = item.get("question", "") + "\n" + item.get("choices", "")
+            samples.append({
+                "index": idx,
+                "image": image_paths,
+                "question": question_text,
+                "answer": answer_letter,
+                "category": item.get("question_type", "unknown"),
+                "thought": "",
+                "data_dir": str(data_dir),
+            })
+
     elif dataset == "spinbench":
         # SPINBench — multi-view object spatial reasoning.
         # Uses test.jsonl which includes an 'id' field matching
@@ -512,7 +627,8 @@ def load_testing_dataset(
         raise ValueError(
             f"Unknown dataset '{dataset}'. "
             "Choose: mmsibench | mindcube | sat | sat_real | vsibench | "
-            "sparbench_multi_view | sparbench_single_view | sparbench_mv | spinbench | robospatial"
+            "sparbench_multi_view | sparbench_single_view | sparbench_mv | "
+            "spinbench | robospatial | viewspatial | omnispatial_pt | embspatial"
         )
 
     return samples

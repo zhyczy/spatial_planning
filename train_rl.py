@@ -105,9 +105,11 @@ from src.models import (
     CameraTokenRotationEncoderRL,
     RotationRoPEModel,
     SpaForConditionalGeneration,
+    SpaDecForConditionalGeneration,
+    patch_attention_layers_dec,
 )
-from src.models.rotation_rope_llm import _build_token_txyz_int
 from src.models.spa_emb import SpaTextRotaryEmbedding
+from src.models.spa_emb_dec import SpaXYZRotaryEmbedding
 from src.dataset import (
     MindCube_Train_Dataset_Rotation,
     SAT_Train_Dataset_Rotation,
@@ -150,18 +152,45 @@ def build_model(
     rot_dim_feedforward: int   = 2048,
     rot_num_layers:      int   = 2,
     relative:            bool  = False,
+    decouple:            bool  = False,
+    xyz_rope_dim:        int   = 66,
 ) -> RotationRoPEModel:
-    """Build RotationRoPEModel with the RL encoder (discrete 24-class)."""
+    """Build RotationRoPEModel with the RL encoder (discrete 24-class).
+
+    decouple=True  → mirrors train_alternate.py: keep Qwen original 3D M-RoPE
+                     [11,11,10] in the rotary 64 dims (UNCHANGED) and add a
+                     NEW XYZ RoPE in dims 64..129 (xyz_rope_dim dims, fed
+                     R-rotated Cartesian xyz). Mutually exclusive with
+                     --relative.
+    xyz_rope_dim   → total dims for the pass-through XYZ RoPE under
+                     --decouple (must be a positive multiple of 6 ≤ 192).
+    """
+    if decouple and relative:
+        raise ValueError("--decouple is mutually exclusive with --relative.")
+    if xyz_rope_dim % 6 != 0 or xyz_rope_dim <= 0 or xyz_rope_dim > 192:
+        raise ValueError(
+            f"--xyz_rope_dim must be a positive multiple of 6 ≤ 192 "
+            f"(pass-through region); got {xyz_rope_dim}."
+        )
+
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
-    total    = sum(orig_section)
-    xyz_size = (total - 2) // 3
-    new_section = [2, xyz_size, xyz_size, xyz_size]
-    config.text_config.rope_scaling["mrope_section"] = new_section
-    log.info(
-        f"mrope_section: {orig_section} -> {new_section}  "
-        f"(4D M-RoPE: 2 for t, {xyz_size} each for x/y/z)"
-    )
+
+    if decouple:
+        log.info(
+            f"mrope_section: {orig_section} (UNCHANGED — Qwen original 3D M-RoPE) "
+            f"+ new XYZ RoPE ({xyz_rope_dim} dims, rope_theta=10000) in pass-through region "
+            f"[input: R-rotated Cartesian (x, y, z)]"
+        )
+    else:
+        total    = sum(orig_section)
+        xyz_size = (total - 2) // 3
+        new_section = [2, xyz_size, xyz_size, xyz_size]
+        config.text_config.rope_scaling["mrope_section"] = new_section
+        log.info(
+            f"mrope_section: {orig_section} -> {new_section}  "
+            f"(4D M-RoPE: 2 for t, {xyz_size} each for x/y/z)"
+        )
 
     mllm_head_dim = getattr(config.text_config, "head_dim", None) or (
         config.text_config.hidden_size // config.text_config.num_attention_heads
@@ -171,12 +200,33 @@ def build_model(
         f"→ rotation_enc d_model={rot_nhead * mllm_head_dim}"
     )
 
-    spa = SpaForConditionalGeneration.from_pretrained(
-        model_path,
-        config              = config,
-        torch_dtype         = torch.bfloat16,
-        attn_implementation = "sdpa",
-    )
+    if decouple:
+        spa = SpaDecForConditionalGeneration.from_pretrained(
+            model_path,
+            config              = config,
+            torch_dtype         = torch.bfloat16,
+            attn_implementation = "sdpa",
+        )
+        if xyz_rope_dim != 66:
+            _lm  = spa.model.language_model
+            _old = _lm.xyz_rotary_emb
+            _new = SpaXYZRotaryEmbedding(
+                xyz_dim             = xyz_rope_dim,
+                rope_theta          = 10000.0,
+                default_coord_scale = _old.default_coord_scale,
+            )
+            _lm.xyz_rotary_emb = _new.to(next(_lm.parameters()).device)
+            log.info(
+                f"[XYZ RoPE] xyz_dim={xyz_rope_dim} "
+                f"(n_per_axis={xyz_rope_dim // 6}), theta=10000"
+            )
+    else:
+        spa = SpaForConditionalGeneration.from_pretrained(
+            model_path,
+            config              = config,
+            torch_dtype         = torch.bfloat16,
+            attn_implementation = "sdpa",
+        )
 
     if freeze_vision:
         for p in spa.model.visual.parameters():
@@ -197,6 +247,12 @@ def build_model(
     spa = get_peft_model(spa, lora_cfg)
     spa.print_trainable_parameters()
 
+    if decouple:
+        n_patched = patch_attention_layers_dec(spa)
+        log.info(
+            f"Wrapped {n_patched} attention layers with SpaDecAttentionWrapper."
+        )
+
     spa.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
@@ -207,7 +263,32 @@ def build_model(
 
     hidden_dim = config.text_config.hidden_size
 
-    rot_rope_emb = SpaTextRotaryEmbedding(config=config.text_config).to(torch.bfloat16)
+    # rotation_enc's positional encoding mirrors the LLM main-path RoPE.
+    import copy as _copy
+    _rot_text_config = _copy.deepcopy(config.text_config)
+    _rot_text_config.rope_scaling = dict(_rot_text_config.rope_scaling)
+    if decouple:
+        _rot_text_config.rope_scaling["mrope_section"] = list(orig_section)
+    else:
+        _orig_total   = sum(orig_section)
+        _rot_xyz_size = (_orig_total - 2) // 3
+        _rot_text_config.rope_scaling["mrope_section"] = [
+            2, _rot_xyz_size, _rot_xyz_size, _rot_xyz_size,
+        ]
+    rot_rope_emb = SpaTextRotaryEmbedding(config=_rot_text_config).to(torch.bfloat16)
+
+    rot_xyz_rope_emb = None
+    if decouple:
+        rot_xyz_rope_emb = SpaXYZRotaryEmbedding(
+            xyz_dim             = xyz_rope_dim,
+            rope_theta          = 10000.0,
+            default_coord_scale = 100.0,
+        ).to(torch.bfloat16)
+        log.info(
+            f"rotation_enc XYZ RoPE: xyz_dim={xyz_rope_dim} "
+            f"(n_per_axis={xyz_rope_dim // 6}), theta=10000 "
+            f"[independent instance from main backbone]"
+        )
 
     rotation_enc = CameraTokenRotationEncoderRL(
         hidden_dim      = hidden_dim,
@@ -218,11 +299,14 @@ def build_model(
         num_layers      = rot_num_layers,
         dropout         = 0.0,                  # MUST be 0 for RL (det. no_grad == grad)
         action_space    = "discrete",
+        decouple        = decouple,
+        xyz_rotary_emb  = rot_xyz_rope_emb,
     ).to(torch.bfloat16)
     log.info(
         f"CameraTokenRotationEncoderRL  hidden_dim={hidden_dim}  "
         f"mllm_head_dim={mllm_head_dim}  nhead={rot_nhead}  "
-        f"d_model={rotation_enc.d_model}  (discrete action space)"
+        f"d_model={rotation_enc.d_model}  (discrete action space"
+        f"{', decouple' if decouple else ''})"
     )
 
     cam_dim = rotation_enc.d_model if relative else 0
@@ -243,6 +327,7 @@ def build_model(
         spatial_merge_size = spatial_merge_size,
         answer_weight      = answer_weight,
         coord_weight       = coord_weight,
+        decouple           = decouple,
     )
 
 
@@ -317,13 +402,9 @@ def _phase_a_step(
     R        = None
     cam_feat = None
     if use_rot_enc and image_xyz is not None and image_grid_thw is not None:
-        token_txyz_int = _build_token_txyz_int(
-            input_ids, _model.image_token_id,
-            image_xyz, image_grid_thw, _model.spatial_merge_size,
-            args.coord_scale,
-        )
-        logits, residual_all, cam_feat = _model.rotation_enc(
-            inputs_embeds.detach(), token_txyz_int,
+        logits, residual_all, cam_feat = _model._call_rotation_enc(
+            inputs_embeds.detach(), input_ids,
+            image_xyz, image_grid_thw, args.coord_scale,
         )
         k_star = int(logits.argmax(-1).item())
         R = _model.rotation_enc.compose_R(k_star, residual_all)
@@ -428,15 +509,12 @@ def _phase_b_grpo_step(
     # ── Encoding shared across all 24 no_grad + K grad forwards ─────────
     inputs_embeds = _model.encode_inputs(input_ids, pixel_values, image_grid_thw)
 
-    token_txyz_int = _build_token_txyz_int(
-        input_ids, _model.image_token_id,
-        image_xyz, image_grid_thw, _model.spatial_merge_size,
-        args.coord_scale,
-    )
     # Encoder forward WITH grad — logits carries head_cls gradient back to
-    # the head and encoder backbone.
-    logits, residual_all, cam_feat = _model.rotation_enc(
-        inputs_embeds.detach(), token_txyz_int,
+    # the head and encoder backbone. _call_rotation_enc dispatches between
+    # 4D M-RoPE (non-decouple) and 3D M-RoPE + XYZ RoPE (decouple).
+    logits, residual_all, cam_feat = _model._call_rotation_enc(
+        inputs_embeds.detach(), input_ids,
+        image_xyz, image_grid_thw, args.coord_scale,
     )   # logits (24,), residual_all=None (discrete), cam_feat (d_model,)
 
     # ── Stage 1: 24 × no_grad reward collection ──────────────────────────
@@ -604,9 +682,11 @@ def _phase_b_grpo_step(
             for inner_step in range(K):
                 # Re-forward rotation_enc (rot_bb + head_cls). inputs_embeds
                 # is already detached upstream, so only the shallow M-RoPE
-                # encoder graph is rebuilt — cheap.
-                logits_i, _res_i, _cam_i = _model.rotation_enc(
-                    inputs_embeds.detach(), token_txyz_int,
+                # encoder graph is rebuilt — cheap. _call_rotation_enc
+                # dispatches on decouple internally.
+                logits_i, _res_i, _cam_i = _model._call_rotation_enc(
+                    inputs_embeds.detach(), input_ids,
+                    image_xyz, image_grid_thw, args.coord_scale,
                 )
                 log_probs_i = F.log_softmax(logits_i, dim=-1)
                 probs_i     = log_probs_i.exp()
@@ -765,6 +845,8 @@ def train(args: argparse.Namespace) -> None:
         rot_dim_feedforward = args.rot_dim_feedforward,
         rot_num_layers      = args.rot_num_layers,
         relative            = args.relative,
+        decouple            = args.decouple,
+        xyz_rope_dim        = args.xyz_rope_dim,
     )
     model = model.to(device)
     if local_rank == 0:
@@ -784,12 +866,11 @@ def train(args: argparse.Namespace) -> None:
     # -- dataset / loader ------------------------------------------------------
     if args.training_dataset == "mindcube":
         train_dataset = MindCube_Train_Dataset_Rotation(
-            args.json_path, args.results_dir, processor, None, log,
+            args.json_path, args.results_dir, processor, log,
             max_images         = args.max_images,
             spatial_merge_size = spatial_merge_size,
             coord_upscale      = args.coord_upscale,
             max_samples        = args.max_samples,
-            no_cam             = True,
         )
     elif args.training_dataset == "sat":
         train_dataset = SAT_Train_Dataset_Rotation(
@@ -829,11 +910,10 @@ def train(args: argparse.Namespace) -> None:
     ]:
         try:
             ds = Eval_Dataset_Coord(
-                _ds_jsonl, _ds_results, processor, None, log,
+                _ds_jsonl, _ds_results, processor, log,
                 max_images         = args.max_images,
                 spatial_merge_size = spatial_merge_size,
                 coord_upscale      = args.coord_upscale,
-                no_cam             = True,
                 question_key       = _q_key,
                 answer_key         = _a_key,
             )
@@ -923,6 +1003,10 @@ def train(args: argparse.Namespace) -> None:
     log.info(f">>> w_coord        = {args.w_coord}")
     log.info(f">>> no_coord       = {args.no_coord}")
     log.info(f">>> relative       = {args.relative}")
+    log.info(
+        f">>> decouple       = {args.decouple}"
+        + (f"  (xyz_rope_dim={args.xyz_rope_dim})" if args.decouple else "")
+    )
     log.info(f">>> lr_phase_a     = {lr_phase_a_base:.2e}  (LoRA, warm-restart per Phase A)")
     log.info(f">>> lr_phase_b     = {lr_phase_b_base:.2e}  (rot_bb, warm-restart per Phase B)")
     log.info(f">>> head_cls_lr    = {lr_phase_b_base * args.head_cls_lr_scale:.2e}"
@@ -1296,13 +1380,9 @@ def _run_eval(
 
             with torch.inference_mode():
                 inputs_embeds = _model.encode_inputs(t_ids, t_pv, t_thw)
-                token_txyz_int = _build_token_txyz_int(
-                    t_ids, _model.image_token_id,
-                    t_xyz, t_thw, _model.spatial_merge_size,
-                    args.coord_scale,
-                )
-                logits, residual_all, cam_feat = _model.rotation_enc(
-                    inputs_embeds, token_txyz_int,
+                logits, residual_all, cam_feat = _model._call_rotation_enc(
+                    inputs_embeds, t_ids,
+                    t_xyz, t_thw, args.coord_scale,
                 )
                 probs    = torch.softmax(logits.float(), dim=-1)            # (24,)
                 entropy  = float(-(probs * (probs.clamp_min(1e-12)).log()).sum().item())
@@ -1448,7 +1528,7 @@ def _run_eval(
                     f"{ds_name}  {_vals}"
                 )
             if use_wandb:
-                _main = {"coord_loss", "lm_loss"}
+                _main = {"coord_loss", "lm_loss", "acc"}
                 wandb.log(
                     {
                         **{f"eval/{ds_name}_{k}": agg_sums[k] / total_count
@@ -1609,6 +1689,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--coord_weight",  type=float, default=1.0)
     p.add_argument("--no_coord",      action="store_true")
     p.add_argument("--relative",      action="store_true")
+    p.add_argument(
+        "--decouple", action="store_true",
+        help="Mirror train_alternate.py --decouple: keep Qwen original 3D "
+             "M-RoPE on rotary 64 dims (UNCHANGED) and add a new XYZ RoPE on "
+             "the pass-through region (xyz_rope_dim dims, fed R-rotated "
+             "Cartesian xyz). Mutually exclusive with --relative.",
+    )
+    p.add_argument(
+        "--xyz_rope_dim", type=int, default=66,
+        help="Total dims for the pass-through XYZ RoPE under --decouple "
+             "(must be a positive multiple of 6 ≤ 192). No effect without "
+             "--decouple.",
+    )
     p.add_argument("--coord_upscale", type=int,   default=4)
     p.add_argument("--coord_scale",   type=float, default=100.0)
 

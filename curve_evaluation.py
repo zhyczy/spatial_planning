@@ -19,7 +19,7 @@ python curve_evaluation.py \\
     --start     500 \\
     --end       1000 \\
     --step_size 50 \\
-    --method    coordinate \\  # or polar / decouple / relative / rotation / rotation_relative / rotation_rl
+    --method    coordinate \\  # or polar / decouple / rotation / rotation_rl
     --datasets  mindcube,sat_real \\
     --gpus      0,1,2,3 \\
     --output_dir eval_results/curves/coordinate_no_cam_mindcube
@@ -60,13 +60,19 @@ _ROOT = Path(__file__).resolve().parent
 
 PYTHON = str(Path(sys.executable))
 
-ALL_DATASETS = ["mindcube", "sat_real", "spinbench", "robospatial"]
+ALL_DATASETS = [
+    "mindcube", "sat_real", "spinbench", "robospatial",
+    "viewspatial", "omnispatial_pt", "embspatial",
+]
 
 DATASET_DIR = {
     "mindcube":              "datasets/evaluation/MindCube",
     "sat_real":              "datasets/evaluation/SAT",
     "spinbench":             "datasets/evaluation/spinbench_data",
     "robospatial":           "datasets/evaluation/RoboSpatial",
+    "viewspatial":           "datasets/evaluation/ViewSpatial-Bench",
+    "omnispatial_pt":        "datasets/evaluation/OmniSpatial",
+    "embspatial":            "datasets/evaluation/EmbSpatial-Bench",
 }
 
 MODEL_PATH = str(_ROOT / "checkpoints" / "Qwen3.5-4B")
@@ -308,8 +314,7 @@ def main() -> None:
     parser.add_argument(
         "--method", type=str, default="coordinate",
         choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
-                 "decouple", "relative",
-                 "rotation", "rotation_relative", "rotation_rl"],
+                 "decouple", "rotation", "rotation_rl"],
         help="Evaluation method (default: coordinate).",
     )
     parser.add_argument(

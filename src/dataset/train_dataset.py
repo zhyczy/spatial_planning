@@ -998,6 +998,404 @@ class MindCube_Train_Dataset_Rotation(MindCube_Train_Dataset_Coord):
 _SAT_LETTERS = "ABCDEFGHIJ"
 
 
+def _balance_sat_samples_by_qtype(
+    samples: list,
+    target_size: int,
+    seed: int = 0,
+    log=None,
+) -> list:
+    """Down-sample a SAT (entry, sample_dir) list so that the total count is
+    ~``target_size`` and each ``question_type`` contributes uniformly.
+
+    Per-category quota = ceil(target / n_categories) for the first
+    (target % n_categories) categories, floor otherwise. If a category has
+    fewer samples than its quota, all of them are kept (no upsampling).
+
+    Sampling is deterministic given ``seed``.
+    """
+    import random
+    from collections import defaultdict
+
+    if target_size <= 0 or len(samples) <= target_size:
+        return samples
+
+    groups: dict[str, list] = defaultdict(list)
+    for entry, sd in samples:
+        qt = str(entry.get("question_type", "_unknown"))
+        groups[qt].append((entry, sd))
+
+    cats = sorted(groups.keys())
+    n_cats = len(cats)
+    base   = target_size // n_cats
+    extra  = target_size % n_cats   # first `extra` categories get +1
+
+    rng = random.Random(seed)
+    out: list = []
+    per_cat_taken: dict[str, int] = {}
+    for i, qt in enumerate(cats):
+        quota = base + (1 if i < extra else 0)
+        pool  = groups[qt]
+        if len(pool) <= quota:
+            picked = pool
+        else:
+            picked = rng.sample(pool, quota)
+        per_cat_taken[qt] = len(picked)
+        out.extend(picked)
+
+    rng.shuffle(out)   # avoid category-block ordering after concat
+    if log is not None:
+        log.info(
+            f"_balance_sat_samples_by_qtype: target={target_size} "
+            f"-> kept {len(out)} (per-category: {per_cat_taken})"
+        )
+    return out
+
+
+def _format_sat_question(entry: dict) -> tuple[str, str]:
+    """Format a SAT entry into (prompt_text, answer).
+
+    If answer_choices is non-empty, the answer is the matching letter
+    ("A", "B", ...); otherwise it's the raw correct_answer string.
+    """
+    question = entry.get("question", "")
+    choices  = entry.get("answer_choices", []) or []
+    correct  = entry.get("correct_answer", "")
+    if choices:
+        formatted = "\n".join(
+            f"{_SAT_LETTERS[i]}. {c}" for i, c in enumerate(choices)
+        )
+        prompt_text = question + "\n" + formatted
+        try:
+            answer = _SAT_LETTERS[choices.index(correct)]
+        except ValueError:
+            answer = str(correct)
+    else:
+        prompt_text = question
+        answer = str(correct)
+    return prompt_text, answer
+
+
+class SAT_Train_Dataset(Dataset):
+    """
+    SAT training dataset (LM-only, mirrors MindCube_Train_Dataset).
+
+    Reads a SAT JSON list (NOT JSONL) where each entry has:
+        database_idx, question, answer_choices, correct_answer, img_paths
+
+    3D layout under ``results_dir`` (same as MindCube):
+        <results_dir>/<database_idx>/view_XXXX/
+            image.png, pts3d.npy, mask.npy, [camera_pose.npy]
+
+    Returns the same per-item dict as MindCube_Train_Dataset:
+        input_ids, attention_mask, pixel_values, image_grid_thw,
+        image_xyz, labels.
+    """
+
+    def __init__(
+        self,
+        json_path:           str,
+        results_dir:         str,
+        processor,
+        log,
+        max_images:          int = 4,
+        spatial_merge_size:  int = 2,
+        max_samples:         int | None = None,
+        balanced_categories: bool = False,
+        target_size:         int | None = None,
+        balance_seed:        int = 0,
+    ):
+        import json
+        with open(json_path) as fh:
+            raw = json.load(fh)
+
+        self.samples = []
+        for entry in raw:
+            eid = str(entry.get("database_idx", ""))
+            sample_dir = os.path.join(results_dir, eid)
+            if not os.path.isdir(sample_dir):
+                continue
+            self.samples.append((entry, sample_dir))
+
+        if balanced_categories and target_size is not None and target_size > 0:
+            self.samples = _balance_sat_samples_by_qtype(
+                self.samples, target_size=target_size,
+                seed=balance_seed, log=log,
+            )
+
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
+
+        self.processor          = processor
+        self.max_images         = max_images
+        self.spatial_merge_size = spatial_merge_size
+        self.log = log
+        log.info(
+            f"SAT_Train_Dataset: {len(self.samples)} valid entries "
+            f"(out of {len(raw)} total) from {json_path} "
+            f"[balanced={balanced_categories}, target={target_size}]"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        entry, sample_dir = self.samples[idx]
+
+        # ── load images and per-pixel xyz ─────────────────────────────────────
+        view_dirs = sorted(
+            d for d in os.listdir(sample_dir) if d.startswith("view_")
+        )
+        images, xyz_raw_list, mask_raw_list = [], [], []
+        for vd in view_dirs[: self.max_images]:
+            img_path = os.path.join(sample_dir, vd, "image.png")
+            try:
+                images.append(Image.open(img_path).convert("RGB"))
+            except (FileNotFoundError, OSError):
+                break
+            pts3d_path = os.path.join(sample_dir, vd, "pts3d.npy")
+            mask_path  = os.path.join(sample_dir, vd, "mask.npy")
+            xyz_raw_list.append(
+                np.load(pts3d_path).astype(np.float32)
+                if os.path.exists(pts3d_path) else None
+            )
+            mask_raw_list.append(
+                np.load(mask_path) if os.path.exists(mask_path) else None
+            )
+
+        N = len(images)
+        if N < 1:
+            raise RuntimeError(
+                f"SAT sample {idx} (database_idx={entry.get('database_idx')}) "
+                f"has no valid images under {sample_dir}."
+            )
+
+        # ── build prompt (QA + choices) ──────────────────────────────────────
+        question_text, answer_text = _format_sat_question(entry)
+        if not question_text or not answer_text:
+            raise RuntimeError(
+                f"SAT sample {idx} (database_idx={entry.get('database_idx')}) "
+                f"has no QA pair."
+            )
+
+        content: list = [{"type": "image", "image": img} for img in images]
+        content.append({"type": "text", "text": question_text})
+
+        text_full = self.processor.apply_chat_template(
+            [{"role": "user",      "content": content},
+             {"role": "assistant", "content": answer_text}],
+            tokenize=False, add_generation_prompt=False,
+        )
+        proc_out = self.processor(
+            text=[text_full], images=images,
+            return_tensors="pt", padding=False,
+        )
+        suffix_ids = self.processor.tokenizer(
+            answer_text + "<|im_end|>\n", add_special_tokens=False
+        )["input_ids"]
+        labels = proc_out["input_ids"].clone()
+        labels[0, :-len(suffix_ids)] = -100
+
+        # ── 3D position maps (pts3d → patch-level xyz) ────────────────────────
+        image_xyz = None
+        try:
+            thw_all = proc_out["image_grid_thw"]  # (N, 3)
+            sms     = self.spatial_merge_size
+            xyz_list = []
+            for k in range(N):
+                xyz_raw  = xyz_raw_list[k]
+                mask_raw = mask_raw_list[k]
+                thw_k    = thw_all[k]
+                llm_h    = int(thw_k[1]) // sms
+                llm_w    = int(thw_k[2]) // sms
+                if xyz_raw is not None:
+                    xyz_list.append(resize_xyz(xyz_raw, llm_h, llm_w, valid=mask_raw))
+                else:
+                    xyz_list.append(torch.zeros(llm_h, llm_w, 3))
+            image_xyz = xyz_list
+        except Exception as exc:
+            self.log.debug(f"pts3d load failed for {sample_dir}: {exc}")
+            image_xyz = None
+
+        return {
+            **proc_out,
+            "image_xyz": image_xyz,
+            "labels":    labels,
+        }
+
+
+class SAT_Train_Dataset_Relative(Dataset):
+    """
+    SAT training dataset with per-frame relative xyz (mirrors
+    MindCube_Train_Dataset_Relative). Same JSON format as SAT_Train_Dataset
+    plus requires camera_pose.npy in every view directory.
+
+    Returns:
+        input_ids, attention_mask, pixel_values, image_grid_thw,
+        image_xyz_relative (list of (N_frames, llm_H, llm_W, 3)), labels.
+
+    Single-view samples (N=1) are skipped (relative needs ≥2 frames to
+    compute meaningful per-frame transforms).
+    """
+
+    def __init__(
+        self,
+        json_path:           str,
+        results_dir:         str,
+        processor,
+        log,
+        max_images:          int = 4,
+        spatial_merge_size:  int = 2,
+        max_samples:         int | None = None,
+        balanced_categories: bool = False,
+        target_size:         int | None = None,
+        balance_seed:        int = 0,
+    ):
+        import json
+        with open(json_path) as fh:
+            raw = json.load(fh)
+
+        self.samples = []
+        for entry in raw:
+            eid = str(entry.get("database_idx", ""))
+            sample_dir = os.path.join(results_dir, eid)
+            if not os.path.isdir(sample_dir):
+                continue
+            self.samples.append((entry, sample_dir))
+
+        if balanced_categories and target_size is not None and target_size > 0:
+            self.samples = _balance_sat_samples_by_qtype(
+                self.samples, target_size=target_size,
+                seed=balance_seed, log=log,
+            )
+
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
+
+        self.processor          = processor
+        self.max_images         = max_images
+        self.spatial_merge_size = spatial_merge_size
+        self.log = log
+        log.info(
+            f"SAT_Train_Dataset_Relative: {len(self.samples)} valid entries "
+            f"(out of {len(raw)} total) from {json_path} "
+            f"[balanced={balanced_categories}, target={target_size}]"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        entry, sample_dir = self.samples[idx]
+
+        view_dirs = sorted(
+            d for d in os.listdir(sample_dir) if d.startswith("view_")
+        )
+        images, xyz_raw_list, mask_raw_list, poses = [], [], [], []
+        for vd in view_dirs[: self.max_images]:
+            img_path = os.path.join(sample_dir, vd, "image.png")
+            try:
+                images.append(Image.open(img_path).convert("RGB"))
+            except (FileNotFoundError, OSError):
+                break
+            pts3d_path = os.path.join(sample_dir, vd, "pts3d.npy")
+            mask_path  = os.path.join(sample_dir, vd, "mask.npy")
+            pose_path  = os.path.join(sample_dir, vd, "camera_pose.npy")
+            xyz_raw_list.append(
+                np.load(pts3d_path).astype(np.float32)
+                if os.path.exists(pts3d_path) else None
+            )
+            mask_raw_list.append(
+                np.load(mask_path) if os.path.exists(mask_path) else None
+            )
+            poses.append(
+                np.load(pose_path).astype(np.float64)
+                if os.path.exists(pose_path) else None
+            )
+
+        N = len(images)
+        if N < 2:
+            raise RuntimeError(
+                f"SAT_Relative sample {idx} (database_idx={entry.get('database_idx')}) "
+                f"has only {N} valid images; need ≥ 2."
+            )
+
+        w2c_list = []
+        for f in range(N):
+            if poses[f] is not None:
+                try:
+                    w2c_list.append(np.linalg.inv(poses[f]).astype(np.float32))
+                except np.linalg.LinAlgError:
+                    w2c_list.append(None)
+            else:
+                w2c_list.append(None)
+
+        # ── build prompt ──────────────────────────────────────────────────
+        question_text, answer_text = _format_sat_question(entry)
+        if not question_text or not answer_text:
+            raise RuntimeError(
+                f"SAT_Relative sample {idx} (database_idx={entry.get('database_idx')}) "
+                f"has no QA pair."
+            )
+
+        content: list = [{"type": "image", "image": img} for img in images]
+        content.append({"type": "text", "text": question_text})
+
+        text_full = self.processor.apply_chat_template(
+            [{"role": "user",      "content": content},
+             {"role": "assistant", "content": answer_text}],
+            tokenize=False, add_generation_prompt=False,
+        )
+        proc_out = self.processor(
+            text=[text_full], images=images,
+            return_tensors="pt", padding=False,
+        )
+        suffix_ids = self.processor.tokenizer(
+            answer_text + "<|im_end|>\n", add_special_tokens=False
+        )["input_ids"]
+        labels = proc_out["input_ids"].clone()
+        labels[0, :-len(suffix_ids)] = -100
+
+        # ── per-frame relative xyz ─────────────────────────────────────────
+        image_xyz_relative = None
+        try:
+            thw_all = proc_out["image_grid_thw"]
+            sms     = self.spatial_merge_size
+            xyz_rel_list = []
+            for k in range(N):
+                xyz_raw  = xyz_raw_list[k]
+                mask_raw = mask_raw_list[k]
+                thw_k    = thw_all[k]
+                llm_h    = int(thw_k[1]) // sms
+                llm_w    = int(thw_k[2]) // sms
+                if xyz_raw is None:
+                    xyz_rel_list.append(torch.zeros(N, llm_h, llm_w, 3))
+                    continue
+                xyz_world      = resize_xyz(xyz_raw, llm_h, llm_w, valid=mask_raw)
+                xyz_world_flat = xyz_world.reshape(-1, 3).numpy().astype(np.float32)
+                frames_for_k = []
+                for f in range(N):
+                    w2c = w2c_list[f]
+                    if w2c is None:
+                        frames_for_k.append(torch.zeros(llm_h, llm_w, 3))
+                        continue
+                    R_wc = w2c[:3, :3]
+                    t_wc = w2c[:3,  3]
+                    xyz_cam = (xyz_world_flat @ R_wc.T) + t_wc
+                    frames_for_k.append(
+                        torch.from_numpy(xyz_cam).reshape(llm_h, llm_w, 3)
+                    )
+                xyz_rel_list.append(torch.stack(frames_for_k, dim=0))
+            image_xyz_relative = xyz_rel_list
+        except Exception as exc:
+            self.log.debug(f"pts3d/relative load failed for {sample_dir}: {exc}")
+
+        return {
+            **proc_out,
+            "image_xyz_relative": image_xyz_relative,
+            "labels":             labels,
+        }
+
+
 class SAT_Train_Dataset_Rotation(Dataset):
     """
     SAT training dataset for RotationRoPEModel.

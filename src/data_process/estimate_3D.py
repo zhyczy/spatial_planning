@@ -12,6 +12,9 @@ Datasets
   sparbench_multi_view  sparbench_multi_view.json   — images: base64
   sparbench_single_view sparbench_single_view.json  — images: base64
   sparbench_mv          sparbench_mv.json           — images: base64 (multi-view, video excluded)
+  viewspatial           ViewSpatial-Bench.json      — image_path: rel paths (strip prefix)
+  omnispatial_pt        OmniSpatial-test/data.json  — Perspective_Taking subset (561)
+  embspatial            embspatial_bench.json       — image_path: pre-cached images/{qid}.jpg
 
 Routing
 -------
@@ -156,6 +159,60 @@ def _iter_sparbench(json_path: Path, limit: int = -1) -> Iterator[Tuple[str, Lis
             yield str(entry.get("id", i)), imgs
 
 
+def _iter_viewspatial(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
+    """ViewSpatial-Bench: image_path entries are 'ViewSpatial-Bench/...' —
+    strip the leading prefix so they resolve under the dataset root.
+    Index matches eval_dataset.py's `idx` (sequential 0..5711)."""
+    root = _EVAL_ROOT / "ViewSpatial-Bench"
+    with open(root / "ViewSpatial-Bench.json") as f:
+        data = json.load(f)
+    for i, entry in enumerate(data):
+        if limit > 0 and i >= limit:
+            break
+        rels = []
+        for p in entry.get("image_path", []):
+            rels.append(p.split("/", 1)[1] if p.startswith("ViewSpatial-Bench/") else p)
+        imgs = _load_images_from_paths(root, rels)
+        if imgs:
+            yield str(i), imgs
+
+
+def _iter_omnispatial_pt(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
+    """OmniSpatial Perspective_Taking subset (561 Q). Each qid has its own
+    image at Perspective_Taking/{image_number}.png. Entry id = qid (e.g. '0_0')
+    matches eval_dataset.py's index."""
+    root = _EVAL_ROOT / "OmniSpatial"
+    with open(root / "OmniSpatial-test" / "data.json") as f:
+        data = json.load(f)
+    data = [d for d in data if d.get("task_type") == "Perspective_Taking"]
+    for i, entry in enumerate(data):
+        if limit > 0 and i >= limit:
+            break
+        qid = entry.get("id", str(i))
+        img_num = qid.split("_")[0]
+        imgs = _load_images_from_paths(
+            root, [f"OmniSpatial-test/Perspective_Taking/{img_num}.png"]
+        )
+        if imgs:
+            yield qid, imgs
+
+
+def _iter_embspatial(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
+    """EmbSpatial-Bench: images are pre-extracted to data_dir/images/{qid}.jpg
+    by the eval_dataset.py loader on first load. Entry id = question_id
+    (e.g. 'mp3d_0') matches eval_dataset.py's index."""
+    root = _EVAL_ROOT / "EmbSpatial-Bench"
+    with open(root / "embspatial_bench.json") as f:
+        data = json.load(f)
+    for i, entry in enumerate(data):
+        if limit > 0 and i >= limit:
+            break
+        qid = entry.get("question_id", str(i))
+        imgs = _load_images_from_paths(root, [f"images/{qid}.jpg"])
+        if imgs:
+            yield qid, imgs
+
+
 # ---------------------------------------------------------------------------
 # Dataset registry
 # ---------------------------------------------------------------------------
@@ -195,6 +252,18 @@ DATASETS = {
         ),
         "out_dir": _EVAL_ROOT / "SPARBench" / "3d_results",
     },
+    "viewspatial": {
+        "iter": _iter_viewspatial,
+        "out_dir": _EVAL_ROOT / "ViewSpatial-Bench" / "3d_results",
+    },
+    "omnispatial_pt": {
+        "iter": _iter_omnispatial_pt,
+        "out_dir": _EVAL_ROOT / "OmniSpatial" / "3d_results",
+    },
+    "embspatial": {
+        "iter": _iter_embspatial,
+        "out_dir": _EVAL_ROOT / "EmbSpatial-Bench" / "3d_results",
+    },
 }
 
 
@@ -207,15 +276,25 @@ def process_dataset(
     estimator: CoordEstimator,
     limit: int = -1,
     skip_existing: bool = True,
+    shard_idx: int = 0,
+    n_shards: int = 1,
 ) -> None:
-    """Estimate 3D for every entry in *name* and save results to disk."""
+    """Estimate 3D for every entry in *name* and save results to disk.
+
+    Sharding: with n_shards > 1, only entries where (i % n_shards == shard_idx)
+    are processed (i is the enumeration index from the iterator). This lets
+    multiple processes on different GPUs cooperatively process one dataset.
+    """
     cfg = DATASETS[name]
     out_root: Path = cfg["out_dir"]
     out_root.mkdir(parents=True, exist_ok=True)
 
     n_ok = n_skip = n_err = 0
+    tag = f"{name}[{shard_idx}/{n_shards}]" if n_shards > 1 else name
 
-    for entry_id, imgs in cfg["iter"](limit):
+    for i, (entry_id, imgs) in enumerate(cfg["iter"](limit)):
+        if n_shards > 1 and (i % n_shards) != shard_idx:
+            continue
         entry_out = out_root / entry_id
         if skip_existing and (entry_out / "cameras.json").exists():
             n_skip += 1
@@ -226,10 +305,10 @@ def process_dataset(
             save_results(results, save_dir=out_root, run_name=entry_id)
             n_ok += 1
         except Exception as exc:
-            print(f"[WARN] {name}/{entry_id} failed: {exc}")
+            print(f"[WARN] {tag}/{entry_id} failed: {exc}")
             n_err += 1
 
-    print(f"[{name}] done — ok={n_ok}  skipped={n_skip}  errors={n_err}")
+    print(f"[{tag}] done — ok={n_ok}  skipped={n_skip}  errors={n_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +394,23 @@ def main() -> None:
         action="store_true",
         help="Reprocess entries even if output already exists.",
     )
+    parser.add_argument(
+        "--shard",
+        type=str,
+        default=None,
+        help="Shard 'i/n' (e.g. '0/4'): process only entries where index%n==i. "
+             "Use this to split one dataset across multiple GPUs in parallel.",
+    )
     args = parser.parse_args()
+
+    shard_idx, n_shards = 0, 1
+    if args.shard:
+        try:
+            shard_idx, n_shards = (int(x) for x in args.shard.split("/"))
+        except Exception:
+            parser.error("--shard must be 'i/n' (e.g. '0/4')")
+        if not (0 <= shard_idx < n_shards):
+            parser.error("--shard 'i/n' requires 0 <= i < n")
 
     print("Loading CoordEstimator …")
     estimator = CoordEstimator(device=args.device)
@@ -340,7 +435,8 @@ def main() -> None:
             "out_dir": out_root,
         }
         process_dataset("_custom", estimator, limit=args.limit,
-                        skip_existing=not args.no_skip)
+                        skip_existing=not args.no_skip,
+                        shard_idx=shard_idx, n_shards=n_shards)
     else:
         # Predefined datasets mode
         ds_list = args.datasets or list(DATASETS.keys())
@@ -348,9 +444,12 @@ def main() -> None:
             print(f"\n{'='*60}")
             print(f"  Dataset : {ds}")
             print(f"  Out dir : {DATASETS[ds]['out_dir']}")
+            if n_shards > 1:
+                print(f"  Shard   : {shard_idx}/{n_shards}")
             print(f"{'='*60}")
             process_dataset(ds, estimator, limit=args.limit,
-                            skip_existing=not args.no_skip)
+                            skip_existing=not args.no_skip,
+                            shard_idx=shard_idx, n_shards=n_shards)
 
     print("\nAll done.")
 

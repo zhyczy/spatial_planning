@@ -129,7 +129,10 @@ class SpaXYZRotaryEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq_axis", inv_freq_axis, persistent=False)  # (11,)
 
-    @torch.no_grad()
+    # NOTE: no @torch.no_grad() — train_alternate.py's decouple path needs the
+    # gradient w.r.t. xyz to flow back to the rotation matrix R (and thence
+    # rotation_enc).  Other call sites (train_correspondence.py) feed xyz that
+    # has no grad anyway, so removing the decorator is a no-op for them.
     def forward(
         self,
         xyz:         torch.Tensor,

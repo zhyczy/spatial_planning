@@ -23,6 +23,12 @@
 #   --coord_scale S          XYZ discretization multiplier (default: 100.0)
 #   --no_coord               disable coord loss entirely
 #   --relative               coord_head predicts original xyz
+#   --decouple               Keep Qwen original 3D M-RoPE in rotary 64 dims +
+#                            add new XYZ RoPE on pass-through (mirrors
+#                            train_alternate.sh --decouple). Mutually
+#                            exclusive with --relative.
+#   --xyz_rope_dim D         XYZ RoPE dim under --decouple (positive multiple
+#                            of 6 ≤ 192; default 66).
 #   --lr_phase_a LR          Phase A base LR
 #   --lr_phase_b LR          Phase B base LR (rot_bb; head_cls = this × scale / K)
 #   --w_lm W                 scale on -lm_loss dense reward (default: 1.0)
@@ -47,10 +53,12 @@
 #   --w_trans W              Bucket A weight  (default: 0.8; identity prior)
 #
 # Examples:
-#   bash scripts/train_rl.sh                   # all GPUs
-#   bash scripts/train_rl.sh 4                 # 4 GPUs
+#   bash scripts/train_rl.sh                                # all GPUs
+#   bash scripts/train_rl.sh 4                              # 4 GPUs
 #   bash scripts/train_rl.sh 4 --lr_phase_a 2e-4 --lr_phase_b 5e-5
 #   bash scripts/train_rl.sh 4 --ppo_inner_epochs 5 --ppo_clip_eps 0.1
+#   bash scripts/train_rl.sh 4 --decouple                   # decouple XYZ RoPE
+#   bash scripts/train_rl.sh 4 --decouple --xyz_rope_dim 132
 # =============================================================================
 
 set -euo pipefail
@@ -71,6 +79,8 @@ COORD_WEIGHT=""
 COORD_SCALE=""
 NO_COORD_CLI=false
 RELATIVE_CLI=false
+DECOUPLE_CLI=false
+XYZ_ROPE_DIM_CLI=""
 LR_PHASE_A_CLI=""
 LR_PHASE_B_CLI=""
 W_LM_CLI=""
@@ -97,6 +107,8 @@ while [ $# -gt 0 ]; do
         --coord_scale)       COORD_SCALE="$2";           shift 2 ;;
         --no_coord)          NO_COORD_CLI=true;          shift   ;;
         --relative)          RELATIVE_CLI=true;          shift   ;;
+        --decouple)          DECOUPLE_CLI=true;          shift   ;;
+        --xyz_rope_dim)      XYZ_ROPE_DIM_CLI="$2";      shift 2 ;;
         --lr_phase_a)        LR_PHASE_A_CLI="$2";        shift 2 ;;
         --lr_phase_b)        LR_PHASE_B_CLI="$2";        shift 2 ;;
         --w_lm)              W_LM_CLI="$2";              shift 2 ;;
@@ -156,6 +168,8 @@ esac
 EPOCHS=6
 NO_COORD=$NO_COORD_CLI
 RELATIVE=$RELATIVE_CLI
+DECOUPLE=$DECOUPLE_CLI                              # mirrors train_alternate.sh
+XYZ_ROPE_DIM="${XYZ_ROPE_DIM_CLI:-66}"              # only used under --decouple
 
 LR=2e-4                   # Phase A fallback
 ROTATION_ENC_LR=2e-4      # Phase B fallback (rot_bb)
@@ -226,6 +240,9 @@ fi
 if [ "$RELATIVE" = "true" ]; then
     _METHOD="${_METHOD}_relative"
 fi
+if [ "$DECOUPLE" = "true" ]; then
+    _METHOD="${_METHOD}_decouple"
+fi
 RUN_NAME="${_METHOD}_${TRAINING_DATASET}"
 if [ "$NO_COORD" = "true" ]; then
     WANDB_RUN_NAME="${_METHOD}_${TRAINING_DATASET}_r${LORA_RANK}_ep${EPOCHS}"
@@ -251,6 +268,10 @@ echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EPOCHS               = $EPOCHS"
 echo "[INFO] NO_COORD             = $NO_COORD"
 echo "[INFO] RELATIVE             = $RELATIVE"
+echo "[INFO] DECOUPLE             = $DECOUPLE"
+if [ "$DECOUPLE" = "true" ]; then
+    echo "[INFO]   xyz_rope_dim       = $XYZ_ROPE_DIM"
+fi
 echo "[INFO] LR_PHASE_A           = ${LR_PHASE_A:-<fallback to \$LR=$LR>}"
 echo "[INFO] LR_PHASE_B           = ${LR_PHASE_B:-<fallback to \$ROTATION_ENC_LR=$ROTATION_ENC_LR>}"
 echo "[INFO] HEAD_CLS_LR_SCALE    = $HEAD_CLS_LR_SCALE"
@@ -289,6 +310,11 @@ fi
 RELATIVE_FLAG=""
 if [ "$RELATIVE" = "true" ]; then
     RELATIVE_FLAG="--relative"
+fi
+
+DECOUPLE_FLAG=""
+if [ "$DECOUPLE" = "true" ]; then
+    DECOUPLE_FLAG="--decouple --xyz_rope_dim $XYZ_ROPE_DIM"
 fi
 
 LR_PHASE_A_FLAG=""
@@ -355,6 +381,7 @@ $TORCHRUN \
     $MAX_SAMPLES_FLAG \
     $NO_COORD_FLAG \
     $RELATIVE_FLAG \
+    $DECOUPLE_FLAG \
     $LR_PHASE_A_FLAG \
     $LR_PHASE_B_FLAG
 

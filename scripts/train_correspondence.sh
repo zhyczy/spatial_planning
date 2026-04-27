@@ -10,7 +10,7 @@
 # Pass --relative to enable per-query-frame coordinate transforms.
 #
 # Usage:
-#   bash scripts/train_correspondence.sh [num_gpus] [--polar] [--vanilla] [--relative] [--decouple] [--interleave_vision] [--max_samples N]
+#   bash scripts/train_correspondence.sh [num_gpus] [--polar] [--vanilla] [--relative] [--decouple] [--interleave_vision] [--max_samples N] [--datasets mindcube|sat|...]
 #
 #   num_gpus            — first positional arg, number of GPUs (default: all)
 #   --polar             — use the decouple architecture (Qwen 3D M-RoPE in
@@ -35,15 +35,24 @@
 #                         Default 66 (= 11 bands per axis). Non-default values
 #                         get stamped into RUN_NAME (_xrd<N>). No effect
 #                         without --decouple / --polar.
-#   --max_samples N     — truncate dataset to N entries (default: all)
+#   --max_samples N     — truncate dataset to N entries (default: all; applied per-source)
+#   --datasets LIST     — space-separated list of training datasets to concatenate.
+#                         Choices: mindcube, sat. Default: mindcube only.
+#                         Example: --datasets mindcube sat → ConcatDataset of
+#                         MindCube_train.jsonl + SAT/train_36k.json. Each source
+#                         uses its own (json_path, results_dir); paths default
+#                         to the standard locations under datasets/train/{Name}/.
+#                         RUN_NAME suffix: _ds<name1>+<name2>+... when not "mindcube" alone.
 #
 # Examples:
-#   bash scripts/train_correspondence.sh                                  # all GPUs, 4D M-RoPE (Cartesian)
+#   bash scripts/train_correspondence.sh                                  # all GPUs, 4D M-RoPE (Cartesian), MindCube only
 #   bash scripts/train_correspondence.sh 2                                # 2 GPUs, 4D M-RoPE
 #   bash scripts/train_correspondence.sh 2 --polar                        # decouple + log-spherical XYZ RoPE
 #   bash scripts/train_correspondence.sh 2 --decouple                     # decouple + Cartesian XYZ RoPE
 #   bash scripts/train_correspondence.sh 2 --vanilla                      # vanilla 3D M-RoPE
 #   bash scripts/train_correspondence.sh 2 --relative                     # relative per-frame coords
+#   bash scripts/train_correspondence.sh 2 --datasets mindcube sat        # MindCube + SAT combined
+#   bash scripts/train_correspondence.sh 2 --polar --datasets mindcube sat # combined + polar
 #   bash scripts/train_correspondence.sh 1 --max_samples 6                # single GPU, 6 samples
 # =============================================================================
 
@@ -66,6 +75,7 @@ POLAR_FLAG=""
 INTERLEAVE_FLAG=""
 DECOUPLE_FLAG=""
 XYZ_ROPE_DIM=""
+DATASETS=()
 _positional=0
 
 while [ $# -gt 0 ]; do
@@ -84,6 +94,12 @@ while [ $# -gt 0 ]; do
             XYZ_ROPE_DIM="$2"; shift 2 ;;
         --max_samples)
             MAX_SAMPLES="$2"; shift 2 ;;
+        --datasets)
+            shift
+            # Consume all following non-flag tokens as dataset names
+            while [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; do
+                DATASETS+=("$1"); shift
+            done ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -92,6 +108,11 @@ while [ $# -gt 0 ]; do
             shift ;;
     esac
 done
+
+# Default: mindcube only (matches the .py default)
+if [ ${#DATASETS[@]} -eq 0 ]; then
+    DATASETS=("mindcube")
+fi
 
 if [ -n "$NPROC" ]; then
     CUDA_IDS=$(seq -s ',' 0 $((NPROC - 1)))
@@ -141,8 +162,16 @@ if [ -n "$XYZ_ROPE_DIM" ] && [ "$XYZ_ROPE_DIM" != "66" ] \
     _xrd_suffix="_xrd${XYZ_ROPE_DIM}"
 fi
 
-RUN_NAME="correspondence_mindcube${_relative_suffix}${_polar_suffix}${_interleave_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
-WANDB_RUN_NAME="corr_mindcube_r${LORA_RANK}_ep${EPOCHS}${_relative_suffix}${_polar_suffix}${_interleave_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
+# Stamp dataset selection into RUN_NAME when more than one source or not the
+# default (mindcube alone). Joined with '+' (e.g. _ds-mindcube+sat).
+_ds_suffix=""
+if [ "${#DATASETS[@]}" -gt 1 ] || [ "${DATASETS[0]}" != "mindcube" ]; then
+    _ds_joined=$(IFS=+; echo "${DATASETS[*]}")
+    _ds_suffix="_ds-${_ds_joined}"
+fi
+
+RUN_NAME="correspondence${_ds_suffix:-_mindcube}${_relative_suffix}${_polar_suffix}${_interleave_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
+WANDB_RUN_NAME="corr${_ds_suffix:-_mindcube}_r${LORA_RANK}_ep${EPOCHS}${_relative_suffix}${_polar_suffix}${_interleave_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
 
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
@@ -168,6 +197,7 @@ if [ -n "$DECOUPLE_FLAG" ] || [ -n "$POLAR_FLAG" ]; then
 else
     echo "[INFO] xyz_rope_dim         = N/A (no --decouple / --polar)"
 fi
+echo "[INFO] Datasets              = ${DATASETS[*]}"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -210,6 +240,7 @@ $TORCHRUN \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
+    --datasets               "${DATASETS[@]}"          \
     $RELATIVE_FLAG                                     \
     $POLAR_FLAG                                        \
     $INTERLEAVE_FLAG                                   \
