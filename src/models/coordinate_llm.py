@@ -225,9 +225,20 @@ class CoordinateModel(nn.Module):
             _sl_m = shift_logits[0, mask]
             _sb_m = shift_labels[0, mask]
             lm_loss = F.cross_entropy(_sl_m, _sb_m)
-            # Top-1 accuracy on the first answer token (eval-only).
+            # Letter-position argmax (Option C from the paradigm-mismatch
+            # postmortem). The supervised suffix is `<answer>{letter}</answer>`
+            # plus `<|im_end|>\n`; the letter sits at index `letter_offset` in
+            # the masked subset (= number of tokens in `<answer>`). Under
+            # greedy decoding this matches evaluation.py's first-generated-
+            # letter-token accuracy. Caller sets `model.letter_offset` once at
+            # startup (see md/bug_fix/train_eval_paradigm_mismatch.md).
             if (not self.training) and _sl_m.numel() > 0:
-                _ldict["acc"] = 1.0 if _sl_m[0].argmax(-1).item() == int(_sb_m[0].item()) else 0.0
+                idx = getattr(self, "letter_offset", 0)
+                if 0 <= idx < _sl_m.shape[0]:
+                    _ldict["acc"] = (
+                        1.0 if _sl_m[idx].argmax(-1).item() == int(_sb_m[idx].item())
+                        else 0.0
+                    )
 
         # ── per-patch 3D coordinate prediction ──────────────────────────────
         coord_loss = None

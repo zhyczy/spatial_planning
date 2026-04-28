@@ -119,6 +119,14 @@ class SpatialAttnWrapper(nn.Module):
         )
 
         if flat_xyz is None or vision_mask is None or is_decode:
+            # SDPA requires `attn_mask.stride(-1) == 1`. The mask flowing through
+            # this short-circuit comes from upstream (HF prefill mask, decode
+            # KV-cache mask, or our V↔V-hole-punched causal mask in
+            # SpatialAttnVanillaTextModel) and may have non-unit last-dim stride
+            # after slicing / torch.where / broadcast. One blanket .contiguous()
+            # here covers every short-circuit case.
+            if attention_mask is not None:
+                attention_mask = attention_mask.contiguous()
             return self.attn(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -133,30 +141,43 @@ class SpatialAttnWrapper(nn.Module):
         # bias: (B, H, L, L); zero outside vision-vision sub-block.
         bias = self.bias_module(flat_xyz, vision_mask)
 
-        if attention_mask is not None:
-            # attention_mask is typically (B, 1, L_q, L_k) with large negative
-            # values (e.g. -1e4 / -65504 / -inf) at masked positions and 0
-            # elsewhere.
-            bias = bias.to(attention_mask.dtype)
+        if attention_mask is None:
+            # SAFETY: Qwen3.5's stock path may pass attention_mask=None when
+            # SDPA's is_causal=True is used instead. Adding our bias as the
+            # mask would disable ALL causal masking (SDPA sees non-None →
+            # is_causal=False → uses our zero-ish bias as the mask → every
+            # token can attend everywhere). SpatialAttnVanillaTextModel.forward
+            # already materialises causal_mask before reaching here whenever
+            # _spatial_cache is active, so this branch should be unreachable
+            # in normal training. If we ever hit it, raise loudly rather than
+            # silently leak.
+            raise RuntimeError(
+                "SpatialAttnWrapper received attention_mask=None while "
+                "spatial bias is being applied. This would disable causal "
+                "masking. Ensure SpatialAttnVanillaTextModel.forward "
+                "materialises causal_mask whenever _spatial_cache is set."
+            )
 
-            # Broadcast-add: (B, 1, L_q, L_k) + (B, H, L_q, L_k) → (B, H, L_q, L_k).
-            new_mask = attention_mask + bias
+        # attention_mask is typically (B, 1, L_q, L_k) with large negative
+        # values (e.g. -1e4 / -65504 / -inf) at masked positions and 0 elsewhere.
+        bias = bias.to(attention_mask.dtype)
 
-            # ── Causal-mask safety: re-mask after the additive bias ──────────
-            # Vision-vision pairs are unmasked (mask = 0) so bias is added in
-            # full. Text→future-text pairs are masked with a large negative
-            # value, and our bias is supposed to be 0 there (the vision-vision
-            # sub-block excludes them). But if bias *ever* leaks a positive
-            # value into a masked entry — bf16 noise, a runaway training step,
-            # an off-by-one in vision_mask, etc. — the additive sum could
-            # creep above zero and silently break causality / leak padding.
-            # Threshold -1e4 is comfortably above any value that's "real
-            # attention" (post-softmax-pre-bias scores are O(1)) and well
-            # below any HF-style mask value (-1e4, -65504, -inf).
-            is_masked = attention_mask < -1e4
-            new_mask = torch.where(is_masked, attention_mask, new_mask)
-        else:
-            new_mask = bias
+        # Broadcast-add: (B, 1, L_q, L_k) + (B, H, L_q, L_k) → (B, H, L_q, L_k).
+        new_mask = attention_mask + bias
+
+        # ── Causal-mask safety: re-mask after the additive bias ──────────
+        # Vision-vision pairs are unmasked (mask = 0) so bias is added in
+        # full. Text→future-text pairs are masked with a large negative
+        # value, and our bias is supposed to be 0 there (the vision-vision
+        # sub-block excludes them). But if bias *ever* leaks a positive
+        # value into a masked entry — bf16 noise, a runaway training step,
+        # an off-by-one in vision_mask, etc. — the additive sum could
+        # creep above zero and silently break causality / leak padding.
+        # Threshold -1e4 is comfortably above any value that's "real
+        # attention" (post-softmax-pre-bias scores are O(1)) and well
+        # below any HF-style mask value (-1e4, -65504, -inf).
+        is_masked = attention_mask < -1e4
+        new_mask = torch.where(is_masked, attention_mask, new_mask)
 
         # Dtype safety: PyTorch SDPA requires attn_mask.dtype == query.dtype.
         # Q comes from q_proj(hidden_states) so its dtype tracks hidden_states.
@@ -164,6 +185,13 @@ class SpatialAttnWrapper(nn.Module):
         # backbone .to(bfloat16) cast), and the upstream attention_mask may
         # also be fp32 in some HF code paths. Cast new_mask explicitly here.
         new_mask = new_mask.to(hidden_states.dtype)
+
+        # Contiguity: SDPA also requires `attn_mask.stride(-1) == 1`. The
+        # broadcast-add (B,1,L,L)+(B,H,L,L) plus the torch.where above can
+        # leave a non-contiguous result whose last-dim stride differs.
+        # Force contiguity once here so training and generation see the same
+        # layout.
+        new_mask = new_mask.contiguous()
 
         return self.attn(
             hidden_states,
@@ -337,6 +365,43 @@ class SpatialAttnVanillaTextModel(Qwen3_5TextModel):
         )
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
 
+        # Prefill = first generate() call, no KV cache yet. Only here do we
+        # need the spatial bias and the V↔V mask hole; on decode the new
+        # query is a single text token attending to a frozen KV cache, no
+        # spatial work to do.
+        is_prefill = (
+            past_key_values is None
+            or past_key_values.get_seq_length() == 0
+        )
+
+        # ── Materialize causal_mask if HF returned None — PREFILL ONLY ───────
+        # Stock Qwen3.5 lets `create_causal_mask` return None when SDPA can use
+        # its built-in `is_causal=True` flag instead of an explicit mask tensor.
+        # That optimization breaks SpatialAttnWrapper on prefill, which adds the
+        # geometric bias by `attention_mask + bias` — if attention_mask is None
+        # it falls through to `new_mask = bias` (a zero tensor at init), and
+        # SDPA will see a non-None mask of all zeros, set is_causal=False, and
+        # apply NO causal masking at all → catastrophic information leak.
+        # Materialise the 4D causal mask only in prefill, so the wrapper always
+        # has a real causal pattern to add to.
+        #
+        # On decode we MUST leave causal_mask as None: a hand-built (1,1,1,1)
+        # mask would (a) be the wrong shape vs. the KV cache (HF expects
+        # (B, 1, 1, L_kv)), and (b) push HF off SDPA's `is_causal=True` fast
+        # path into a slicing branch whose output isn't last-dim-contiguous,
+        # which SDPA then rejects with `(*bias): last dimension must be
+        # contiguous`. Stock Qwen3.5 already handles None correctly here.
+        if causal_mask is None and self._spatial_cache is not None and is_prefill:
+            seq_len = inputs_embeds.shape[1]
+            finfo_min = torch.finfo(inputs_embeds.dtype).min
+            causal_mask = torch.triu(
+                torch.full(
+                    (seq_len, seq_len), finfo_min,
+                    device=inputs_embeds.device, dtype=inputs_embeds.dtype,
+                ),
+                diagonal=1,
+            )[None, None, :, :]                              # (1, 1, L, L)
+
         # ── Prefix-mask hole: make V↔V attention bidirectional ───────────────
         # Stock `create_causal_mask` is strict lower-triangular: a vision query
         # at position i can attend to vision keys j only if j ≤ i. That's a
@@ -356,8 +421,7 @@ class SpatialAttnVanillaTextModel(Qwen3_5TextModel):
         # is irrelevant (and vision_mask wouldn't even cover the new query).
         if (self._spatial_cache is not None
                 and causal_mask is not None
-                and (past_key_values is None
-                     or past_key_values.get_seq_length() == 0)):
+                and is_prefill):
             _, vision_mask = self._spatial_cache               # (B, L) bool
             # Build (B, 1, L, L) bool: True iff query i AND key j are vision.
             #   .unsqueeze(1).unsqueeze(3) → (B, 1, L, 1)  — query (row) axis
@@ -377,12 +441,9 @@ class SpatialAttnVanillaTextModel(Qwen3_5TextModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # ── Spatial cache → extra self_attn kwargs (only diff from parent) ──
+        # is_prefill computed earlier; reuse it.
         extra_attn_kwargs: dict = {}
         cache = self._spatial_cache
-        is_prefill = (
-            past_key_values is None
-            or past_key_values.get_seq_length() == 0
-        )
         if cache is not None and is_prefill:
             flat_xyz, vision_mask = cache
             extra_attn_kwargs["flat_xyz"] = flat_xyz

@@ -1,12 +1,13 @@
 # Evaluation Datasets — Task Taxonomy & Rotation Coverage
 
-**Date:** 2026-04-22 (last updated 2026-04-27)
+**Date:** 2026-04-22 (last updated 2026-04-28)
 **Scope:** `spatial_planning/datasets/evaluation/`
 
 Cross-references:
 - Training side: [train_datasets.md](train_datasets.md)
 - Rotation anchor details: [rotation_axes.md](rotation_axes.md)
 - Spatial-attention model design: [../model_design/spatial_attention.md](../model_design/spatial_attention.md)
+- Train/eval template alignment postmortem: [../bug_fix/train_eval_paradigm_mismatch.md](../bug_fix/train_eval_paradigm_mismatch.md)
 
 ---
 
@@ -25,6 +26,29 @@ Three datasets that are wired into `evaluation.py` — `viewspatial`,
 `omnispatial_pt`, `embspatial`, plus the combined `sparbench_mv` —
 do not yet have entries in §2 (only their answer-format properties are
 covered in §7).
+
+### 0.1 Unified answer-format contract (2026-04-28)
+
+All MC datasets, training-time eval (`Eval_Dataset_Coord`) and deploy
+inference (`evaluation.py prepare_batch_spa`) now share **one** template,
+defined in [`src/dataset/answer_format.py`](../../src/dataset/answer_format.py):
+
+- Assistant content = `<answer>{letter}</answer>` (`format_answer(letter)`)
+- `apply_chat_template(..., enable_thinking=False)` — autofills empty
+  `<think></think>` so the deploy prompt ends at `</think>\n\n` (= start
+  of supervised suffix), not mid-`<think>`.
+- Deploy prompt is a **strict prefix** of the training text.
+- `evaluation.py` parser is strict `<answer>\s*([A-Za-z])\s*</answer>`
+  regex with **no fallbacks** (no prepend hack, no last-letter scan).
+- Training-time eval reports `acc` via letter-position argmax
+  (`compute_letter_offset(tokenizer) == 2` for Qwen3.5-VL — BPE merges
+  `>X` into one token, so the letter sits at masked-subset index 2).
+  Mathematically equivalent to deploy first-generated-letter under
+  greedy + no-leak.
+
+See [../bug_fix/train_eval_paradigm_mismatch.md](../bug_fix/train_eval_paradigm_mismatch.md)
+§0.1 for the wrap-order / template-alignment postmortem that motivated
+this unification.
 
 ---
 
@@ -208,9 +232,15 @@ The dominant eval task in MindCube (~17,000 samples under `0/1/2/3_frame` etc.) 
 
 Every dataset wired into `evaluation.py` emits the loader's `answer` field in
 one of two shapes — single ASCII letter, or numeric string. `evaluation.py`
-dispatches scoring via the per-sample `format_type` field
-(`select` → `extract_answer_letter` + exact match;
- `fill` → `extract_answer_number` + `_mra_score`).
+dispatches scoring via the per-sample `format_type`:
+
+- `select` → `extract_answer_letter` (strict `<answer>\s*([A-Za-z])\s*</answer>`
+  regex, no fallbacks) + exact match against the loader's letter.
+- `fill` → `extract_answer_number` + `_mra_score`.
+
+The dataset class wraps the bare letter from disk into `<answer>{letter}</answer>`
+before tokenizing (see §0.1) — model is supervised on the wrapped form, then
+emits the wrapped form back at deploy.
 
 | Dataset | n | format | Verification |
 |---|---:|---|---|
@@ -226,18 +256,18 @@ dispatches scoring via the per-sample `format_type` field
 | embspatial            | 3,640 | 100% single A/B/C/D | derived from int answer-index over 4 options |
 | robospatial           |   350 | yes/no + (x,y) pointing | dispatched via `format_type="robospatial"` |
 
-**MindCube + SpinBench** are also the two datasets the inline eval inside
-[../../train_atten.py](../../train_atten.py) runs after each `eval_steps`. The
-inline eval reports `{ds}_acc` as **first-token argmax accuracy** —
-implicitly assumes the answer is exactly one token. Since every
-MindCube/SpinBench answer is a single capital letter and Qwen tokenizes
-A/B/C/D as single tokens, **first-token accuracy ≡ answer accuracy**
-on these two datasets. This equivalence breaks if a future eval is wired in
-where answers are multi-token (e.g. parenthesized `(A)`, free-form text,
-multi-digit numerics, or any tokenizer that introduces a leading-space
-variant) — at that point switch to all-position match or `.generate()` +
-exact match. See [../model_design/spatial_attention.md §10](../model_design/spatial_attention.md#10-open-questions--future-work).
+### 7.1 Training-time vs deploy parity
 
-`evaluation.py` itself does NOT have this issue — it always uses
-`.generate()` followed by regex extraction, so multi-token answers are
-handled correctly when present.
+| Stage | Mechanism | Accuracy reported as |
+|---|---|---|
+| training-time eval ([train_atten.py:eval block](../../train_atten.py)) | TF forward + letter-position argmax (Option C, see §0.1) | `eval/{ds}_acc` in wandb |
+| deploy ([evaluation.py](../../evaluation.py)) | `model.generate()` + strict `<answer>X</answer>` regex | `metrics_{method}.json:overall_accuracy` |
+
+Both quantities measure the **same thing** under greedy decoding + no leak:
+"does the model predict the correct letter token at the position right after
+`<answer>`?". The training-time path is bit-for-bit equivalent to the deploy
+path's first generated letter token; numerical drift (bf16, KV cache) plus
+sample-set differences (tinybench 1,050 vs full 21,154) account for any
+residual gap. See [../bug_fix/train_eval_paradigm_mismatch.md](../bug_fix/train_eval_paradigm_mismatch.md)
+§Option C and [tests/test_atten_no_leak.py](../../tests/test_atten_no_leak.py)
+for the regression test confirming TF ≡ generate at the relevant position.

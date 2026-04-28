@@ -423,27 +423,25 @@ def train(args: argparse.Namespace) -> None:
          os.path.join(_eval_dir, "spinbench_data", "3d_results"),
          "problem", "answer"),
     ]:
-        try:
-            ds = Eval_Dataset_Coord(
-                _ds_jsonl, _ds_results, processor, log,
-                max_images         = args.max_images,
-                spatial_merge_size = spatial_merge_size,
-                coord_upscale      = 1,
-                question_key       = _q_key,
-                answer_key         = _a_key,
-            )
-            _es = (DistributedSampler(ds, num_replicas=world_size,
-                                      rank=local_rank, shuffle=False)
-                   if world_size > 1 else None)
-            test_loaders[_ds_name] = DataLoader(
-                ds, batch_size=1, shuffle=False,
-                num_workers=args.num_workers, collate_fn=collate_fn,
-                sampler=_es,
-            )
-            test_samplers[_ds_name] = _es
-            log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
-        except Exception as exc:
-            log.warning(f"Failed to load eval dataset '{_ds_name}': {exc}")
+        ds = Eval_Dataset_Coord(
+            _ds_jsonl, _ds_results, processor, log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            coord_upscale      = 1,
+            question_key       = _q_key,
+            answer_key         = _a_key,
+        )
+        _es = (DistributedSampler(ds, num_replicas=world_size,
+                                    rank=local_rank, shuffle=False)
+                if world_size > 1 else None)
+        test_loaders[_ds_name] = DataLoader(
+            ds, batch_size=1, shuffle=False,
+            num_workers=args.num_workers, collate_fn=collate_fn,
+            sampler=_es,
+        )
+        test_samplers[_ds_name] = _es
+        log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
+
 
     # ── optimiser ─────────────────────────────────────────────────────────────
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -557,6 +555,19 @@ def train(args: argparse.Namespace) -> None:
                     if _gc_flag:    _spa.gradient_checkpointing = False
                     if _lm and _lm_gc: _lm.gradient_checkpointing = False
 
+                    # Letter-position offset inside the supervised suffix.
+                    # Probed dynamically (see src/dataset/answer_format.py) —
+                    # not just `len(tokenize("<answer>"))`, because Qwen's
+                    # BPE merges `>` with the following character into a
+                    # single token (`>A`, `>B`, ... are 4 distinct ids), so
+                    # the letter sits at index 2 of the tokenized
+                    # `<answer>X</answer>...` suffix, not 3. Greedy logits
+                    # at letter_pos-1 should equal the letter — equivalent
+                    # to evaluation.py's first generated letter token under
+                    # no leak. See md/bug_fix/train_eval_paradigm_mismatch.md.
+                    from src.dataset import compute_letter_offset
+                    LETTER_OFFSET = compute_letter_offset(processor.tokenizer)
+
                     for ds_name, loader in test_loaders.items():
                         if test_samplers.get(ds_name) is not None:
                             test_samplers[ds_name].set_epoch(global_step)
@@ -601,20 +612,33 @@ def train(args: argparse.Namespace) -> None:
                                     ignore_index=-100,
                                 )
                                 loss_sum += lm_loss.item()
-                                _m = sb[0] != -100
-                                _slm = sl[0, _m]; _sbm = sb[0, _m]
-                                if _slm.numel() > 0:
-                                    acc_sum += 1.0 if _slm[0].argmax(-1).item() == int(_sbm[0].item()) else 0.0
                                 count += 1
-                            
+
+                                # Letter-position argmax — equivalent to
+                                # evaluation.py's first generated letter token
+                                # under greedy decoding & no leak.
+                                first_ans = (t_lbl[0] != -100).nonzero(as_tuple=False)
+                                if first_ans.numel() > 0:
+                                    ans_start = first_ans[0, 0].item()
+                                    letter_pos = ans_start + LETTER_OFFSET
+                                    sl_idx = letter_pos - 1
+                                    if 0 <= sl_idx < sl.shape[1]:
+                                        pred = sl[0, sl_idx, :].argmax(-1).item()
+                                        target = sb[0, sl_idx].item()
+                                        if pred == target:
+                                            acc_sum += 1.0
+
                         if world_size > 1:
                             stats = torch.tensor([loss_sum, acc_sum, count],
                                                  dtype=torch.float64, device=device)
                             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                            loss_sum, acc_sum, count = stats[0].item(), stats[1].item(), int(stats[2].item())
+                            loss_sum, acc_sum, count = (
+                                stats[0].item(), stats[1].item(), int(stats[2].item()),
+                            )
 
                         if count > 0 and local_rank == 0:
-                            avg_l, avg_a = loss_sum / count, acc_sum / count
+                            avg_l = loss_sum / count
+                            avg_a = acc_sum / count
                             log.info(
                                 f"[eval] global_step={global_step:05d}  "
                                 f"{ds_name}_lm_loss={avg_l:.4f}  "

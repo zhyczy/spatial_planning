@@ -184,20 +184,19 @@ EVAL_SYSTEM_PROMPT_THINKING = (
 # ===========================================================================
 
 def extract_answer_letter(text: str) -> str:
+    """Extract the multiple-choice letter from a `<answer>X</answer>` tag.
+
+    Single contract — matches the training-time supervision format set in
+    MindCube_Train_Dataset / MindCube_Train_Dataset_Coord / Eval_Dataset_Coord
+    (assistant turn = `<answer>{letter}</answer>`). Returns "" if the tag is
+    missing or malformed; no fragile fallbacks. See
+    md/bug_fix/train_eval_paradigm_mismatch.md.
+    """
     if not text or not isinstance(text, str):
         return ""
     m = re.search(r"<answer>\s*([A-Za-z])\s*</answer>", text, re.IGNORECASE)
     if m:
         return m.group(1).upper()
-    m = re.search(
-        r"(?:the\s+)?(?:answer|option|choice)\s+(?:is\s+)?[:\s]*([A-Za-z])\b",
-        text, re.IGNORECASE,
-    )
-    if m:
-        return m.group(1).upper()
-    matches = re.findall(r"\b([A-D])\b", text)
-    if matches:
-        return matches[-1]
     return ""
 
 
@@ -504,30 +503,45 @@ def load_spa_model(
             spa.resize_token_embeddings(new_vocab)
             logger.info(f"[spa] Embedding: {old_vocab} → {new_vocab} (from tokenizer)")
 
+    # 5a. WRAP BEFORE PEFT LOAD.
+    # Training scripts (train_atten / train_correspondence / train_coordinate /
+    # ...) follow the order: get_peft_model(spa) → patch_attention_layers_*(spa).
+    # That means save_pretrained writes LoRA keys at the *wrapped* path
+    # (`...self_attn.attn.q_proj.lora_*` for atten, or
+    #  `...self_attn.attn.q_proj.lora_*` for decouple wrappers).
+    # If we load PEFT first and wrap second, PEFT injects LoRA at the
+    # *unwrapped* path (`...self_attn.q_proj.lora_*`) and silently drops every
+    # LoRA tensor whose saved key path includes the wrapper prefix — see
+    # md/bug_fix/train_eval_paradigm_mismatch.md §0.1.
+    if atten:
+        n_wrapped = patch_attention_layers_spatial(spa)
+        for module in spa.modules():
+            if isinstance(module, SpatialAttentionBias):
+                module.to(dtype=torch.bfloat16)
+        logger.info(
+            f"[spa] atten: pre-wrapped {n_wrapped} self_attn layers BEFORE "
+            f"PEFT load so LoRA paths match the saved adapter."
+        )
+    if decouple:
+        from src.models.spa_emb_dec import patch_attention_layers_dec
+        n_wrapped = patch_attention_layers_dec(spa)
+        logger.info(
+            f"[spa] decouple: pre-wrapped {n_wrapped} self_attn layers BEFORE "
+            f"PEFT load (same reason as atten)."
+        )
+
     # 5. Load LoRA adapter and merge
     spa = PeftModel.from_pretrained(spa, str(ckpt_dir), is_trainable=False)
     spa = spa.merge_and_unload()
     logger.info("[spa] LoRA adapter merged.")
 
-    # 5b. For decouple mode, wrap every self_attn with SpaDecAttentionWrapper
-    # (mirror of train_correspondence.py — must be AFTER LoRA merge).
-    if decouple:
-        from src.models.spa_emb_dec import patch_attention_layers_dec
-        n_wrapped = patch_attention_layers_dec(spa)
-        logger.info(f"[spa] Wrapped {n_wrapped} attention layers with SpaDecAttentionWrapper.")
-
-    # 5c. For atten mode, install per-layer SpatialAttentionBias and load
-    # spatial_bias.pt. Patch must come AFTER LoRA merge (mirror of train_atten.py).
+    # 5c. For atten mode, load spatial_bias.pt now that the wrappers are in
+    # place (and LoRA is merged, matching train_atten.py's save-time state).
     if atten:
-        n_wrapped = patch_attention_layers_spatial(spa)
-        # Cast freshly-created bias_module params to bf16 to match the backbone.
-        for module in spa.modules():
-            if isinstance(module, SpatialAttentionBias):
-                module.to(dtype=torch.bfloat16)
         n_loaded = _load_spatial_bias_modules(spa, ckpt_dir)
         logger.info(
-            f"[spa] atten: wrapped {n_wrapped} self_attn layers, loaded "
-            f"{n_loaded} SpatialAttentionBias modules from spatial_bias.pt"
+            f"[spa] atten: loaded {n_loaded} SpatialAttentionBias modules "
+            f"from spatial_bias.pt"
         )
         # HF generate() validates kwargs against forward signatures and strips
         # unknown ones (image_xyz is not in Qwen3_5ForConditionalGeneration.forward).
@@ -558,7 +572,8 @@ def _load_spatial_bias_modules(model: Any, ckpt_dir: Path) -> int:
 
     spatial_bias.pt was saved by train_atten.py from a PEFT-wrapped model, so
     saved keys carry a `base_model.model.` prefix. The eval model (after
-    merge_and_unload + patch_attention_layers_spatial) does NOT carry that
+    patch_attention_layers_spatial + merge_and_unload — note the order, see
+    md/bug_fix/train_eval_paradigm_mismatch.md §0.1) does NOT carry that
     prefix. Match by suffix starting at `language_model.layers.` — unique per
     layer, robust to any wrapper chain on either side.
     """
@@ -1114,10 +1129,14 @@ def prepare_batch_baseline(
                 )
             )
         else:
+            # Same template as training: empty `<think></think>` block then
+            # the assistant content. Model is expected to write
+            # `<answer>X</answer>` itself — no `+ "<answer>"` prepend hack.
             prompts_text.append(
                 processor.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True,
-                ) + "<answer>"
+                    enable_thinking=False,
+                )
             )
 
     all_image_inputs, all_video_inputs = [], []
@@ -1214,9 +1233,15 @@ def prepare_batch_spa(
     content.append({"type": "text", "text": question})
 
     # ── build messages (no system prompt — matches training) ─────────────────
+    # Pass `enable_thinking=False` to mirror the training-time chat template
+    # (MindCube_Train_Dataset / Eval_Dataset_Coord). With thinking enabled
+    # the deploy prompt ends mid-`<think>` and the model produces reasoning
+    # instead of `<answer>X</answer>`. See
+    # md/bug_fix/train_eval_paradigm_mismatch.md.
     messages = [{"role": "user", "content": content}]
     prompt_text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
     )
 
     image_inputs, video_inputs = process_vision_info(messages)
@@ -1433,11 +1458,12 @@ def _make_result(
         full_output = output
         prediction = output
     else:
-        # Non-thinking: model output starts right after the "<answer>" prefix we
-        # injected into the prompt, so we prepend it back for a complete tag.
-        # Thinking: model generates the full response (including <think>...</think>
-        # and <answer>X</answer>) — no prefix needed.
-        full_output = output if thinking else "<answer>" + output
+        # Train datasets supervise the assistant turn as
+        #   `<answer>{letter}</answer><|im_end|>\n`
+        # (see MindCube_Train_Dataset / Eval_Dataset_Coord), so the model
+        # writes the opening tag itself. No prefix prepending — parse the
+        # raw output as-is.
+        full_output = output
         if fmt == "fill":
             prediction = extract_answer_number(full_output)
         else:
@@ -1864,18 +1890,15 @@ def evaluate(
 
         # ---- Baseline ----
         if run_baseline:
-            try:
-                inputs, prompt = prepare_batch_baseline([item], baseline_proc,
-                                                         thinking=thinking)
-                outputs = run_inference_baseline(inputs, baseline_model, baseline_proc,
-                                                 max_new_tokens)
-                results_map["baseline"].append(
-                    _make_result(item, outputs[0], prompt[0], "baseline",
-                                 thinking=thinking)
-                )
-            except Exception as exc:
-                logger.error(f"[baseline] idx={item.get('index')}: {exc}", exc_info=True)
-                results_map["baseline"].append(_error_result(item, exc, "baseline"))
+            inputs, prompt = prepare_batch_baseline([item], baseline_proc,
+                                                        thinking=thinking)
+            outputs = run_inference_baseline(inputs, baseline_model, baseline_proc,
+                                                max_new_tokens)
+            results_map["baseline"].append(
+                _make_result(item, outputs[0], prompt[0], "baseline",
+                                thinking=thinking)
+            )
+            
 
         # ---- SPA variants ----
         for (
@@ -1905,34 +1928,29 @@ def evaluate(
                 and image_xyz is not None
                 and image_token_id_val is not None
             ):
-                try:
-                    R_mat = _compute_rotation_R(
-                        spa_model, spa_rotation_enc, inputs, image_xyz,
-                        image_token_id_val, spatial_merge_size, coord_scale,
-                    )
-                    if R_mat is not None:
-                        # Rotation angle from trace: θ = acos((tr(R) - 1) / 2)
-                        with torch.no_grad():
-                            R_f = R_mat.detach().float()
-                            trace = R_f[0, 0] + R_f[1, 1] + R_f[2, 2]
-                            cos_theta = ((trace - 1.0) / 2.0).clamp(-1.0, 1.0)
-                            rotation_angle_deg = float(
-                                torch.acos(cos_theta) * (180.0 / np.pi)
-                            )
-                        rotated = _apply_rotation_to_xyz(
-                            R_mat,
-                            [x.to(next(spa_model.parameters()).device) for x in image_xyz],
-                        )
-                        xyz_for_rope = rotated
-                        # Keep xyz_for_mae on CPU so it matches coord_head
-                        # predictions (which _get_coord_predictions returns on CPU).
-                        xyz_for_mae = [r.detach().cpu() for r in rotated]
-                except Exception as re:
-                    logger.warning(
-                        f"[{spa_method_name}] rotation_enc failed for idx="
-                        f"{item.get('index')}: {re}"
-                    )
 
+                R_mat = _compute_rotation_R(
+                    spa_model, spa_rotation_enc, inputs, image_xyz,
+                    image_token_id_val, spatial_merge_size, coord_scale,
+                )
+                if R_mat is not None:
+                    # Rotation angle from trace: θ = acos((tr(R) - 1) / 2)
+                    with torch.no_grad():
+                        R_f = R_mat.detach().float()
+                        trace = R_f[0, 0] + R_f[1, 1] + R_f[2, 2]
+                        cos_theta = ((trace - 1.0) / 2.0).clamp(-1.0, 1.0)
+                        rotation_angle_deg = float(
+                            torch.acos(cos_theta) * (180.0 / np.pi)
+                        )
+                    rotated = _apply_rotation_to_xyz(
+                        R_mat,
+                        [x.to(next(spa_model.parameters()).device) for x in image_xyz],
+                    )
+                    xyz_for_rope = rotated
+                    # Keep xyz_for_mae on CPU so it matches coord_head
+                    # predictions (which _get_coord_predictions returns on CPU).
+                    xyz_for_mae = [r.detach().cpu() for r in rotated]
+                
             output = run_inference_spa(
                 inputs, xyz_for_rope, spa_model, spa_proc,
                 max_new_tokens, coord_scale,
@@ -1953,19 +1971,13 @@ def evaluate(
                 and image_token_id_val is not None
                 and xyz_for_rope is not None
             ):
-                try:
-                    preds = _get_coord_predictions(
-                        spa_model, inputs,
-                        image_token_id_val, spa_coord_head,
-                        spatial_merge_size, xyz_for_rope, coord_scale,
-                    )
-                    if preds is not None:
-                        result["coord_mae"] = _compute_coord_mae(preds, xyz_for_mae)
-                except Exception as ce:
-                    logger.warning(
-                        f"[{spa_method_name}] coord_head failed for idx="
-                        f"{item.get('index')}: {ce}"
-                    )
+                preds = _get_coord_predictions(
+                    spa_model, inputs,
+                    image_token_id_val, spa_coord_head,
+                    spatial_merge_size, xyz_for_rope, coord_scale,
+                )
+                if preds is not None:
+                    result["coord_mae"] = _compute_coord_mae(preds, xyz_for_mae)
 
             results_map[spa_method_name].append(result)
 

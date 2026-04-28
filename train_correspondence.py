@@ -455,33 +455,31 @@ def train(args: argparse.Namespace) -> None:
          os.path.join(_eval_dir, "spinbench_data", "3d_results"),
          "problem", "answer"),
     ]:
-        try:
-            ds = Eval_Dataset_Coord(
-                _ds_jsonl,
-                _ds_results,
-                processor,
-                log,
-                max_images         = args.max_images,
-                spatial_merge_size = spatial_merge_size,
-                coord_upscale      = 1,
-                question_key       = _q_key,
-                answer_key         = _a_key,
-            )
-            _eval_sampler = (
-                DistributedSampler(ds, num_replicas=world_size,
-                                   rank=local_rank, shuffle=False)
-                if world_size > 1 else None
-            )
-            test_loaders[_ds_name] = DataLoader(
-                ds, batch_size=1, shuffle=False,
-                num_workers=args.num_workers, collate_fn=collate_fn,
-                sampler=_eval_sampler,
-            )
-            test_samplers[_ds_name] = _eval_sampler
-            log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
-        except Exception as exc:
-            log.warning(f"Failed to load eval dataset '{_ds_name}': {exc}")
 
+        ds = Eval_Dataset_Coord(
+            _ds_jsonl,
+            _ds_results,
+            processor,
+            log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            coord_upscale      = 1,
+            question_key       = _q_key,
+            answer_key         = _a_key,
+        )
+        _eval_sampler = (
+            DistributedSampler(ds, num_replicas=world_size,
+                                rank=local_rank, shuffle=False)
+            if world_size > 1 else None
+        )
+        test_loaders[_ds_name] = DataLoader(
+            ds, batch_size=1, shuffle=False,
+            num_workers=args.num_workers, collate_fn=collate_fn,
+            sampler=_eval_sampler,
+        )
+        test_samplers[_ds_name] = _eval_sampler
+        log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
+        
 
     # ── optimiser ─────────────────────────────────────────────────────────────
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -653,6 +651,14 @@ def train(args: argparse.Namespace) -> None:
                     if _lm and _lm_gc_flag:
                         _lm.gradient_checkpointing = False
 
+                    # Letter-position offset inside the supervised suffix
+                    # `<answer>{letter}</answer><|im_end|>\n` —
+                    # equivalent to evaluation.py's first generated letter
+                    # token under greedy + no leak. Probed dynamically
+                    # (BPE merges `>X`, see src/dataset/answer_format.py).
+                    from src.dataset import compute_letter_offset
+                    LETTER_OFFSET = compute_letter_offset(processor.tokenizer)
+
                     for ds_name, loader in test_loaders.items():
                         if ds_name in test_samplers and test_samplers[ds_name] is not None:
                             test_samplers[ds_name].set_epoch(global_step)
@@ -674,47 +680,47 @@ def train(args: argparse.Namespace) -> None:
                                 t_labels = t_labels.to(device)
                             if t_xyz is not None:
                                 t_xyz = [x.to(device) for x in t_xyz]
-                            try:
-                                # Match training input distribution per mode:
-                                #   vanilla       — no xyz kwargs (stock Qwen)
-                                #   --polar       — image_xyz + polar=True (xyz→log-spherical in M-RoPE)
-                                #   default/decouple — image_xyz
-                                _eval_fwd_kwargs = dict(
-                                    input_ids=t_ids, attention_mask=t_mask,
-                                    pixel_values=t_pv, image_grid_thw=t_thw,
-                                    return_dict=True,
-                                    kv_cache=(ds_name == "spinbench"),
+                            # Match training input distribution per mode:
+                            #   vanilla       — no xyz kwargs (stock Qwen)
+                            #   --polar       — image_xyz + polar=True (xyz→log-spherical in M-RoPE)
+                            #   default/decouple — image_xyz
+                            _eval_fwd_kwargs = dict(
+                                input_ids=t_ids, attention_mask=t_mask,
+                                pixel_values=t_pv, image_grid_thw=t_thw,
+                                return_dict=True,
+                                kv_cache=(ds_name == "spinbench"),
+                            )
+                            if not args.vanilla:
+                                if t_xyz is not None:
+                                    _eval_fwd_kwargs["image_xyz"] = t_xyz
+                                if args.polar:
+                                    _eval_fwd_kwargs["polar"] = True
+                            with torch.no_grad():
+                                out = _spa(**_eval_fwd_kwargs)
+                                logits = out.logits
+                                shift_logits = logits[..., :-1, :].contiguous()
+                                shift_labels = t_labels[..., 1:].contiguous()
+                                lm_loss = F.cross_entropy(
+                                    shift_logits.view(-1, shift_logits.size(-1)),
+                                    shift_labels.view(-1),
+                                    ignore_index=-100,
                                 )
-                                if not args.vanilla:
-                                    if t_xyz is not None:
-                                        _eval_fwd_kwargs["image_xyz"] = t_xyz
-                                    if args.polar:
-                                        _eval_fwd_kwargs["polar"] = True
-                                with torch.no_grad():
-                                    out = _spa(**_eval_fwd_kwargs)
-                                    logits = out.logits
-                                    shift_logits = logits[..., :-1, :].contiguous()
-                                    shift_labels = t_labels[..., 1:].contiguous()
-                                    lm_loss = F.cross_entropy(
-                                        shift_logits.view(-1, shift_logits.size(-1)),
-                                        shift_labels.view(-1),
-                                        ignore_index=-100,
-                                    )
-                                    local_loss_sum += lm_loss.item()
+                                local_loss_sum += lm_loss.item()
 
-                                    # Top-1 accuracy on first answer token
-                                    # (matches coordinate_llm.py convention).
-                                    _mask  = shift_labels[0] != -100
-                                    _sl_m  = shift_logits[0, _mask]
-                                    _sb_m  = shift_labels[0, _mask]
-                                    if _sl_m.numel() > 0:
-                                        _pred = _sl_m[0].argmax(-1).item()
-                                        _tgt  = int(_sb_m[0].item())
-                                        local_acc_sum += 1.0 if _pred == _tgt else 0.0
-                                    local_count += 1
-                            except Exception as exc:
-                                log.debug(f"Eval skip ({ds_name}): {exc}")
-                                continue
+                                # Letter-position argmax (Option C):
+                                # mask the suffix, take logits at the letter
+                                # position (index LETTER_OFFSET in masked
+                                # subset). Equivalent to evaluation.py's first
+                                # generated letter token under greedy + no
+                                # leak. See md/bug_fix/train_eval_paradigm_mismatch.md.
+                                _mask  = shift_labels[0] != -100
+                                _sl_m  = shift_logits[0, _mask]
+                                _sb_m  = shift_labels[0, _mask]
+                                if 0 <= LETTER_OFFSET < _sl_m.shape[0]:
+                                    _pred = _sl_m[LETTER_OFFSET].argmax(-1).item()
+                                    _tgt  = int(_sb_m[LETTER_OFFSET].item())
+                                    local_acc_sum += 1.0 if _pred == _tgt else 0.0
+                                local_count += 1
 
                         # Aggregate across all ranks
                         if world_size > 1:

@@ -297,6 +297,15 @@ def train(args: argparse.Namespace) -> None:
         decouple           = args.decouple,
         xyz_rope_dim       = args.xyz_rope_dim,
     )
+    # Letter-position offset inside the masked answer suffix. Probed
+    # dynamically (see src/dataset/answer_format.py — Qwen BPE merges `>X`
+    # into one token, so the letter sits at index 2 not 3). Plumbed into
+    # CoordinateModel.forward so its eval-time `_ldict["acc"]` reports the
+    # letter-prediction accuracy instead of the trivial first-supervised-
+    # token argmax. See md/bug_fix/train_eval_paradigm_mismatch.md.
+    from src.dataset import compute_letter_offset
+    model.letter_offset = compute_letter_offset(processor.tokenizer)
+    log.info(f"letter_offset = {model.letter_offset}")
     log.info("Using CoordinateModel (camera transform prediction removed)")
 
     model = model.to(device)
@@ -358,32 +367,30 @@ def train(args: argparse.Namespace) -> None:
          os.path.join(_eval_dir, "spinbench_data", "3d_results"),
          "problem", "answer"),
     ]:
-        try:
-            ds = Eval_Dataset_Coord(
-                _ds_jsonl,
-                _ds_results,
-                processor,
-                log,
-                max_images         = args.max_images,
-                spatial_merge_size = spatial_merge_size,
-                coord_upscale      = args.coord_upscale,
-                question_key       = _q_key,
-                answer_key         = _a_key,
-            )
-            _eval_sampler = (
-                DistributedSampler(ds, num_replicas=world_size,
-                                   rank=local_rank, shuffle=False)
-                if world_size > 1 else None
-            )
-            test_loaders[_ds_name] = DataLoader(
-                ds, batch_size=1, shuffle=False,
-                num_workers=args.num_workers, collate_fn=collate_fn,
-                sampler=_eval_sampler, pin_memory=True,
-            )
-            test_samplers[_ds_name] = _eval_sampler
-            log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
-        except Exception as exc:
-            log.warning(f"Failed to load eval dataset '{_ds_name}': {exc}")
+        ds = Eval_Dataset_Coord(
+            _ds_jsonl,
+            _ds_results,
+            processor,
+            log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            coord_upscale      = args.coord_upscale,
+            question_key       = _q_key,
+            answer_key         = _a_key,
+        )
+        _eval_sampler = (
+            DistributedSampler(ds, num_replicas=world_size,
+                                rank=local_rank, shuffle=False)
+            if world_size > 1 else None
+        )
+        test_loaders[_ds_name] = DataLoader(
+            ds, batch_size=1, shuffle=False,
+            num_workers=args.num_workers, collate_fn=collate_fn,
+            sampler=_eval_sampler, pin_memory=True,
+        )
+        test_samplers[_ds_name] = _eval_sampler
+        log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
+
 
     # -- optimiser -------------------------------------------------------------
     trainable   = [p for p in model.parameters() if p.requires_grad]

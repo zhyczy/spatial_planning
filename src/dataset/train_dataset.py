@@ -228,17 +228,31 @@ class MindCube_Train_Dataset(Dataset):
         if _question and _answer:
             qa_content = list(content)
             qa_content.append({"type": "text", "text": _question})
+            # Wrap the bare letter in <answer>X</answer> so the supervised
+            # assistant turn matches evaluation.py's regex parser. Pass
+            # `enable_thinking=False` so the chat template auto-fills an
+            # empty `<think></think>` block — without this, the deploy-time
+            # prompt ends mid-`<think>` and the model produces reasoning
+            # instead of the answer. See
+            # md/bug_fix/train_eval_paradigm_mismatch.md §6.
+            from .answer_format import format_answer, IM_END_NEWLINE
+            formatted_answer = format_answer(_answer)
             text_full = self.processor.apply_chat_template(
                 [{"role": "user",      "content": qa_content},
-                 {"role": "assistant", "content": _answer}],
+                 {"role": "assistant", "content": formatted_answer}],
                 tokenize=False, add_generation_prompt=False,
+                enable_thinking=False,
             )
             proc_out = self.processor(
                 text=[text_full], images=images,
                 return_tensors="pt", padding=False,
             )
+            # Loss mask covers the full `<answer>X</answer><|im_end|>\n`
+            # suffix (8 tokens for Qwen3.5-VL), so the model gets gradient on
+            # the tags too — not just the bare letter. This forces the
+            # assistant turn to start with `<answer>` at deploy.
             suffix_ids = self.processor.tokenizer(
-                _answer + "<|im_end|>\n", add_special_tokens=False
+                formatted_answer + IM_END_NEWLINE, add_special_tokens=False
             )["input_ids"]
             labels = proc_out["input_ids"].clone()
             labels[0, :-len(suffix_ids)] = -100
@@ -246,6 +260,7 @@ class MindCube_Train_Dataset(Dataset):
             messages = [{"role": "user", "content": content}]
             prompt_text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False,
+                enable_thinking=False,
             )
             proc_out = self.processor(
                 text=[prompt_text], images=images,
@@ -378,18 +393,27 @@ class MindCube_Train_Dataset_Coord(Dataset):
             )
 
         content.append({"type": "text", "text": _question})
+        # Wrap the bare letter in <answer>X</answer> + disable thinking
+        # mode so the deploy-time chat template ends with `</think>\n\n`
+        # (= start of the supervised suffix), not mid-`<think>`. See
+        # md/bug_fix/train_eval_paradigm_mismatch.md §6.
+        from .answer_format import format_answer, IM_END_NEWLINE
+        formatted_answer = format_answer(_answer)
         text_full = self.processor.apply_chat_template(
             [{"role": "user",      "content": content},
-             {"role": "assistant", "content": _answer}],
+             {"role": "assistant", "content": formatted_answer}],
             tokenize=False, add_generation_prompt=False,
+            enable_thinking=False,
         )
         proc_out = self.processor(
             text=[text_full], images=images,
             return_tensors="pt", padding=False,
         )
-        # Supervise only the answer tokens
+        # Supervise the full `<answer>X</answer><|im_end|>\n` suffix (tags
+        # included), so the model learns to start the assistant turn with
+        # the opening tag.
         suffix_ids = self.processor.tokenizer(
-            _answer + "<|im_end|>\n", add_special_tokens=False
+            formatted_answer + IM_END_NEWLINE, add_special_tokens=False
         )["input_ids"]
         labels = proc_out["input_ids"].clone()
         labels[0, :-len(suffix_ids)] = -100
@@ -969,17 +993,23 @@ class SAT_Train_Dataset(Dataset):
         content: list = [{"type": "image", "image": img} for img in images]
         content.append({"type": "text", "text": question_text})
 
+        # New format (matches MindCube_Train_Dataset): wrap the SAT answer
+        # in <answer>X</answer>, disable thinking. See
+        # md/bug_fix/train_eval_paradigm_mismatch.md.
+        from .answer_format import format_answer, IM_END_NEWLINE
+        formatted_answer = format_answer(answer_text)
         text_full = self.processor.apply_chat_template(
             [{"role": "user",      "content": content},
-             {"role": "assistant", "content": answer_text}],
+             {"role": "assistant", "content": formatted_answer}],
             tokenize=False, add_generation_prompt=False,
+            enable_thinking=False,
         )
         proc_out = self.processor(
             text=[text_full], images=images,
             return_tensors="pt", padding=False,
         )
         suffix_ids = self.processor.tokenizer(
-            answer_text + "<|im_end|>\n", add_special_tokens=False
+            formatted_answer + IM_END_NEWLINE, add_special_tokens=False
         )["input_ids"]
         labels = proc_out["input_ids"].clone()
         labels[0, :-len(suffix_ids)] = -100
@@ -1144,17 +1174,22 @@ class SAT_Train_Dataset_Rotation(Dataset):
         content: list = [{"type": "image", "image": img} for img in images]
         content.append({"type": "text", "text": question_text})
 
+        # New format (matches MindCube_Train_Dataset): wrap the SAT answer
+        # in <answer>X</answer>, disable thinking.
+        from .answer_format import format_answer, IM_END_NEWLINE
+        formatted_answer = format_answer(answer_text)
         text_full = self.processor.apply_chat_template(
             [{"role": "user",      "content": content},
-             {"role": "assistant", "content": answer_text}],
+             {"role": "assistant", "content": formatted_answer}],
             tokenize=False, add_generation_prompt=False,
+            enable_thinking=False,
         )
         proc_out = self.processor(
             text=[text_full], images=images,
             return_tensors="pt", padding=False,
         )
         suffix_ids = self.processor.tokenizer(
-            answer_text + "<|im_end|>\n", add_special_tokens=False
+            formatted_answer + IM_END_NEWLINE, add_special_tokens=False
         )["input_ids"]
         labels = proc_out["input_ids"].clone()
         labels[0, :-len(suffix_ids)] = -100

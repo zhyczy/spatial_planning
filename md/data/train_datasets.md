@@ -1,11 +1,39 @@
 # Training Datasets — Inventory & Rotation Supervision
 
-**Date:** 2026-04-22
+**Date:** 2026-04-28
 **Scope:** `spatial_planning/datasets/train/{MindCube, SAT, SPAR_7M}/`
 
 Cross-references:
 - Rotation anchor structure: [rotation_axes.md](rotation_axes.md)
 - Evaluation side: [eval_datasets.md](eval_datasets.md)
+- Train/eval template alignment postmortem: [../bug_fix/train_eval_paradigm_mismatch.md](../bug_fix/train_eval_paradigm_mismatch.md)
+
+---
+
+## 0. Unified assistant-turn format (2026-04-28)
+
+All training datasets — `MindCube_Train_Dataset`, `MindCube_Train_Dataset_Coord`
+(+ Rotation / Polar variants), `SAT_Train_Dataset`, `SAT_Train_Dataset_Rotation`
+— share **one** assistant-turn template, defined in
+[`src/dataset/answer_format.py`](../../src/dataset/answer_format.py):
+
+| Slot | Value |
+|---|---|
+| Assistant content | `<answer>{letter}</answer>` (`format_answer(letter)`) |
+| Chat template flag | `enable_thinking=False` (autofills empty `<think></think>`) |
+| Suffix tokens | `<answer>{letter}</answer><|im_end|>\n` (8 tokens for Qwen3.5-VL) |
+| Label mask | only the suffix is supervised — `labels[:, :-len(suffix_ids)] = -100` |
+| Letter-token offset in masked subset | **2** (BPE merges `>X` into single token; see `compute_letter_offset(tokenizer)`) |
+
+This format is **identical** to `Eval_Dataset_Coord` (training-time eval) and
+`evaluation.py prepare_batch_spa` (deploy). The deploy-time prompt
+(`add_generation_prompt=True, enable_thinking=False`) is a strict prefix of
+the training-time text — model generates `<answer>{letter}</answer><|im_end|>`
+directly from `<|im_start|>assistant\n<think>\n\n</think>\n\n`.
+
+**No backward compatibility** with the older bare-letter format — checkpoints
+trained before 2026-04-28 will not parse correctly under the new
+`evaluation.py` (strict `<answer>X</answer>` regex). Re-train.
 
 ---
 

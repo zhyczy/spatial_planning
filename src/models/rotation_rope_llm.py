@@ -1283,8 +1283,9 @@ class RotationRoPEModel(nn.Module):
             R: (3, 3) rotation matrix (or None → identity). The caller decides
                whether R has grad (for head_res update) or not (for reward
                collection).
-            compute_reward: if True, add `_ldict["acc"]` (0/1 top-1 accuracy on
-               the first non-masked answer token — used as binary reward).
+            compute_reward: if True, add `_ldict["acc"]` (0/1 top-1 accuracy
+               at the letter-token position inside the masked answer suffix
+               — see Option C in md/bug_fix/train_eval_paradigm_mismatch.md).
 
         Returns:
             (lm_loss, coord_loss, _ldict).  Each loss may be None.
@@ -1339,15 +1340,23 @@ class RotationRoPEModel(nn.Module):
             shift_labels = labels[:, 1:].to(logits2.device)
             mask         = shift_labels[0] != -100
             if mask.any():
-                lm_loss = F.cross_entropy(
-                    shift_logits[0, mask], shift_labels[0, mask],
-                )
+                _sl_m = shift_logits[0, mask]
+                _sb_m = shift_labels[0, mask]
+                lm_loss = F.cross_entropy(_sl_m, _sb_m)
                 _ldict["lm_loss"] = lm_loss.item()
                 if compute_reward:
-                    first_pos = mask.nonzero(as_tuple=True)[0][0].item()
-                    pred = shift_logits[0, first_pos].argmax(-1).item()
-                    gt   = int(shift_labels[0, first_pos].item())
-                    _ldict["acc"] = 1.0 if pred == gt else 0.0
+                    # Letter-position argmax (Option C). Suffix layout:
+                    #   <answer>{letter}</answer><|im_end|>\n
+                    # → letter at index `letter_offset` in the masked subset
+                    # (= number of tokens in "<answer>"). Caller sets
+                    # `model.letter_offset` after build; defaults to 0
+                    # (= old first-token argmax) for backward compat. See
+                    # md/bug_fix/train_eval_paradigm_mismatch.md.
+                    idx = getattr(self, "letter_offset", 0)
+                    if 0 <= idx < _sl_m.shape[0]:
+                        pred = _sl_m[idx].argmax(-1).item()
+                        gt   = int(_sb_m[idx].item())
+                        _ldict["acc"] = 1.0 if pred == gt else 0.0
         del logits2
 
         # Coord loss --------------------------------------------------------

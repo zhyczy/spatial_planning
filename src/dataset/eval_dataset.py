@@ -40,20 +40,26 @@ class Eval_Dataset(Dataset):
             content.append({"type": "image", "image": p})
         content.append({"type": "text", "text": question})
 
-        # Full conversation with assistant answer (for computing LM loss)
+        # Full conversation with assistant answer (for computing LM loss).
+        # New format: wrap bare letter with <answer>X</answer> + disable
+        # thinking, mirroring train datasets.
+        from .answer_format import format_answer, IM_END_NEWLINE
+        formatted_answer = format_answer(answer)
         text_full = self.processor.apply_chat_template(
             [{"role": "user", "content": content},
-             {"role": "assistant", "content": answer}],
+             {"role": "assistant", "content": formatted_answer}],
             tokenize=False, add_generation_prompt=False,
+            enable_thinking=False,
         )
         proc_out = self.processor(
             text=[text_full], images=images,
             return_tensors="pt", padding=False,
         )
 
-        # Build labels: mask everything except the answer tokens
+        # Build labels: mask everything except the <answer>X</answer><|im_end|>\n
+        # suffix.
         suffix_ids = self.processor.tokenizer(
-            answer + "<|im_end|>\n", add_special_tokens=False
+            formatted_answer + IM_END_NEWLINE, add_special_tokens=False
         )["input_ids"]
         suffix_len = len(suffix_ids)
         labels = proc_out["input_ids"].clone()
@@ -161,17 +167,24 @@ class Eval_Dataset_Coord(Dataset):
 
         content.append({"type": "text", "text": _question})
 
+        # Same <answer>X</answer> format and `enable_thinking=False` as
+        # MindCube_Train_Dataset_Coord — training/eval must use identical
+        # chat template flags so the first supervised token aligns across
+        # the two and the eval-time TF metric is comparable.
+        from .answer_format import format_answer, IM_END_NEWLINE
+        formatted_answer = format_answer(_answer)
         text_full = self.processor.apply_chat_template(
             [{"role": "user",      "content": content},
-             {"role": "assistant", "content": _answer}],
+             {"role": "assistant", "content": formatted_answer}],
             tokenize=False, add_generation_prompt=False,
+            enable_thinking=False,
         )
         proc_out = self.processor(
             text=[text_full], images=images,
             return_tensors="pt", padding=False,
         )
         suffix_ids = self.processor.tokenizer(
-            _answer + "<|im_end|>\n", add_special_tokens=False
+            formatted_answer + IM_END_NEWLINE, add_special_tokens=False
         )["input_ids"]
         labels = proc_out["input_ids"].clone()
         labels[0, :-len(suffix_ids)] = -100
