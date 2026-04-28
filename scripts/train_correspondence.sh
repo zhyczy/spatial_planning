@@ -207,7 +207,7 @@ TORCHRUN=/egr/research-actionlab/caizhon2/miniconda3/envs/spc/bin/torchrun
 
 $TORCHRUN \
     --nproc_per_node "$NPROC" \
-    --master_port    29501 \
+    --master_port    29502 \
     train_correspondence.py \
     --model_path             "$MODEL_PATH"             \
     --json_path              "$JSON_PATH"              \

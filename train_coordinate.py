@@ -642,13 +642,16 @@ def train(args: argparse.Namespace) -> None:
                             agg_sums = dict(local_loss_sums)
 
                         if total_count > 0 and local_rank == 0:
-                            detail = "  ".join(
+                            # Pull `acc` to the front of the line for visibility;
+                            # other loss keys follow in sorted order.
+                            _front  = f"acc={agg_sums['acc'] / total_count:.4f}  " if "acc" in agg_sums else ""
+                            _rest   = "  ".join(
                                 f"{k}={agg_sums[k] / total_count:.4f}"
-                                for k in _loss_keys
+                                for k in _loss_keys if k != "acc"
                             )
                             log.info(
                                 f"[eval] global_step={global_step:05d}  {ds_name}  "
-                                + detail
+                                + _front + _rest
                                 + f"  (n={total_count}, {world_size} GPU{'s' if world_size > 1 else ''})"
                             )
                             if use_wandb:

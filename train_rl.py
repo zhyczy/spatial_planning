@@ -1496,11 +1496,15 @@ def _run_eval(
             # line so the main eval metrics row stays readable.
             _anchor_keys = [k for k in _keys if k.startswith("eval_lm_loss_a")]
             _main_keys   = [k for k in _keys if k not in _anchor_keys]
-            detail = "  ".join(
-                f"{k}={agg_sums[k] / total_count:.4f}" for k in _main_keys
+            # Pull `acc` to the front of the line for visibility; other
+            # main keys follow in sorted order.
+            _front = f"acc={agg_sums['acc'] / total_count:.4f}  " if "acc" in agg_sums else ""
+            _rest  = "  ".join(
+                f"{k}={agg_sums[k] / total_count:.4f}"
+                for k in _main_keys if k != "acc"
             )
             log.info(f"[eval] global_step={global_step:05d}  {ds_name}  "
-                     + detail
+                     + _front + _rest
                      + f"  (n={total_count}, {world_size} GPU"
                      f"{'s' if world_size > 1 else ''})")
             if _anchor_keys:
