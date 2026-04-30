@@ -10,7 +10,7 @@
 #   bash scripts/evaluate.sh [options]
 #
 # Options:
-#   --method    baseline | vanilla | position_embedding | coordinate | polar | decouple | rotation | rotation_rl | atten | both
+#   --method    baseline | vanilla | position_embedding | coordinate | polar | decouple | atten | both
 #               (default: both = baseline + coordinate)
 #   --ckpt      path to SPA LoRA checkpoint dir
 #               (required when method != baseline)
@@ -40,11 +40,6 @@
 #   decouple           — SpaDec + LoRA: Qwen original 3D M-RoPE unchanged
 #                        + new Cartesian XYZ RoPE in pass-through dims 64..129, θ=10000.
 #                        Matches train_correspondence.py / train_coordinate.py --decouple.
-#   rotation           — SPA LoRA + 4D M-RoPE + rotation_enc + coord head (cam_dim=0)
-#                        (predicts canonical R; xyz rotated before RoPE/MAE).
-#                        Requires ckpt trained by train_alternate.py.
-#   rotation_rl        — same as rotation, but for train_rl.py ckpts
-#                        (rotation_enc has head_cls/head_res; R = compose_R(argmax logits, residual)).
 #   atten              — Qwen3.5-VL + LoRA + per-layer SpatialAttentionBias on V↔V attention.
 #                        Original 3D M-RoPE UNCHANGED; per-pair edge feature (n_x, n_y, n_z, d)
 #                        → per-layer 2-MLP → per-head bias. Requires spatial_bias.pt in ckpt.
@@ -149,7 +144,7 @@ done
 # Validate arguments
 # =============================================================================
 
-VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple rotation rotation_rl atten both"
+VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple atten both"
 if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
     echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1

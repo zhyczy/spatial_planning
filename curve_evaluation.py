@@ -19,7 +19,7 @@ python curve_evaluation.py \\
     --start     500 \\
     --end       1000 \\
     --step_size 50 \\
-    --method    coordinate \\  # or polar / decouple / rotation / rotation_rl
+    --method    coordinate \\  # or polar / decouple / atten
     --datasets  mindcube,sat_real \\
     --gpus      0,1,2,3 \\
     --output_dir eval_results/curves/coordinate_no_cam_mindcube
@@ -102,7 +102,7 @@ def read_accuracy(metrics_path: Path) -> float | None:
 
 
 def read_extras(metrics_path: Path) -> dict:
-    """Pull optional extras (rotation_angle_deg, coord_mae) from a metrics file."""
+    """Pull optional extras (coord_mae) from a metrics file."""
     try:
         with open(metrics_path) as f:
             data = json.load(f)
@@ -110,8 +110,6 @@ def read_extras(metrics_path: Path) -> dict:
         logger.warning(f"Could not read extras from {metrics_path}: {exc}")
         return {}
     out: dict = {}
-    if "rotation_angle_deg" in data:
-        out["rotation_angle_deg"] = data["rotation_angle_deg"]
     if "coord_mae_mean" in data:
         out["coord_mae_mean"] = data["coord_mae_mean"]
         if "coord_mae_std" in data:
@@ -249,7 +247,7 @@ def _save_summary(
       "config": { ... run parameters ... },
       "by_dataset":         { dataset: { step: accuracy } },
       "by_step":            { step:    { dataset: accuracy } },
-      "by_dataset_extras":  { dataset: { step: {rotation_angle_deg, coord_mae_*} } }
+      "by_dataset_extras":  { dataset: { step: {coord_mae_*} } }
     }
     """
     by_step: dict[str, dict[str, float]] = {}
@@ -310,7 +308,7 @@ def main() -> None:
     parser.add_argument(
         "--method", type=str, default="coordinate",
         choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
-                 "decouple", "rotation", "rotation_rl", "atten"],
+                 "decouple", "atten"],
         help="Evaluation method (default: coordinate).",
     )
     parser.add_argument(
@@ -367,7 +365,7 @@ def main() -> None:
 
     # curve_data[dataset][step] = accuracy
     curve_data: dict[str, dict[int, float]] = {ds: {} for ds in datasets}
-    # extras_data[dataset][step] = {"rotation_angle_deg": {...}, "coord_mae_mean": ...}
+    # extras_data[dataset][step] = {"coord_mae_mean": ..., "coord_mae_std": ...}
     extras_data: dict[str, dict[int, dict]] = {ds: {} for ds in datasets}
 
     # Try to load existing summary (for resumability)
@@ -423,15 +421,7 @@ def main() -> None:
             if extras:
                 extras_data[dataset][step] = extras
 
-            msg = f"[OK] step={step} dataset={dataset} accuracy={acc:.4f} ({acc*100:.2f}%)"
-            ra = extras.get("rotation_angle_deg") if extras else None
-            if ra:
-                msg += (
-                    f"  rot_angle_deg: min={ra['min']:.2f} max={ra['max']:.2f} "
-                    f"mean={ra['mean']:.2f} median={ra['median']:.2f} "
-                    f"var={ra['var']:.2f} (n={ra['n']})"
-                )
-            logger.info(msg)
+            logger.info(f"[OK] step={step} dataset={dataset} accuracy={acc:.4f} ({acc*100:.2f}%)")
 
             # Save incrementally after each evaluation
             _save_summary(summary_path, curve_data, extras_data, steps, datasets, args)

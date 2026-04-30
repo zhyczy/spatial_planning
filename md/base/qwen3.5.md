@@ -105,16 +105,190 @@ their own convolutional + recurrent processing on top.
 
 ---
 
-## 2. Vision side — `Qwen3_5VisionModel`
+## 2. Vision side — `Qwen3_5VisionModel` and image input pipeline
 
-Stub — extend when needed. Notes that may be useful:
+Qwen3.5 uses **dynamic resolution**: any input image is admitted, the
+processor independently rounds H and W to multiples of
+`factor = patch_size × merge_size = 14 × 2 = 28`, bounded by
+`[min_pixels, max_pixels]`, then bicubic-resizes (no crop, no padding). The
+number of vision tokens varies per image based on the resulting (H, W).
+
+### 2.1 Vision-side configuration constants
 
 - `config.vision_config.spatial_merge_size` controls the patch merge ratio
   (typically 2). Used everywhere in this codebase via
   `int(json.load(...)["vision_config"].get("spatial_merge_size", 2))`.
 - The vision encoder uses its own `Qwen3_5VisionAttention` with separate
-  `apply_rotary_pos_emb_vision` (different from text RoPE).
-- Output gets re-embedded at `<|image_pad|>` positions in the input_ids.
+  `apply_rotary_pos_emb_vision` (different from text RoPE — see §4).
+- Output gets re-embedded at `<|image_pad|>` positions in the input_ids
+  (`mm_token_type_ids == 1` cells), driven by §3's modality contract.
+
+### 2.2 The `smart_resize` formula
+
+The image processor (Qwen2-VL family, used by Qwen3.5) computes the resize
+target via:
+
+```python
+def smart_resize(height, width, factor=28,
+                 min_pixels=56*56, max_pixels=14*14*4*1280):  # ≈ [3136, 1003520]
+    h_bar = round(height / factor) * factor
+    w_bar = round(width  / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = sqrt((height * width) / max_pixels)
+        h_bar = max(factor, floor(height / beta / factor) * factor)
+        w_bar = max(factor, floor(width  / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = sqrt(min_pixels / (height * width))
+        h_bar = ceil(height * beta / factor) * factor
+        w_bar = ceil(width  * beta / factor) * factor
+    return h_bar, w_bar
+```
+
+Defaults:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `patch_size` | 14 | DINOv2-style ViT patch |
+| `merge_size` (`sms`) | 2 | Spatial merging into LLM tokens |
+| `factor` | **28** | `= patch_size × merge_size` — the rounding granularity |
+| `min_pixels` | 3,136 (= 56²) | Don't go below ~56×56 |
+| `max_pixels` | **1,003,520** (= 14² × 4 × 1280) | Cap area, scaling down preserves AR via `beta` |
+
+> Round semantics: Python's `round()` uses **banker's rounding** (round-half-to-even).
+> E.g. `round(518/28) = round(18.5) = 18 → 504`. Inputs whose dimensions land near
+> `.5` boundaries get tiny aspect-ratio drift (~1-2%).
+
+### 2.3 What the processor returns
+
+Per image:
+
+```python
+proc_out["pixel_values"]      # (T*H_bar*W_bar/14² , 3, 14, 14)   flattened patch tokens
+proc_out["image_grid_thw"]    # (T, H_bar/14, W_bar/14)           per image
+```
+
+Vision-token count per image, before/after spatial merge:
+
+| Stage | Token count |
+|---|---|
+| Pre-merge (raw patches, what ViT outputs) | `H_bar/14 × W_bar/14` |
+| Post-merge (`sms=2`, what the LLM consumes) | `H_bar/28 × W_bar/28` |
+
+The LLM patch grid is therefore `(image_grid_thw[1] // sms, image_grid_thw[2] // sms)`.
+
+### 2.4 Worked examples
+
+**480×640 input** (4:3 landscape, MindCube parquet):
+
+```python
+smart_resize(H=480, W=640, factor=28, max_pixels=1003520)
+  h_bar = round(480/28)*28 = 17*28 = 476
+  w_bar = round(640/28)*28 = 23*28 = 644
+  area = 476*644 = 306,544  < 1,003,520 ✓ no scaling needed
+  → (476, 644)
+```
+
+→ LLM patch grid `(17, 23)` = 391 patches. AR drift: 1.333 → 1.353 (+1.5%).
+
+**1024×768 input** (4:3 landscape, VST si_distance):
+
+```python
+smart_resize(H=768, W=1024)
+  h_bar = round(768/28)*28 = 27*28 = 756
+  w_bar = round(1024/28)*28 = 37*28 = 1036
+  area = 756*1036 = 783,216  < 1,003,520 ✓
+  → (756, 1036)
+```
+
+→ LLM patch grid `(27, 37)` = 999 patches. AR drift: 1.333 → 1.370 (+2.8%).
+
+**1920×1440 input** (4:3 landscape, VST si_depth_comparison high-res):
+
+```python
+smart_resize(H=1440, W=1920)
+  h_bar = round(1440/28)*28 = 51*28 = 1428
+  w_bar = round(1920/28)*28 = 69*28 = 1932
+  area = 1428*1932 = 2,758,896  > 1,003,520 ✗ → scale down
+  beta = sqrt(2,764,800 / 1,003,520) = 1.660
+  h_bar = floor(1440/1.660/28)*28 = 30*28 = 840
+  w_bar = floor(1920/1.660/28)*28 = 41*28 = 1148
+  → (840, 1148)
+```
+
+→ LLM patch grid `(30, 41)` = 1,230 patches. Effective downscale ×0.6 (Qwen will
+not let any input exceed ~1M pixels).
+
+### 2.5 No crop, no pad — bicubic resize only
+
+Aspect ratio is **not** preserved exactly (H and W round independently to 28-multiples,
+introducing ~1-2% non-uniform stretch on most images), but the **full field of view
+is preserved** — no scene content is cropped or padded.
+
+For 4:3 (1.333) inputs, common landings:
+
+| Input (W × H) | smart_resize (W × H) | New AR | AR drift |
+|---|---|---|---|
+| 640 × 480 | 644 × 476 | 1.353 | +1.5% |
+| 1024 × 768 | 1036 × 756 | 1.370 | +2.8% |
+| 1920 × 1440 | 1148 × 840 | 1.367 | +2.5% |
+
+This drift is small but non-zero. For tasks where pixel-level alignment with another
+representation that **does** preserve AR exactly (e.g. `pts3d.npy` from a fixed-resolution
+reconstruction model — see [mapanything.md](mapanything.md)), the discrepancy needs
+explicit handling at the dataloader.
+
+### 2.6 Practical implications for dataloaders
+
+The processor handles smart_resize internally:
+
+```python
+proc_out = self.processor(
+    text=[prompt_text],
+    images=images,            # any list of PIL Image — no manual resize required
+    return_tensors="pt",
+    padding=False,
+)
+thw_per_image = proc_out["image_grid_thw"]   # (N, 3) tensor — actual post-resize grid
+```
+
+You **do not** manually round to 28-multiples or apply your own resize before the
+processor — doing so doubles the work and may introduce additional artifacts. The
+dataloader can read images from any source (parquet bytes, on-disk PNG/JPG of
+arbitrary size) and feed them directly. `image_grid_thw` reports the post-resize
+patch grid the LLM's vision tokens describe.
+
+### 2.7 Tuning `min_pixels` / `max_pixels`
+
+The defaults `[3136, 1003520]` cap GPU memory at a reasonable size while keeping
+enough resolution for typical VLM tasks. Three scenarios where overriding helps:
+
+| Scenario | Adjustment |
+|---|---|
+| Low-VRAM training, high token-count regret | Lower `max_pixels` to e.g. 256² × 28² = 200,704 |
+| Documents / OCR / text-heavy inputs | Raise `max_pixels` to keep small text legible |
+| Very tiny thumbnails (< 56²) | Raise `min_pixels` so they get upsampled, not collapsed to a single token |
+
+Pass via `processor(..., min_pixels=..., max_pixels=...)` or set on
+`processor.image_processor` once at init.
+
+### 2.8 Comparison with fixed-resolution preprocessors
+
+Fixed-resolution preprocessors (CLIP at 224², our reconstruction models — see
+[mapanything.md](mapanything.md)) require a single shape and either crop or pad to fit.
+Qwen3.5 sidesteps this:
+
+| Aspect | Qwen3.5 dynamic | Fixed-resolution (CLIP / MapAnything / VGGT) |
+|---|---|---|
+| Output shape | Variable per image | Single shape |
+| Aspect-ratio preservation | Not exact (~1-2% drift) | Either exact (with crop) or distorted (with stretch) |
+| Field of view | **Always full** (no crop, no pad) | Cropped or padded |
+| Token count | Variable per image | Constant |
+| Caller responsibility | None — handled internally | Must manually invoke preprocessor |
+
+For VLM tasks, "always full FOV with small AR drift" is generally preferred: no
+scene content is lost (even text on the edge stays visible) and the model's vision
+tokens adapt to any input shape. The cost — patch-grid variability — is exactly
+what `image_grid_thw` exposes for downstream consumers.
 
 ---
 

@@ -36,22 +36,6 @@ Multi-method QA evaluation:
       Input : images + question
       3D pos: precomputed Cartesian XYZ → XYZ RoPE on image patches
 
-  rotation
-      Model : SpaForConditionalGeneration (4D M-RoPE) + LoRA
-              + CameraTokenRotationEncoder (predicts canonical R)
-              + DepthPredictionTransformer (coord head in rotated frame)
-      Input : images + question  (no pose sentences; no_cam)
-      3D pos: R = rotation_enc(merged_embeds, token_txyz_int);
-              rotated_xyz = R @ xyz_world → 4D M-RoPE on image patches
-      Coord : predicted in rotated frame; GT = R @ gt_xyz before MAE
-
-  rotation_rl
-      Same architecture as `rotation` at inference time, but rotation_enc is a
-      CameraTokenRotationEncoderRL trained by train_rl.py.
-      Inference picks R via anchor argmax + residual:
-          k = argmax(logits), R = R_bins[k] @ exp(hat(clamp·tanh(residual[k])))
-      Ckpt  : rotation_enc.pt contains head_cls.* / head_res.* (NOT rot_head.*).
-
   atten
       Model : Qwen3.5-VL + LoRA, original 3D M-RoPE UNCHANGED, with
               SpatialAttnVanillaModel inner backbone and per-layer
@@ -124,17 +108,11 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGe
 from src.models import (
     SpaForConditionalGeneration,
     DepthPredictionTransformer,
-    CameraTokenRotationEncoder,
-    CameraTokenRotationEncoderRL,
     SpatialAttentionBias,
     SpatialAttnVanillaModel,
     patch_attention_layers_spatial,
 )
-from src.models.rotation_rope_llm import (
-    _build_token_txyz_int,
-    _apply_rotation_to_xyz,
-)
-from src.dataset import load_testing_dataset, chunk_dataset
+from src.dataset import load_testing_dataset, chunk_dataset, _qwen_align_view
 
 # ── sys.path: ensure spatial_planning/ root is importable ──────────────────
 _ROOT = Path(__file__).resolve().parent
@@ -450,7 +428,7 @@ def load_spa_model(
                 f"(n_per_axis={xyz_rope_dim // 6}), theta={_xyz_theta:g}"
             )
     else:
-        # 4D M-RoPE for default / coordinate / rotation variants.
+        # 4D M-RoPE for default / coordinate variants.
         total = sum(orig_section)
         xyz_size = (total - 2) // 3
         new_section = [2, xyz_size, xyz_size, xyz_size]
@@ -658,174 +636,6 @@ def _load_coord_head(
         f"(hidden_dim={hidden_dim}, d_model={d_model}, upscale={upscale_factor})"
     )
     return coord_head
-
-
-def _load_rotation_enc(
-    ckpt_path: str,
-    spa_model: Any,
-    device: str,
-    expect_rl: Optional[bool] = None,
-) -> Optional[torch.nn.Module]:
-    """Load rotation encoder (RL or non-RL) from checkpoint directory.
-
-    Auto-detects the architecture from state-dict keys:
-      - non-RL (train_alternate.py) → CameraTokenRotationEncoder (has rot_head.*)
-      - RL     (train_rl.py)       → CameraTokenRotationEncoderRL (has head_cls.* / head_res.*)
-
-    Infers architecture (hidden_dim, d_model, dim_feedforward, num_layers) from
-    the saved weight shapes. `nhead` is derived from d_model / mllm_head_dim.
-    Reuses the merged SPA model's SpaTextRotaryEmbedding so inv_freq and
-    mrope_section are byte-identical to training.
-
-    Args:
-        expect_rl: if True, require an RL ckpt; if False, require a non-RL ckpt;
-                   if None, accept either. Mismatch raises RuntimeError.
-    """
-    logger = logging.getLogger(__name__)
-    ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=False)
-    rot_path = ckpt_dir / "rotation_enc.pt"
-    if not rot_path.exists():
-        logger.info(f"[rotation] rotation_enc.pt not found in {ckpt_dir} — skipping.")
-        return None
-
-    state = torch.load(str(rot_path), map_location="cpu", weights_only=True)
-
-    # Detect RL vs non-RL from state-dict keys
-    is_rl = "head_cls.weight" in state
-    if expect_rl is True and not is_rl:
-        raise RuntimeError(
-            f"[rotation_rl] {rot_path} has no head_cls.* — this is a non-RL rotation "
-            "encoder (trained by train_alternate.py). Use --method rotation instead, "
-            "or retrain with train_rl.py."
-        )
-    if expect_rl is False and is_rl:
-        raise RuntimeError(
-            f"[rotation] {rot_path} contains head_cls.* — this is an RL rotation "
-            "encoder (trained by train_rl.py). Use --method rotation_rl instead."
-        )
-
-    # Infer architecture from state dict shapes
-    d_model = int(state["cam_token"].shape[1])
-    hidden_dim = int(state["input_proj.weight"].shape[1])
-    dim_feedforward = int(state["layers.0.ffn.0.weight"].shape[0])
-    num_layers = len({k.split(".")[1] for k in state if k.startswith("layers.")})
-
-    # Retrieve rotary_emb and head_dim from the merged spa_model
-    spa_inner = spa_model.model  # SpaModel
-    rotary_emb = spa_inner.language_model.rotary_emb  # SpaTextRotaryEmbedding
-    text_config = spa_model.config.text_config
-    mllm_head_dim = getattr(text_config, "head_dim", None) or (
-        text_config.hidden_size // text_config.num_attention_heads
-    )
-    if d_model % mllm_head_dim != 0:
-        raise ValueError(
-            f"[rotation] d_model={d_model} not divisible by mllm_head_dim={mllm_head_dim}"
-        )
-    nhead = d_model // mllm_head_dim
-
-    if is_rl:
-        # RL: action_space is "hybrid" iff head_res.* is present, else "discrete".
-        action_space = "hybrid" if "head_res.weight" in state else "discrete"
-        rotation_enc = CameraTokenRotationEncoderRL(
-            hidden_dim=hidden_dim,
-            mllm_head_dim=mllm_head_dim,
-            rope_emb=rotary_emb,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            num_layers=num_layers,
-            action_space=action_space,
-        )
-        cls_name = f"CameraTokenRotationEncoderRL(action_space={action_space})"
-    else:
-        rotation_enc = CameraTokenRotationEncoder(
-            hidden_dim=hidden_dim,
-            mllm_head_dim=mllm_head_dim,
-            rope_emb=rotary_emb,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            num_layers=num_layers,
-        )
-        cls_name = "CameraTokenRotationEncoder"
-
-    # rope_emb's inv_freq is a non-persistent buffer shared with the MLLM;
-    # allow strict=False so the missing inv_freq keys don't fail the load.
-    missing, unexpected = rotation_enc.load_state_dict(state, strict=False)
-    if unexpected:
-        logger.warning(f"[rotation] unexpected keys when loading rotation_enc: {unexpected}")
-    rotation_enc = rotation_enc.to(device).to(torch.bfloat16).eval()
-    logger.info(
-        f"[rotation] {cls_name} loaded from {rot_path} "
-        f"(hidden_dim={hidden_dim}, d_model={d_model}, nhead={nhead}, "
-        f"dim_ff={dim_feedforward}, num_layers={num_layers})"
-    )
-    return rotation_enc
-
-
-def _compute_rotation_R(
-    spa_model: Any,
-    rotation_enc: torch.nn.Module,
-    inputs: Dict[str, Any],
-    image_xyz: List[torch.Tensor],
-    image_token_id: int,
-    spatial_merge_size: int,
-    coord_scale: float,
-) -> Optional[torch.Tensor]:
-    """Compute rotation R via a partial forward.
-
-    Mirrors RotationRoPEModel.forward Steps 1-2 without gradients.
-    Dispatches on encoder type:
-      - CameraTokenRotationEncoder  → R = rot6d head output
-      - CameraTokenRotationEncoderRL → R = compose_R(argmax logits, residual)
-
-    Returns R (3,3) or None on missing inputs.
-    """
-    device = next(spa_model.parameters()).device
-    inputs_dev = {
-        k: v.to(device) if isinstance(v, torch.Tensor) else v
-        for k, v in inputs.items()
-    }
-    input_ids = inputs_dev["input_ids"]
-    pixel_values = inputs_dev.get("pixel_values")
-    image_grid_thw = inputs_dev.get("image_grid_thw")
-    if pixel_values is None or image_grid_thw is None:
-        return None
-
-    spa_inner = spa_model.model  # SpaModel (post LoRA merge)
-
-    with torch.no_grad():
-        # Step 1: merged inputs_embeds (text embed + vision encoder scatter)
-        inputs_embeds = spa_inner.get_input_embeddings()(input_ids)
-        image_outputs = spa_inner.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True,
-        )
-        image_embeds = image_outputs.pooler_output
-        if isinstance(image_embeds, (list, tuple)):
-            image_embeds = torch.cat(list(image_embeds), dim=0)
-        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-
-        # Step 2: rotation encoder → R
-        xyz_on_device = [x.to(device=device, dtype=torch.float32) for x in image_xyz]
-        token_txyz_int = _build_token_txyz_int(
-            input_ids,
-            image_token_id,
-            xyz_on_device,
-            image_grid_thw,
-            spatial_merge_size,
-            coord_scale,
-        )
-        if isinstance(rotation_enc, CameraTokenRotationEncoderRL):
-            # RL: pick argmax anchor, compose final R with residual correction
-            logits, residual_all, _ = rotation_enc(
-                inputs_embeds, token_txyz_int
-            )
-            k = int(torch.argmax(logits).item())
-            R = rotation_enc.compose_R(k, residual_all)
-        else:
-            R, _ = rotation_enc(inputs_embeds, token_txyz_int)
-
-    return R
 
 
 def _get_coord_predictions(
@@ -1036,10 +846,12 @@ def build_image_xyz(
 ) -> List[torch.Tensor]:
     """Convert CoordEstimator output to image_xyz list for SpaForConditionalGeneration.
 
-    1. Aligns all frames to the first-frame camera coordinate system
-       (T0_inv = inv(camera_pose[0])).
-    2. Resizes each per-pixel XYZ map to the LLM patch grid resolution
-       (grid_thw[i, 1:] // spatial_merge_size).
+    Block-averages each per-pixel XYZ map to the LLM patch grid
+    (grid_thw[i, 1:] // spatial_merge_size). Pts3d is used as-is — the
+    reconstruction pipeline already saves it in MapAnything's world frame
+    (≈ view 0 frame, modulo a few-mm pose-estimation noise), and training
+    feeds raw pts3d to resize_xyz without any pose normalization. Skipping
+    T0_inv keeps train and eval bit-equivalent at the LLM patch grid.
 
     Parameters
     ----------
@@ -1054,9 +866,6 @@ def build_image_xyz(
     """
     N = image_grid_thw.shape[0]
 
-    # World-to-first-frame transform
-    T0_inv = np.linalg.inv(coord_results[0]["camera_pose"].astype(np.float64))  # (4,4)
-
     xyz_list: List[torch.Tensor] = []
     for k in range(N):
         thw_k = image_grid_thw[k]                      # (T, H_patches, W_patches)
@@ -1065,17 +874,9 @@ def build_image_xyz(
 
         if k < len(coord_results):
             r    = coord_results[k]
-            pts  = r["pts3d"].astype(np.float64)        # (H, W, 3)
+            pts  = r["pts3d"].astype(np.float32)        # (H, W, 3)
             mask = r["mask"]                            # (H, W) bool
-            H, W = pts.shape[:2]
-
-            # Transform pts to first-frame coords
-            pts_flat = pts.reshape(-1, 3)
-            ones     = np.ones((H * W, 1), dtype=np.float64)
-            pts_hom  = np.concatenate([pts_flat, ones], axis=1)  # (H*W, 4)
-            pts_ff   = (T0_inv @ pts_hom.T).T[:, :3].reshape(H, W, 3).astype(np.float32)
-
-            xyz_list.append(_resize_xyz(pts_ff, llm_h, llm_w, valid=mask))
+            xyz_list.append(_resize_xyz(pts, llm_h, llm_w, valid=mask))
         else:
             # Fallback: zero coords (no coord estimate available for this frame)
             xyz_list.append(torch.zeros(llm_h, llm_w, 3))
@@ -1142,6 +943,11 @@ def prepare_batch_baseline(
     all_image_inputs, all_video_inputs = [], []
     for msgs in batch_messages:
         imgs, vids = process_vision_info(msgs)
+        if imgs:
+            # Match training: pre-align image to Qwen smart_resize target via
+            # PIL LANCZOS. Qwen's image_processor uses BICUBIC internally, so
+            # without this the train and test interpolation kernels diverge.
+            imgs = [_qwen_align_view(img, None, None)[0] for img in imgs]
         all_image_inputs.extend(imgs or [])
         all_video_inputs.extend(vids or [])
 
@@ -1246,6 +1052,34 @@ def prepare_batch_spa(
 
     image_inputs, video_inputs = process_vision_info(messages)
 
+    # Pre-load pts3d/mask if needed so we can Qwen-align it in lockstep with
+    # the images. Without this, image goes to /28 via Qwen's internal
+    # smart_resize but pts3d stays at MapAny shape — build_image_xyz's
+    # integer-stride block-mean would then truncate edge pixels (see
+    # train_dataset_qwen35.py docstring).
+    coord_results: Optional[List[Dict]] = None
+    load_exc: Optional[Exception] = None
+    if (use_coord or load_xyz) and item["image"]:
+        try:
+            coord_results = load_precomputed_coords(item)
+        except Exception as exc:
+            load_exc = exc
+
+    # Qwen-align each view (image + pts3d + mask). Image-only when pts3d is
+    # not available for a given view. Mirrors training preprocessing.
+    if image_inputs:
+        aligned_imgs: list = []
+        for k, img in enumerate(image_inputs):
+            r = coord_results[k] if (coord_results is not None and k < len(coord_results)) else None
+            if r is not None:
+                img_q, pts_q, mask_q = _qwen_align_view(img, r["pts3d"], r["mask"])
+                r["pts3d"] = pts_q
+                r["mask"]  = mask_q
+            else:
+                img_q = _qwen_align_view(img, None, None)[0]
+            aligned_imgs.append(img_q)
+        image_inputs = aligned_imgs
+
     inputs = processor(
         text=[prompt_text],
         images=image_inputs if image_inputs else None,
@@ -1254,16 +1088,9 @@ def prepare_batch_spa(
         padding=False,
     )
 
-    # Build image_xyz from precomputed 3d_results
+    # Build image_xyz from precomputed 3d_results (now /28-aligned)
     image_xyz: Optional[List[torch.Tensor]] = None
     if (use_coord or load_xyz) and item["image"]:
-        coord_results = None
-        load_exc: Optional[Exception] = None
-        try:
-            coord_results = load_precomputed_coords(item)
-        except Exception as exc:
-            load_exc = exc
-
         image_grid_thw = inputs.get("image_grid_thw")
         if (load_exc is None
                 and coord_results is not None
@@ -1613,21 +1440,6 @@ def compute_metrics(results: List[Dict]) -> Dict[str, Any]:
         metrics["coord_mae_mean"] = float(np.mean(coord_maes))
         metrics["coord_mae_std"]  = float(np.std(coord_maes))
         metrics["coord_mae_n"]    = len(coord_maes)
-    # Aggregate rotation angle (deg) when present (rotation / rotation_rl)
-    angles = [
-        r["rotation_angle_deg"] for r in results
-        if r.get("rotation_angle_deg") is not None
-    ]
-    if angles:
-        a = np.asarray(angles, dtype=np.float64)
-        metrics["rotation_angle_deg"] = {
-            "min":    float(a.min()),
-            "max":    float(a.max()),
-            "mean":   float(a.mean()),
-            "median": float(np.median(a)),
-            "var":    float(a.var()),
-            "n":      int(a.size),
-        }
     return metrics
 
 
@@ -1691,13 +1503,6 @@ def log_metrics(metrics: Dict, label: str, logger: logging.Logger) -> None:
             f"  Coord MAE: {metrics['coord_mae_mean']:.4f} ± {metrics['coord_mae_std']:.4f}"
             f"  (n={metrics['coord_mae_n']})"
         )
-    if "rotation_angle_deg" in metrics:
-        ra = metrics["rotation_angle_deg"]
-        logger.info(
-            f"  Rotation angle (deg): min={ra['min']:.2f}  max={ra['max']:.2f}  "
-            f"mean={ra['mean']:.2f}  median={ra['median']:.2f}  var={ra['var']:.2f}  "
-            f"(n={ra['n']})"
-        )
     logger.info("  Per-category accuracy:")
     for cat, acc in sorted(metrics["category_accuracy"].items()):
         n = metrics["category_counts"].get(cat, 0)
@@ -1736,11 +1541,6 @@ def evaluate(
                            matches train_correspondence.py / train_coordinate.py --polar
       decouple           — SpaDec + LoRA: 3D M-RoPE unchanged + Cartesian XYZ RoPE in pass-through, θ=10000;
                            matches train_correspondence.py / train_coordinate.py --decouple
-      rotation           — SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder
-                           + coord head (rotated frame); matches train_alternate.py
-      rotation_rl        — same as rotation, but with an RL-trained
-                           CameraTokenRotationEncoderRL (train_rl.py);
-                           R = compose_R(argmax(head_cls), head_res)
       atten              — Qwen3.5-VL + LoRA + per-layer SpatialAttentionBias on
                            V↔V attention; 3D M-RoPE UNCHANGED. Matches train_atten.py.
       both               — baseline + coordinate
@@ -1755,13 +1555,10 @@ def evaluate(
     run_coordinate = method in ("coordinate", "both")
     run_polar = method == "polar"
     run_decouple = method == "decouple"
-    run_rotation = method == "rotation"
-    run_rotation_rl = method == "rotation_rl"
     run_atten = method == "atten"
-    run_any_rotation = run_rotation or run_rotation_rl
     run_spa = (
         run_vanilla or run_position_embedding or run_coordinate
-        or run_polar or run_decouple or run_any_rotation or run_atten
+        or run_polar or run_decouple or run_atten
     )
 
     # Methods whose RoPE / coord head / spatial bias depends on real per-patch
@@ -1770,7 +1567,7 @@ def evaluate(
     # proceed if the dataset has no 3d_results at all.
     methods_needing_xyz = (
         run_position_embedding or run_coordinate
-        or run_polar or run_decouple or run_any_rotation or run_atten
+        or run_polar or run_decouple or run_atten
     )
     if methods_needing_xyz and len(data) > 0:
         # Check the first few samples; if NONE has 3d_results/, abort upfront.
@@ -1802,7 +1599,6 @@ def evaluate(
 
     image_token_id_val: Optional[int] = None
     spa_coord_head: Optional[DepthPredictionTransformer] = None
-    spa_rotation_enc: Optional[torch.nn.Module] = None
 
     if run_spa:
         if correspondence_ckpt is None:
@@ -1837,46 +1633,31 @@ def evaluate(
         if isinstance(_iid, int) and _iid != spa_proc.tokenizer.unk_token_id:
             image_token_id_val = _iid
 
-        # Load DepthPredictionTransformer for coordinate / rotation checkpoints
-        if run_coordinate or run_any_rotation:
+        # Load DepthPredictionTransformer for coordinate checkpoints
+        if run_coordinate:
             spa_coord_head = _load_coord_head(correspondence_ckpt, device)
 
-        # Load rotation encoder (RL or non-RL) for rotation checkpoint
-        if run_any_rotation:
-            # rotation    → non-RL encoder (has rot_head.*)
-            # rotation_rl → RL encoder     (has head_cls.*)
-            _expect_rl = True if run_rotation_rl else False
-            spa_rotation_enc = _load_rotation_enc(
-                correspondence_ckpt, spa_model, device, expect_rl=_expect_rl,
-            )
-
     # Determine which SPA variants to run.
-    # Tuple: (name, use_coord, is_polar, is_rotation, is_decouple, is_atten)
+    # Tuple: (name, use_coord, is_polar, is_decouple, is_atten)
     #   vanilla            : stock Qwen3.5 (3D M-RoPE, no xyz)
     #   position_embedding : 4D M-RoPE Cartesian on vision tokens
     #   coordinate (no_cam): 4D M-RoPE Cartesian + coord head (vision-token readout)
     #   polar              : SpaDec + log-spherical XYZ RoPE (θ=1000)
     #   decouple           : SpaDec + Cartesian XYZ RoPE (θ=10000)
-    #   rotation / rotation_rl : 4D Cartesian RoPE on rotation_enc-rotated xyz
-    #       + coord head
     #   atten              : 3D M-RoPE unchanged + per-layer SpatialAttentionBias on V↔V
-    spa_variants: List[Tuple[str, bool, bool, bool, bool, bool]] = []
+    spa_variants: List[Tuple[str, bool, bool, bool, bool]] = []
     if run_vanilla:
-        spa_variants.append(("vanilla",            False, False, False, False, False))
+        spa_variants.append(("vanilla",            False, False, False, False))
     if run_position_embedding:
-        spa_variants.append(("position_embedding", False, False, False, False, False))
+        spa_variants.append(("position_embedding", False, False, False, False))
     if run_coordinate:
-        spa_variants.append(("coordinate",         True,  False, False, False, False))
+        spa_variants.append(("coordinate",         True,  False, False, False))
     if run_polar:
-        spa_variants.append(("polar",              False, True,  False, True,  False))
+        spa_variants.append(("polar",              False, True,  True,  False))
     if run_decouple:
-        spa_variants.append(("decouple",           False, False, False, True,  False))
-    if run_rotation:
-        spa_variants.append(("rotation",           False, False, True,  False, False))
-    if run_rotation_rl:
-        spa_variants.append(("rotation_rl",        False, False, True,  False, False))
+        spa_variants.append(("decouple",           False, False, True,  False))
     if run_atten:
-        spa_variants.append(("atten",              False, False, False, False, True))
+        spa_variants.append(("atten",              False, False, False, True))
 
     active_methods = (
         (["baseline"] if run_baseline else [])
@@ -1902,7 +1683,7 @@ def evaluate(
 
         # ---- SPA variants ----
         for (
-            spa_method_name, use_coord, is_polar, is_rotation, is_decouple, is_atten,
+            spa_method_name, use_coord, is_polar, is_decouple, is_atten,
         ) in spa_variants:
             # All methods except `vanilla` rely on per-patch xyz from 3d_results
             # to produce meaningful position embeddings / coord supervision.
@@ -1917,42 +1698,8 @@ def evaluate(
                 strict_xyz=_needs_xyz,
             )
 
-            # ---- Rotation: compute R and rotate image_xyz ----
-            # coord GT = R @ xyz (rotated frame).
-            xyz_for_rope = image_xyz
-            xyz_for_mae = image_xyz
-            rotation_angle_deg: Optional[float] = None
-            if (
-                is_rotation
-                and spa_rotation_enc is not None
-                and image_xyz is not None
-                and image_token_id_val is not None
-            ):
-
-                R_mat = _compute_rotation_R(
-                    spa_model, spa_rotation_enc, inputs, image_xyz,
-                    image_token_id_val, spatial_merge_size, coord_scale,
-                )
-                if R_mat is not None:
-                    # Rotation angle from trace: θ = acos((tr(R) - 1) / 2)
-                    with torch.no_grad():
-                        R_f = R_mat.detach().float()
-                        trace = R_f[0, 0] + R_f[1, 1] + R_f[2, 2]
-                        cos_theta = ((trace - 1.0) / 2.0).clamp(-1.0, 1.0)
-                        rotation_angle_deg = float(
-                            torch.acos(cos_theta) * (180.0 / np.pi)
-                        )
-                    rotated = _apply_rotation_to_xyz(
-                        R_mat,
-                        [x.to(next(spa_model.parameters()).device) for x in image_xyz],
-                    )
-                    xyz_for_rope = rotated
-                    # Keep xyz_for_mae on CPU so it matches coord_head
-                    # predictions (which _get_coord_predictions returns on CPU).
-                    xyz_for_mae = [r.detach().cpu() for r in rotated]
-                
             output = run_inference_spa(
-                inputs, xyz_for_rope, spa_model, spa_proc,
+                inputs, image_xyz, spa_model, spa_proc,
                 max_new_tokens, coord_scale,
                 vanilla=use_vanilla_arch,
                 polar=is_polar,
@@ -1961,23 +1708,21 @@ def evaluate(
             )
             result = _make_result(item, output, prompt, spa_method_name,
                                     thinking=thinking)
-            if rotation_angle_deg is not None:
-                result["rotation_angle_deg"] = rotation_angle_deg
 
-            # ---- DepthPredictionTransformer evaluation (coordinate + rotation) ----
+            # ---- DepthPredictionTransformer evaluation (coordinate) ----
             if (
-                (use_coord or is_rotation)
+                use_coord
                 and spa_coord_head is not None
                 and image_token_id_val is not None
-                and xyz_for_rope is not None
+                and image_xyz is not None
             ):
                 preds = _get_coord_predictions(
                     spa_model, inputs,
                     image_token_id_val, spa_coord_head,
-                    spatial_merge_size, xyz_for_rope, coord_scale,
+                    spatial_merge_size, image_xyz, coord_scale,
                 )
                 if preds is not None:
-                    result["coord_mae"] = _compute_coord_mae(preds, xyz_for_mae)
+                    result["coord_mae"] = _compute_coord_mae(preds, image_xyz)
 
             results_map[spa_method_name].append(result)
 
@@ -2128,7 +1873,7 @@ def main() -> None:
     parser.add_argument(
         "--method", type=str, default="both",
         choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
-                 "decouple", "rotation", "rotation_rl", "atten", "both"],
+                 "decouple", "atten", "both"],
         help=(
             "Which method(s) to run. "
             "baseline=stock Qwen3.5-VL; "
@@ -2137,8 +1882,6 @@ def main() -> None:
             "coordinate=SPA LoRA + 4D M-RoPE + coord head (vision-token readout, no_cam, Cartesian); "
             "polar=SpaDec + LoRA (3D M-RoPE unchanged + log-spherical XYZ RoPE in pass-through, θ=1000); "
             "decouple=SpaDec + LoRA (3D M-RoPE unchanged + Cartesian XYZ RoPE in pass-through, θ=10000); "
-            "rotation=SPA LoRA + 4D M-RoPE + CameraTokenRotationEncoder (canonical R) + coord head; "
-            "rotation_rl=same as rotation but for RL-trained ckpts (rotation_enc has head_cls/head_res); "
             "atten=Qwen3.5 + LoRA + per-layer SpatialAttentionBias on V↔V (3D M-RoPE unchanged; matches train_atten.py); "
             "both=baseline + coordinate."
         ),
@@ -2199,7 +1942,7 @@ def main() -> None:
              "region under --method polar / decouple. Each axis (x/y/z) gets "
              "xyz_rope_dim/6 frequency bands. Must be a positive multiple of 6 ≤ 192. "
              "MUST match the value used during training (default 66). "
-             "No effect for --method baseline / vanilla / position_embedding / coordinate / rotation*.",
+             "No effect for --method baseline / vanilla / position_embedding / coordinate.",
     )
 
     # ── output ────────────────────────────────────────────────────────────────
@@ -2355,8 +2098,6 @@ def main() -> None:
         "coordinate":         args.method in ("coordinate", "both"),
         "polar":              args.method == "polar",
         "decouple":           args.method == "decouple",
-        "rotation":           args.method == "rotation",
-        "rotation_rl":        args.method == "rotation_rl",
         "atten":              args.method == "atten",
     }
     # SAFETY CHECK #3: merged sample count must match the dataset size.
@@ -2385,8 +2126,6 @@ def main() -> None:
         "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + coord head, no_cam, Cartesian)",
         "polar":              "polar              (SpaDec + log-spherical XYZ RoPE, θ=1000)",
         "decouple":           "decouple           (SpaDec + Cartesian XYZ RoPE, θ=10000)",
-        "rotation":           "rotation           (SPA LoRA + 4D M-RoPE + rotation_enc + coord head)",
-        "rotation_rl":        "rotation_rl        (SPA LoRA + 4D M-RoPE + rotation_enc_rl + coord head)",
     }
     _metrics_fn = compute_metrics_robospatial if args.dataset == "robospatial" else compute_metrics
     for mname, mresults in all_results.items():
@@ -2408,8 +2147,6 @@ def main() -> None:
         ("baseline", "coordinate"),
         ("baseline", "polar"),
         ("baseline", "decouple"),
-        ("baseline", "rotation"),
-        ("baseline", "rotation_rl"),
         ("baseline", "position_embedding"),
         ("baseline", "vanilla"),
     ]

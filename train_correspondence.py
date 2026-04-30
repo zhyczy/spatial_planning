@@ -59,10 +59,8 @@ from src.models import (
 )
 from src.dataset import (
     MindCube_Train_Dataset,
-    SAT_Train_Dataset,
     Eval_Dataset_Coord,
 )
-from torch.utils.data import ConcatDataset
 
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
@@ -363,65 +361,19 @@ def train(args: argparse.Namespace) -> None:
         _model = model
 
     # ── dataset / loader ──────────────────────────────────────────────────────
-    # --datasets controls which sources are concatenated. Default: mindcube only.
-    # Each source uses its own (json_path, results_dir) pair from CLI args.
-    _ds_classes = {
-        "mindcube": MindCube_Train_Dataset,
-        "sat":      SAT_Train_Dataset,
-    }
-    _ds_paths = {
-        "mindcube": (args.json_path,     args.mindcube_results_dir),
-        "sat":      (args.sat_json_path, args.sat_results_dir),
-    }
-
-    # Two-phase build: construct MindCube first (so we can use its size as the
-    # SAT down-sample target when both sources are mixed), then construct SAT
-    # with category-balanced sub-sampling. Single-source runs skip balancing.
-    _is_mixed = (len(args.datasets) > 1)
-    _built: dict[str, "torch.utils.data.Dataset"] = {}
-    _build_order = sorted(
-        args.datasets, key=lambda n: 0 if n == "mindcube" else 1
+    rank0_print(
+        f"Loading MindCube_Train_Dataset from {args.json_path} "
+        f"(results: {args.mindcube_results_dir})"
     )
-    for _name in _build_order:
-        if _name not in _ds_paths:
-            raise ValueError(f"Unknown dataset '{_name}'. Choices: mindcube, sat.")
-        _cls     = _ds_classes[_name]
-        _jp, _rd = _ds_paths[_name]
-        rank0_print(f"Loading {_cls.__name__} from {_jp} (results: {_rd})")
-        # SAT classes use json_path (JSON list); MindCube classes use jsonl_path.
-        _path_kw = "json_path" if _name == "sat" else "jsonl_path"
-        _kwargs: dict = dict(
-            results_dir        = _rd,
-            processor          = processor,
-            log                = log,
-            max_images         = args.max_images,
-            spatial_merge_size = spatial_merge_size,
-            max_samples        = args.max_samples,
-        )
-        _kwargs[_path_kw] = _jp
-
-        # Mixed (MindCube + SAT): per-category balanced down-sample of SAT to
-        # MindCube's size (~10k → ~1.67k per question_type × 6 cats).
-        if _name == "sat" and _is_mixed and "mindcube" in _built:
-            _kwargs["balanced_categories"] = True
-            _kwargs["target_size"]         = len(_built["mindcube"])
-            _kwargs["balance_seed"]        = 0
-
-        _built[_name] = _cls(**_kwargs)
-
-    # Preserve the user-facing dataset order (args.datasets) for the concat.
-    _per_dataset_loaders = [_built[n] for n in args.datasets]
-
-    if len(_per_dataset_loaders) == 1:
-        train_dataset = _per_dataset_loaders[0]
-    else:
-        train_dataset = ConcatDataset(_per_dataset_loaders)
-        _per_ds_sizes = {n: len(_built[n]) for n in args.datasets}
-        rank0_print(
-            f"ConcatDataset: {len(train_dataset)} total samples across "
-            f"{len(_per_dataset_loaders)} datasets {args.datasets} "
-            f"(per-dataset sizes: {_per_ds_sizes})"
-        )
+    train_dataset = MindCube_Train_Dataset(
+        jsonl_path         = args.json_path,
+        results_dir        = args.mindcube_results_dir,
+        processor          = processor,
+        log                = log,
+        max_images         = args.max_images,
+        spatial_merge_size = spatial_merge_size,
+        max_samples        = args.max_samples,
+    )
 
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
@@ -811,25 +763,6 @@ def parse_args() -> argparse.Namespace:
         "--mindcube_results_dir",
         default=os.path.join(_ROOT, "datasets/train/MindCube/3d_results"),
         help="Directory containing per-sample 3d_results folders for MindCube training",
-    )
-    p.add_argument(
-        "--sat_json_path",
-        default=os.path.join(_ROOT, "datasets/train/SAT/train_36k.json"),
-        help="Path to SAT training JSON list (only used when 'sat' in --datasets)",
-    )
-    p.add_argument(
-        "--sat_results_dir",
-        default=os.path.join(_ROOT, "datasets/train/SAT/3d_results"),
-        help="Directory containing per-sample 3d_results folders for SAT training",
-    )
-    p.add_argument(
-        "--datasets",
-        nargs="+", default=["mindcube"], choices=["mindcube", "sat"],
-        help="Which training datasets to concatenate (one or more). "
-             "Default: mindcube only. Example: --datasets mindcube sat "
-             "→ ConcatDataset of MindCube_train.jsonl + SAT/train_36k.json. "
-             "Each dataset's loader uses its own --{name}_json_path/--{name}_results_dir "
-             "(or --json_path/--mindcube_results_dir for mindcube).",
     )
     p.add_argument(
         "--output_dir",

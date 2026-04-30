@@ -1,89 +1,44 @@
+"""Eval datasets for Qwen3.5-VL.
+
+Eval_Dataset_Coord mirrors MindCube_Train_Dataset_Coord — both run each
+loaded view through `_qwen_align_view` (PIL LANCZOS for image, bilinear for
+pts3d, nearest for mask) before the Qwen processor and resize_xyz. This
+keeps train and per-epoch eval on the same pixel/geometry grid.
+
+The autoregressive generation eval (`evaluation.py`) loads images directly
+from `load_testing_dataset` paths — it must call `_qwen_align_view` itself
+on each PIL image so test images go through the same LANCZOS path as
+training (Qwen's image_processor uses BICUBIC internally, so skipping the
+pre-align would route test images through a different interpolation kernel
+than training).
+"""
+
 import json
 import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .train_dataset import resize_xyz
-
-
-class Eval_Dataset(Dataset):
-    """Wraps raw eval samples into a PyTorch Dataset that produces
-    processor-encoded batches with LM labels for computing eval loss.
-
-    Each sample is a dict with keys: image (list of paths), question, answer.
-    """
-
-    def __init__(self, samples: List[Dict[str, Any]], processor):
-        self.samples = samples
-        self.processor = processor
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        image_paths = sample["image"]
-        question = sample["question"]
-        answer = sample["answer"]
-
-        # Load images
-        images = []
-        content = []
-        for p in image_paths:
-            images.append(Image.open(p).convert("RGB"))
-            content.append({"type": "image", "image": p})
-        content.append({"type": "text", "text": question})
-
-        # Full conversation with assistant answer (for computing LM loss).
-        # New format: wrap bare letter with <answer>X</answer> + disable
-        # thinking, mirroring train datasets.
-        from .answer_format import format_answer, IM_END_NEWLINE
-        formatted_answer = format_answer(answer)
-        text_full = self.processor.apply_chat_template(
-            [{"role": "user", "content": content},
-             {"role": "assistant", "content": formatted_answer}],
-            tokenize=False, add_generation_prompt=False,
-            enable_thinking=False,
-        )
-        proc_out = self.processor(
-            text=[text_full], images=images,
-            return_tensors="pt", padding=False,
-        )
-
-        # Build labels: mask everything except the <answer>X</answer><|im_end|>\n
-        # suffix.
-        suffix_ids = self.processor.tokenizer(
-            formatted_answer + IM_END_NEWLINE, add_special_tokens=False
-        )["input_ids"]
-        suffix_len = len(suffix_ids)
-        labels = proc_out["input_ids"].clone()
-        labels[0, :-suffix_len] = -100
-
-        return {
-            **proc_out,
-            "labels": labels,
-        }
+from .train_dataset_qwen35 import _load_and_align_views, resize_xyz
 
 
 class Eval_Dataset_Coord(Dataset):
     """
-    MindCube evaluation dataset in the same prompt format as MindCube_Train_Dataset_Coord.
+    MindCube evaluation dataset in the same prompt format as
+    MindCube_Train_Dataset_Coord.
 
-    Produces batches with:
-      - QA supervision labels
-      - image_xyz, image_xyz_hires for coord-head loss computation
+    Produces batches with QA-supervision labels and image_xyz / image_xyz_hires
+    for coord-head loss computation. The coord head reads LM hidden states at
+    the <|image_pad|> vision-token positions directly; no dedicated per-patch
+    text token is inserted.
 
-    The coord head reads LM hidden states at the <|image_pad|> vision-token
-    positions directly; no dedicated per-patch text token is inserted.
-
-    This lets the eval loop call model() directly and log all losses
-    (lm_loss, coord_loss).
+    Each loaded view is Qwen-aligned (smart_resize-rounded) before the
+    processor + resize_xyz run, so pts3d patches and Qwen vision tokens cover
+    the same scene region pixel-for-pixel.
     """
 
     def __init__(
@@ -134,25 +89,9 @@ class Eval_Dataset_Coord(Dataset):
     def __getitem__(self, idx):
         entry, sample_dir = self.samples[idx]
 
-        # ── load images, per-pixel xyz ───────────────────────────────────────
-        view_dirs = sorted(d for d in os.listdir(sample_dir) if d.startswith("view_"))
-        images, xyz_raw_list, mask_raw_list = [], [], []
-        for vd in view_dirs[: self.max_images]:
-            img_path = os.path.join(sample_dir, vd, "image.png")
-            try:
-                images.append(Image.open(img_path).convert("RGB"))
-            except (FileNotFoundError, OSError):
-                break
-            pts3d_path = os.path.join(sample_dir, vd, "pts3d.npy")
-            mask_path  = os.path.join(sample_dir, vd, "mask.npy")
-            xyz_raw_list.append(
-                np.load(pts3d_path).astype(np.float32)
-                if os.path.exists(pts3d_path) else None
-            )
-            mask_raw_list.append(
-                np.load(mask_path) if os.path.exists(mask_path) else None
-            )
-
+        images, xyz_raw_list, mask_raw_list, _ = _load_and_align_views(
+            sample_dir, self.max_images,
+        )
         N = len(images)
 
         # ── build prompt (images + QA) ───────────────────────────────────────
@@ -167,10 +106,6 @@ class Eval_Dataset_Coord(Dataset):
 
         content.append({"type": "text", "text": _question})
 
-        # Same <answer>X</answer> format and `enable_thinking=False` as
-        # MindCube_Train_Dataset_Coord — training/eval must use identical
-        # chat template flags so the first supervised token aligns across
-        # the two and the eval-time TF metric is comparable.
         from .answer_format import format_answer, IM_END_NEWLINE
         formatted_answer = format_answer(_answer)
         text_full = self.processor.apply_chat_template(
@@ -379,7 +314,6 @@ def load_testing_dataset(
             if not img_path.exists():
                 img_b64 = item.get("image", "")
                 img_bytes = base64.b64decode(img_b64)
-                # Some entries are PNG, some JPEG — let PIL re-save consistently
                 Image.open(io.BytesIO(img_bytes)).convert("RGB").save(img_path, "JPEG")
             options = item.get("answer_options", [])
             ans_idx = item.get("answer", -1)
@@ -437,11 +371,6 @@ def load_testing_dataset(
     elif dataset == "viewspatial":
         # ViewSpatial-Bench — perspective-taking benchmark on ScanNet+COCO.
         # JSON file: ViewSpatial-Bench.json with 5,712 entries.
-        # Keys: question_type, image_path (list, prefixed with "ViewSpatial-Bench/"),
-        #       question, answer ("<letter>. <text>"), choices ("A. ...\nB. ...").
-        # question_type splits cleanly into:
-        #   "Camera perspective - *"  → egocentric
-        #   "Person perspective - *"  → allocentric (perspective-taking)
         json_file = data_dir / "ViewSpatial-Bench.json"
         if not json_file.exists():
             raise FileNotFoundError(f"Dataset file not found: {json_file}")
@@ -450,8 +379,6 @@ def load_testing_dataset(
         if limit is not None:
             raw = raw[:limit]
         for idx, item in enumerate(raw):
-            # image_path entries are "ViewSpatial-Bench/<root>/..." — strip the
-            # leading "ViewSpatial-Bench/" so they resolve under data_dir.
             image_paths = []
             for p in item.get("image_path", []):
                 rel = p.split("/", 1)[1] if p.startswith("ViewSpatial-Bench/") else p
@@ -498,8 +425,6 @@ def load_testing_dataset(
         # RoboSpatial — robot spatial reasoning with embedded images.
         # Parquet files under data/ with columns: category, question, answer,
         # img (bytes dict), depth_image (bytes dict), mask (bytes dict or None).
-        # Images and masks are extracted to data_dir/images/ and data_dir/masks/ for caching.
-        # 3d_results/{category}_{idx}/ directories are used for precomputed XYZ maps.
         import io
         import pandas as pd
 
@@ -528,7 +453,6 @@ def load_testing_dataset(
             category = row.get("category", "unknown")
             sample_id = f"{category}_{idx}"
 
-            # Extract and cache image to disk
             img_data = row.get("img")
             if img_data is None:
                 continue
@@ -538,7 +462,6 @@ def load_testing_dataset(
                 img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 img.save(img_path, "JPEG")
 
-            # Extract and cache mask to disk (mask naming matches RoboSpatial-Eval convention)
             mask_rel_path = None
             mask_data = row.get("mask")
             if mask_data is not None:

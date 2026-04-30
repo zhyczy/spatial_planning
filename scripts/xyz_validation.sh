@@ -7,12 +7,12 @@
 # dataset, runs two passes on the same checkpoint:
 #   • PASS 1 — normal xyz   : image_xyz from <data_dir>/3d_results/<id>/
 #   • PASS 2 — image_xyz=0  : torch.zeros_like(...) before any consumer
-# Per-dataset Δaccuracy (and Δcoord_mae for coord/rotation methods) is the
+# Per-dataset Δaccuracy (and Δcoord_mae for coordinate method) is the
 # evidence: a near-zero delta means the xyz pathway is dead at inference.
 #
 # Usage:
 #   bash scripts/xyz_validation.sh \
-#       --method   {position_embedding|coordinate|polar|decouple|rotation|rotation_rl|atten} \
+#       --method   {position_embedding|coordinate|polar|decouple|atten} \
 #       --ckpt     <ckpt dir> \
 #       [--datasets "mindcube,sat_real,spinbench"]   # default: mindcube
 #       [--gpus 0,1,2,3]                              # default: all visible
@@ -28,10 +28,6 @@
 #   coordinate           — SPA LoRA + 4D M-RoPE + coord head (Cartesian readout)
 #   polar                — SpaDec + LoRA: log-spherical XYZ RoPE in pass-through, θ=1000
 #   decouple             — SpaDec + LoRA: Cartesian XYZ RoPE in pass-through, θ=10000
-#   rotation             — SPA + 4D M-RoPE + rotation_enc + coord head
-#                          (R derived from xyz; xyz rotated before RoPE/MAE)
-#   rotation_rl          — same as rotation, but for train_rl.py ckpts
-#                          (rotation_enc has head_cls/head_res; argmax+residual)
 #   atten                — Qwen3.5 + LoRA + per-layer SpatialAttentionBias on V↔V
 #                          (3D M-RoPE unchanged; matches train_atten.py)
 #
@@ -129,7 +125,7 @@ done
 # Validate arguments
 # =============================================================================
 
-VALID_METHODS="position_embedding coordinate polar decouple rotation rotation_rl atten"
+VALID_METHODS="position_embedding coordinate polar decouple atten"
 if [[ -z "$METHOD" ]]; then
     echo "[ERROR] --method is required (one of: $VALID_METHODS)" >&2
     exit 1

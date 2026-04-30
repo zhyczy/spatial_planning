@@ -37,10 +37,11 @@ results   = estimator.estimate(image_paths)
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -92,6 +93,127 @@ _LOCAL_CONFIG = {
     "config_json_path": str(_CHECKPOINT_DIR / "config.json"),
     "strict": False,
 }
+
+
+# ---------------------------------------------------------------------------
+# Qwen2-VL smart_resize alignment
+# ---------------------------------------------------------------------------
+# When pts3d is consumed at training time, the dataloader feeds the parquet
+# image through Qwen's processor, which calls smart_resize: each H, W is
+# rounded to a multiple of (patch_size × spatial_merge_size = 14 × 2 = 28),
+# bounded by [min_pixels, max_pixels] preserving aspect ratio. resize_xyz then
+# block-averages pts3d to the resulting LLM patch grid using integer stride.
+#
+# If pts3d is saved at parquet shape (Depth Pro behavior), its shape generally
+# differs from Qwen's smart_resize target. The integer-stride truncation in
+# resize_xyz then accumulates a per-patch offset that fully misaligns edge
+# patches with their Qwen vision tokens. To prevent that, _resample_to_qwen_
+# aligned() pre-resizes the Depth Pro outputs to exactly the smart_resize
+# target shape: pts3d shape on disk == Qwen-processed image shape.
+
+_QWEN_FACTOR = 28
+_QWEN_MIN_PIXELS = 56 * 56
+_QWEN_MAX_PIXELS = 14 * 14 * 4 * 1280  # = 1_003_520
+
+
+def _smart_resize_target(
+    H: int,
+    W: int,
+    factor: int = _QWEN_FACTOR,
+    min_pixels: int = _QWEN_MIN_PIXELS,
+    max_pixels: int = _QWEN_MAX_PIXELS,
+) -> Tuple[int, int]:
+    """Replicate Qwen2-VL's smart_resize target shape: round (H, W) to factor
+    multiples, bound area by [min_pixels, max_pixels] preserving aspect ratio.
+    Returns (H_bar, W_bar)."""
+    h_bar = round(H / factor) * factor
+    w_bar = round(W / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((H * W) / max_pixels)
+        h_bar = max(factor, math.floor(H / beta / factor) * factor)
+        w_bar = max(factor, math.floor(W / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (H * W))
+        h_bar = math.ceil(H * beta / factor) * factor
+        w_bar = math.ceil(W * beta / factor) * factor
+    return h_bar, w_bar
+
+
+def _resample_to_qwen_aligned(result: Dict) -> Dict:
+    """Resample a single Depth Pro result dict to Qwen smart_resize target.
+
+    Bilinear for pts3d / depth (continuous geometry); nearest for mask (binary);
+    LANCZOS for image (uint8 RGB); proportional scale for intrinsics.
+    No-op if (H, W) is already the smart_resize target shape.
+    """
+    import PIL.Image
+
+    pts3d = result["pts3d"]
+    H, W = pts3d.shape[:2]
+    H_q, W_q = _smart_resize_target(H, W)
+    if (H_q, W_q) == (H, W):
+        return result
+
+    # pts3d: (H, W, 3) → (H_q, W_q, 3) bilinear
+    pts3d_t = torch.from_numpy(pts3d).permute(2, 0, 1).unsqueeze(0).float()
+    pts3d_q = (
+        torch.nn.functional.interpolate(
+            pts3d_t, size=(H_q, W_q), mode="bilinear", align_corners=False
+        )
+        .squeeze(0)
+        .permute(1, 2, 0)
+        .contiguous()
+        .numpy()
+        .astype(np.float32)
+    )
+
+    # depth: (H, W) → bilinear
+    depth_t = torch.from_numpy(result["depth"]).unsqueeze(0).unsqueeze(0).float()
+    depth_q = (
+        torch.nn.functional.interpolate(
+            depth_t, size=(H_q, W_q), mode="bilinear", align_corners=False
+        )
+        .squeeze()
+        .numpy()
+        .astype(np.float32)
+    )
+
+    # mask: nearest (preserve binary)
+    mask_t = (
+        torch.from_numpy(result["mask"].astype(np.uint8))
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .float()
+    )
+    mask_q = (
+        torch.nn.functional.interpolate(mask_t, size=(H_q, W_q), mode="nearest")
+        .squeeze()
+        .numpy()
+        .astype(bool)
+    )
+
+    # image: PIL LANCZOS resize (W, H order)
+    pil_img = PIL.Image.fromarray(result["image"])
+    image_q = np.array(
+        pil_img.resize((W_q, H_q), resample=PIL.Image.LANCZOS), dtype=np.uint8
+    )
+
+    # intrinsics: scale fx, fy, cx, cy by per-axis ratio
+    K = result["intrinsics"].copy()
+    sx, sy = W_q / W, H_q / H
+    K[0, 0] *= sx
+    K[1, 1] *= sy
+    K[0, 2] *= sx
+    K[1, 2] *= sy
+
+    return {
+        "pts3d":       pts3d_q,
+        "depth":       depth_q,
+        "camera_pose": result["camera_pose"],
+        "intrinsics":  K,
+        "mask":        mask_q,
+        "image":       image_q,
+    }
 
 
 class CoordEstimator:
@@ -161,6 +283,7 @@ class CoordEstimator:
         save_dir: Optional[Union[str, Path]] = None,
         run_name: Optional[str] = None,
         visualize: bool = False,
+        qwen_align: bool = False,
     ) -> List[Dict]:
         """Estimate per-pixel 3-D coordinates and camera parameters.
 
@@ -177,6 +300,13 @@ class CoordEstimator:
         run_name:
             Sub-folder name inside *save_dir*.  Defaults to the basename of the
             image folder (for folder inputs) or ``"run"`` otherwise.
+        qwen_align:
+            If False (default), keep the reconstruction model's native output
+            shape (MapAnything: 518-bounded /14 multiples; Depth Pro: parquet-
+            native). The dataloader handles Qwen smart_resize alignment at
+            load time, so the same outputs can feed downstream models with
+            different patch grids. Set True to resample each view to the Qwen
+            smart_resize target shape (H, W rounded to /28) at estimate time.
 
         Returns
         -------
@@ -200,10 +330,10 @@ class CoordEstimator:
                 img = np.array(PILImage.open(img).convert("RGB"), dtype=np.uint8)
             elif run_name is None:
                 run_name = "run"
-            results = self._estimate_single_view(img)
+            results = self._estimate_single_view(img, qwen_align=qwen_align)
         else:
             # multi-view: original MapAnything path
-            results = self._estimate_multi_view(images, run_name)
+            results = self._estimate_multi_view(images, run_name, qwen_align=qwen_align)
             if run_name is None:
                 run_name = "run"
 
@@ -222,8 +352,14 @@ class CoordEstimator:
     # Single-view path: Depth Pro
     # ------------------------------------------------------------------
 
-    def _estimate_single_view(self, image_np: np.ndarray) -> List[Dict]:
+    def _estimate_single_view(self, image_np: np.ndarray, qwen_align: bool = False) -> List[Dict]:
         """Use Depth Pro to estimate per-pixel 3-D coords for one image.
+
+        Step A (find_closest_aspect_ratio + crop_resize_if_necessary) is applied
+        here so single-view outputs land on the same RESOLUTION_MAPPINGS[518]
+        pool as the multi-view path. This unifies pts3d shape distribution
+        across all callers (training iterator, eval iterator) without each
+        iterator having to know about MapAnything's contract.
 
         Parameters
         ----------
@@ -235,10 +371,21 @@ class CoordEstimator:
         """
         import PIL.Image
         import depth_pro
+        from mapanything.utils.image import find_closest_aspect_ratio
+        from mapanything.utils.cropping import crop_resize_if_necessary
 
         self._load_depth_pro()
 
-        pil_img = PIL.Image.fromarray(image_np).convert("RGB")
+        # Step A: rescale to the closest MapAny shape (one of 10 entries in
+        # RESOLUTION_MAPPINGS[518]) so single-view shape distribution matches
+        # multi-view. image_np is updated so the saved image.png matches pts3d.
+        h_in, w_in = image_np.shape[:2]
+        target_w, target_h = find_closest_aspect_ratio(w_in / h_in, resolution_set=518)
+        pil_img = crop_resize_if_necessary(
+            PIL.Image.fromarray(image_np).convert("RGB"),
+            resolution=(target_w, target_h),
+        )[0]
+        image_np = np.array(pil_img, dtype=np.uint8)
         W, H = pil_img.size
 
         # Preprocess and run inference
@@ -284,14 +431,20 @@ class CoordEstimator:
         # Valid mask: positive finite depth
         mask = np.isfinite(depth_np) & (depth_np > 0)
 
-        return [{
+        # When qwen_align=True (default), resample to Qwen smart_resize target
+        # shape so pts3d shape matches what the dataloader's Qwen processor
+        # produces on the same image (eliminates resize_xyz integer-stride
+        # drift at the LLM patch grid). When qwen_align=False, keep model-
+        # native shape and let the dataloader handle alignment.
+        result = {
             "pts3d":       pts3d.astype(np.float32),
             "depth":       depth_np.astype(np.float32),
             "camera_pose": camera_pose,
             "intrinsics":  K,
             "mask":        mask,
             "image":       image_np,
-        }]
+        }
+        return [_resample_to_qwen_aligned(result) if qwen_align else result]
 
     # ------------------------------------------------------------------
     # Multi-view path: MapAnything (original logic)
@@ -301,6 +454,7 @@ class CoordEstimator:
         self,
         images: Union[str, List[str], List[np.ndarray]],
         run_name: Optional[str],
+        qwen_align: bool = False,
     ) -> List[Dict]:
         from mapanything.utils.geometry import depthmap_to_world_frame
         from mapanything.utils.image import load_images
@@ -344,14 +498,17 @@ class CoordEstimator:
             if image_np.dtype != np.uint8:
                 image_np = (image_np * 255).clip(0, 255).astype(np.uint8)
 
-            results.append({
+            view_result = {
                 "pts3d":       pts3d_t.cpu().numpy().astype(np.float32),
                 "depth":       depthmap_t.cpu().numpy().astype(np.float32),
                 "camera_pose": camera_pose_t.cpu().numpy().astype(np.float32),
                 "intrinsics":  intrinsics_t.cpu().numpy().astype(np.float32),
                 "mask":        combined_mask,
                 "image":       image_np,
-            })
+            }
+            results.append(
+                _resample_to_qwen_aligned(view_result) if qwen_align else view_result
+            )
 
         return results
 
@@ -407,6 +564,7 @@ def save_results(
     results: List[Dict],
     save_dir: Union[str, Path] = _RESULTS_DIR,
     run_name: Optional[str] = "run",
+    save_image: bool = True,
 ) -> Path:
     """Persist estimation results to *save_dir / run_name/*.
 
@@ -420,7 +578,7 @@ def save_results(
         │   ├── camera_pose.npy    # (4, 4)    float32 — cam-to-world matrix
         │   ├── intrinsics.npy     # (3, 3)    float32 — pinhole K matrix
         │   ├── mask.npy           # (H, W)    bool    — valid pixel mask
-        │   └── image.png          # original image
+        │   └── image.png          # original image (omitted if save_image=False)
         ├── view_0001/
         │   └── ...
         └── cameras.json           # all poses + intrinsics in one JSON file
@@ -444,7 +602,8 @@ def save_results(
         np.save(view_dir / "intrinsics.npy",   r["intrinsics"])
         np.save(view_dir / "mask.npy",         r["mask"])
 
-        PIL.Image.fromarray(r["image"]).save(view_dir / "image.png")
+        if save_image:
+            PIL.Image.fromarray(r["image"]).save(view_dir / "image.png")
 
         cameras_meta.append({
             "view":        idx,
