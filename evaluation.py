@@ -100,6 +100,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.multiprocessing as mp
+from PIL import Image
 from tqdm import tqdm
 
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
@@ -132,19 +133,33 @@ QUESTION_TEMPLATE = "{Question}"
 # ── RoboSpatial: open-ended, no multiple-choice letter ───────────────────────
 ROBOSPATIAL_SYSTEM_PROMPT = "You are a spatial reasoning expert helping with robot navigation tasks."
 
-# ── Non-thinking mode: answer first, then reasoning ──────────────────────────
+# ── Non-thinking mode: answer ONLY, no reasoning ─────────────────────────────
+# Direct-answer prompts: model emits just `<answer>X</answer>`. The constants
+# below are CONTENT only — the chat template wraps them with
+# `<|im_start|>system\n...<|im_end|>\n`.
+
+# MCQ ("select" format_type — letter answer)
 ANSWER_INSTRUCTION = (
-    "First output your answer as <answer>X</answer> where X is the option letter, "
-    "then explain your reasoning."
+    "Output your answer strictly as <answer>X</answer> where X is the option letter."
 )
 EVAL_SYSTEM_PROMPT = (
-    "You are a spatial reasoning expert. "
-    "IMPORTANT: Begin your response by outputting your answer in the format "
-    "<answer>X</answer> where X is the option letter (e.g. <answer>A</answer>). "
-    "Then provide your step-by-step reasoning."
+    "You are a spatial reasoning expert. You must answer the question directly. "
+    "Output your final answer strictly in the format <answer>X</answer> "
+    "where X is the option letter."
+)
+
+# Fill ("fill" format_type — numeric answer, e.g. depth in metres)
+ANSWER_INSTRUCTION_FILL = (
+    "Output your answer strictly as <answer>X</answer> where X is the numeric value."
+)
+EVAL_SYSTEM_PROMPT_FILL = (
+    "You are a spatial reasoning expert. You must answer the question directly. "
+    "Output your final answer strictly in the format <answer>X</answer> "
+    "where X is the numeric value."
 )
 
 # ── Thinking mode: model reasons first, then outputs answer ──────────────────
+# MCQ
 ANSWER_INSTRUCTION_THINKING = (
     "After your reasoning, output your final answer as <answer>X</answer> "
     "where X is the option letter (e.g. <answer>A</answer>)."
@@ -156,37 +171,81 @@ EVAL_SYSTEM_PROMPT_THINKING = (
     "<answer>X</answer> where X is the option letter (e.g. <answer>A</answer>)."
 )
 
+# Fill
+ANSWER_INSTRUCTION_THINKING_FILL = (
+    "After your reasoning, output your final answer as <answer>X</answer> "
+    "where X is the numeric value (e.g. <answer>2.5</answer>)."
+)
+EVAL_SYSTEM_PROMPT_THINKING_FILL = (
+    "You are a spatial reasoning expert. "
+    "Think step by step about the question. "
+    "After your reasoning, output your final answer in the format "
+    "<answer>X</answer> where X is the numeric value (e.g. <answer>2.5</answer>)."
+)
+
 
 # ===========================================================================
 # Answer extraction
 # ===========================================================================
 
-def extract_answer_letter(text: str) -> str:
-    """Extract the multiple-choice letter from a `<answer>X</answer>` tag.
+_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 
-    Single contract — matches the training-time supervision format set in
-    MindCube_Train_Dataset / MindCube_Train_Dataset_Coord / Eval_Dataset_Coord
-    (assistant turn = `<answer>{letter}</answer>`). Returns "" if the tag is
-    missing or malformed; no fragile fallbacks. See
-    md/bug_fix/train_eval_paradigm_mismatch.md.
+
+def extract_answer_content(text: str) -> str:
+    """Return the raw inner content of the *last* ``<answer>...</answer>`` tag.
+
+    Multi-line content is preserved (DOTALL). Used for free-form VST-style
+    outputs (captions, metric explanations, "C. left and forward").
+    Returns "" if no tag is present.
     """
     if not text or not isinstance(text, str):
         return ""
-    m = re.search(r"<answer>\s*([A-Za-z])\s*</answer>", text, re.IGNORECASE)
+    matches = _ANSWER_TAG_RE.findall(text)
+    return matches[-1].strip() if matches else ""
+
+
+def extract_answer_letter(text: str) -> str:
+    """Extract the multiple-choice letter from a `<answer>...</answer>` tag.
+
+    Accepts both strict (`<answer>X</answer>`, MindCube training format) and
+    VST-trained richer variants (`<answer>X. option text</answer>`). The
+    leading letter inside the tag is returned if followed by a delimiter
+    (`.` / `)` / whitespace / end-of-content). Returns "" if no tag matches
+    or the content lacks a leading letter.
+
+    A model SFT'd on both MindCube + VST occasionally bleeds VST style onto
+    MCQ benchmarks, so we extract from inside the tag rather than reject
+    non-whitespace-padded content. See md/bug_fix/train_eval_paradigm_mismatch.md.
+    """
+    content = extract_answer_content(text)
+    if not content:
+        return ""
+    m = re.match(r"\s*([A-Za-z])(?:\s|[.)]|$)", content)
     if m:
         return m.group(1).upper()
     return ""
 
 
+_NUMBER_RE = re.compile(r"(?<![A-Za-z\d])[-+]?\d+(?:\.\d+)?")
+# Lookbehind `(?<![A-Za-z\d])` prevents a `-` glued onto a word (e.g.
+# `point-2`) from being read as a sign. `point-2` → 2, `-2.5cm` → -2.5,
+# `=0.7m` → 0.7.
+
+
 def extract_answer_number(text: str) -> str:
-    """Extract a numeric answer from <answer>...</answer> tags (for fill-format)."""
-    if not text or not isinstance(text, str):
-        return ""
-    m = re.search(r"<answer>\s*([-+]?\d+(?:\.\d+)?)\s*</answer>", text, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    # fallback: last standalone number in text
-    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
+    """Extract a numeric answer from `<answer>...</answer>` (fill-format).
+
+    Looks inside the tag first (matching VST si_measurement style "97 cm" or
+    "Distance[A,B]=0.7m" — picks the first numeric token), then falls back
+    to the last standalone number anywhere in the text if no tag is present.
+    """
+    content = extract_answer_content(text)
+    if content:
+        m = _NUMBER_RE.search(content)
+        if m:
+            return m.group(0)
+    # Fallback: last standalone number in untagged text
+    nums = _NUMBER_RE.findall(text or "")
     return nums[-1] if nums else ""
 
 
@@ -809,6 +868,12 @@ def load_precomputed_coords(item: Dict[str, Any]) -> Optional[List[Dict]]:
         pts3d       : np.ndarray (H, W, 3)
         camera_pose : np.ndarray (4, 4)
         mask        : np.ndarray (H, W) bool
+        image       : PIL.Image (H, W) — the per-view image.png saved by
+                      coord_esti.py at the SAME shape as pts3d. Eval feeds
+                      this (not the raw benchmark image) to the processor so
+                      pixel resolution == geometric resolution, matching
+                      training (_load_and_align_views in train_dataset_qwen35.py).
+                      None if image.png is missing.
     Returns None if the 3d_results directory for this sample does not exist.
     """
     data_dir = item.get("data_dir")
@@ -829,12 +894,14 @@ def load_precomputed_coords(item: Dict[str, Any]) -> Optional[List[Dict]]:
         pts3d_path = vd / "pts3d.npy"
         mask_path  = vd / "mask.npy"
         pose_path  = vd / "camera_pose.npy"
+        image_path = vd / "image.png"
         if not pts3d_path.exists():
             continue
         pts3d = np.load(str(pts3d_path))          # (H, W, 3)
         mask  = np.load(str(mask_path)).astype(bool) if mask_path.exists() else np.ones(pts3d.shape[:2], dtype=bool)
         pose  = np.load(str(pose_path)) if pose_path.exists() else np.eye(4, dtype=np.float64)
-        results.append({"pts3d": pts3d, "camera_pose": pose, "mask": mask})
+        image = Image.open(str(image_path)).convert("RGB") if image_path.exists() else None
+        results.append({"pts3d": pts3d, "camera_pose": pose, "mask": mask, "image": image})
 
     return results if results else None
 
@@ -894,7 +961,13 @@ def _build_user_message(item: Dict[str, Any], thinking: bool = False,
     if train_template or item.get("format_type") == "robospatial":
         text = QUESTION_TEMPLATE.format(Question=item["question"])
     else:
-        instruction = ANSWER_INSTRUCTION_THINKING if thinking else ANSWER_INSTRUCTION
+        is_fill = item.get("format_type") == "fill"
+        if thinking:
+            instruction = (ANSWER_INSTRUCTION_THINKING_FILL if is_fill
+                           else ANSWER_INSTRUCTION_THINKING)
+        else:
+            instruction = (ANSWER_INSTRUCTION_FILL if is_fill
+                           else ANSWER_INSTRUCTION)
         text = (
             f"{QUESTION_TEMPLATE.format(Question=item['question'])}\n"
             f"{instruction}"
@@ -913,10 +986,15 @@ def prepare_batch_baseline(
     prompts_text = []
     batch_messages = []
     for item in batch_data:
-        is_robospatial = item.get("format_type") == "robospatial"
-        sys_prompt = ROBOSPATIAL_SYSTEM_PROMPT if is_robospatial else (
-            EVAL_SYSTEM_PROMPT_THINKING if thinking else EVAL_SYSTEM_PROMPT
-        )
+        fmt = item.get("format_type")
+        is_robospatial = fmt == "robospatial"
+        is_fill        = fmt == "fill"
+        if is_robospatial:
+            sys_prompt = ROBOSPATIAL_SYSTEM_PROMPT
+        elif thinking:
+            sys_prompt = EVAL_SYSTEM_PROMPT_THINKING_FILL if is_fill else EVAL_SYSTEM_PROMPT_THINKING
+        else:
+            sys_prompt = EVAL_SYSTEM_PROMPT_FILL if is_fill else EVAL_SYSTEM_PROMPT
         msgs = [
             {"role": "system", "content": sys_prompt},
             _build_user_message(item, thinking=thinking),
@@ -1065,14 +1143,23 @@ def prepare_batch_spa(
         except Exception as exc:
             load_exc = exc
 
-    # Qwen-align each view (image + pts3d + mask). Image-only when pts3d is
-    # not available for a given view. Mirrors training preprocessing.
+    # Qwen-align each view (image + pts3d + mask). When 3d_results is
+    # available, swap the raw benchmark image for `view_XXXX/image.png` —
+    # coord_esti.py saved both pts3d and image.png at the same MapAny native
+    # shape, so pixel resolution == geometric resolution. Without this swap,
+    # the raw benchmark image (e.g. 968x1296) and pts3d (e.g. 392x518) have
+    # different shapes and _qwen_align_view's pixel-alignment assertion fires.
+    # This mirrors _load_and_align_views in train_dataset_qwen35.py exactly,
+    # so train and eval feed the model bit-equivalent (image, pts3d, mask)
+    # tuples. Image-only fallback (raw benchmark image) is used only when no
+    # pts3d is loaded for a view.
     if image_inputs:
         aligned_imgs: list = []
         for k, img in enumerate(image_inputs):
             r = coord_results[k] if (coord_results is not None and k < len(coord_results)) else None
             if r is not None:
-                img_q, pts_q, mask_q = _qwen_align_view(img, r["pts3d"], r["mask"])
+                src_img = r.get("image") or img
+                img_q, pts_q, mask_q = _qwen_align_view(src_img, r["pts3d"], r["mask"])
                 r["pts3d"] = pts_q
                 r["mask"]  = mask_q
             else:

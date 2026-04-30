@@ -107,7 +107,7 @@ from src.models import (
     patch_attention_layers_spatial,
 )
 from src.dataset import (
-    MindCube_Train_Dataset,
+    VST_Train_Dataset,
     Eval_Dataset_Coord,
 )
 
@@ -381,14 +381,14 @@ def train(args: argparse.Namespace) -> None:
     else:
         _model = model
 
-    # ── train dataset (MindCube only) ─────────────────────────────────────────
+    # ── train dataset (VST 500K) ──────────────────────────────────────────────
     rank0_print(
-        f"Loading MindCube_Train_Dataset from {args.json_path} "
-        f"(results: {args.mindcube_results_dir})"
+        f"Loading VST_Train_Dataset from {args.json_path} "
+        f"(results: {args.vst_results_dir})"
     )
-    train_dataset = MindCube_Train_Dataset(
-        jsonl_path         = args.json_path,
-        results_dir        = args.mindcube_results_dir,
+    train_dataset = VST_Train_Dataset(
+        json_path          = args.json_path,
+        results_dir        = args.vst_results_dir,
         processor          = processor,
         log                = log,
         max_images         = args.max_images,
@@ -673,9 +673,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model_path",
                    default=os.path.join(_ROOT, "checkpoints/Qwen3.5-4B"))
     p.add_argument("--json_path",
-                   default=os.path.join(_ROOT, "datasets/train/MindCube/MindCube_train.jsonl"))
-    p.add_argument("--mindcube_results_dir",
-                   default=os.path.join(_ROOT, "datasets/train/MindCube/3d_results"))
+                   default=os.path.join(_ROOT, "datasets/train/VST_parsed/vst_500k.json"),
+                   help="VST entries JSON (e.g. vst_500k.json).")
+    p.add_argument("--vst_results_dir",
+                   default=os.path.join(_ROOT, "datasets/train/VST/3d_results"),
+                   help="Root of VST 3d_results tree (subdirs per task family).")
     p.add_argument("--output_dir",
                    default=os.path.join(_ROOT, "train_records/spatial_attn"))
     p.add_argument("--epochs",      type=int,   default=3)

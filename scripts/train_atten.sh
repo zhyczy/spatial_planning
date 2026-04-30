@@ -4,7 +4,8 @@
 #
 # LoRA + per-layer SpatialAttentionBias fine-tuning of stock
 # Qwen3_5ForConditionalGeneration (with .model swapped to SpatialAttnVanillaModel)
-# on MindCube. LM answer loss only — no contrast / match heads.
+# on VST 500K (vst_500k.json, 563,190 entries → 551,013 unique ids in
+# 3d_results). LM answer loss only — no contrast / match heads.
 #
 # Mode is fixed: Qwen3.5 ORIGINAL 3D M-RoPE [11,11,10] (UNCHANGED) +
 # per-layer 2-layer geometric MLP that produces a per-head additive bias on
@@ -65,26 +66,26 @@ fi
 # ── hyperparameters ─────────────────────────────────────────────────────────
 
 MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
-JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
-MINDCUBE_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
+JSON_PATH="$SPATIAL_DIR/datasets/train/VST_parsed/vst_500k.json"
+VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/VST/3d_results"
 
-EPOCHS=6
+EPOCHS=1
 LR=2e-4
 LORA_RANK=16
-MAX_IMAGES=4
+MAX_IMAGES=8
 GRAD_ACCUM=8
 NUM_WORKERS=4
 
-SAVE_STEPS=50
-EVAL_STEPS=50
+SAVE_STEPS=500
+EVAL_STEPS=100
 
 WANDB_PROJECT="spc"
 WANDB_ENTITY="actmrv"
 
 # ── run name ────────────────────────────────────────────────────────────────
 
-RUN_NAME="atten_mindcube"
-WANDB_RUN_NAME="atten_mindcube_r${LORA_RANK}_ep${EPOCHS}"
+RUN_NAME="atten_vst"
+WANDB_RUN_NAME="atten_vst_r${LORA_RANK}_ep${EPOCHS}"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 # ── setup ───────────────────────────────────────────────────────────────────
@@ -96,7 +97,7 @@ echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
-echo "[INFO] Dataset              : MindCube"
+echo "[INFO] Dataset              : VST 500K"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Mode                 : SpatialAttn (3D M-RoPE UNCHANGED + per-layer geometric MLP bias)"
 echo "[INFO] Loss                 : LM answer CE only"
@@ -117,7 +118,7 @@ $TORCHRUN \
     train_atten.py \
     --model_path             "$MODEL_PATH"             \
     --json_path              "$JSON_PATH"              \
-    --mindcube_results_dir   "$MINDCUBE_RESULTS_DIR"   \
+    --vst_results_dir        "$VST_RESULTS_DIR"        \
     --output_dir             "$OUTPUT_DIR"             \
     --epochs                 "$EPOCHS"                 \
     --lr                     "$LR"                     \

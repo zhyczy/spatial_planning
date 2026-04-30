@@ -1,13 +1,14 @@
 # Train / Eval / Deploy Alignment Contract
 
-**Date:** 2026-04-28
+**Date:** 2026-04-30 (updated; original draft 2026-04-28)
 **Scope:** All 5 training methods (`atten`, `correspondence`, `coordinate`,
-`alternate`, `rl`) and the offline evaluator (`evaluation.py`).
+`alternate`, `rl`), the VST SFT auxiliary track, and the offline evaluator
+(`evaluation.py`).
 
 Cross-references:
 - Postmortem motivating this unification: [../bug_fix/train_eval_paradigm_mismatch.md](../bug_fix/train_eval_paradigm_mismatch.md)
-- Dataset inventory: [train_datasets.md §0](train_datasets.md#0-unified-assistant-turn-format-2026-04-28),
-  [eval_datasets.md §0.1](eval_datasets.md#01-unified-answer-format-contract-2026-04-28)
+- VST Q&A category breakdown: [../dataset/vst.md](../dataset/vst.md)
+- Train/eval input template comparison + zero-shot baseline prompts: [input_template.md](input_template.md)
 - Format helper: [../../src/dataset/answer_format.py](../../src/dataset/answer_format.py)
 - Leak regression test: [../../tests/test_atten_no_leak.py](../../tests/test_atten_no_leak.py)
 
@@ -16,20 +17,22 @@ Cross-references:
 ## 0. TL;DR
 
 Every training method, training-time eval, and deploy-time eval shares **one**
-assistant-turn template, **one** label-mask scheme, **one** lm_loss formula,
-and **one** letter-prediction position. The five methods only differ in the
-auxiliary spatial signal (xyz / coord / rotation / attention bias) — the
-LM head and the answer-letter pathway are identical across all of them.
+assistant-turn template family (`<answer>...</answer>`), **one** label-mask
+scheme (suffix-only supervision per turn), and **one** extractor pipeline.
+The five methods only differ in the auxiliary spatial signal (xyz / coord /
+rotation / attention bias) — the LM head and the answer-extraction pathway
+are identical across all of them.
 
-| Layer | Constant across all 5 methods |
+| Layer | Constant across all methods |
 |---|---|
-| Assistant content | `<answer>{letter}</answer>` (`format_answer`) |
+| Assistant content | `<answer>{content}</answer>` (`format_answer` for MCQ; raw GPT response for VST) |
 | Chat template flag | `enable_thinking=False` |
-| Suffix tokens (Qwen3.5-VL) | `[<, answer, >X, </, answer, >, <\|im_end\|>, \n]` (8) |
-| Label mask | `labels[:, :-8] = -100` |
+| MCQ suffix tokens (Qwen3.5-VL) | `[<, answer, >X, </, answer, >, <\|im_end\|>, \n]` (8) |
+| MCQ label mask | `labels[:, :-8] = -100` |
 | Letter token offset (in masked subset) | **2** (BPE merges `>X`) |
 | lm_loss formula | `F.cross_entropy(shift_logits[masked], shift_labels[masked])` |
 | Letter-acc formula | `argmax(shift_logits[ans_start + LETTER_OFFSET - 1]) == letter_id` |
+| Multi-turn (VST `si_measurement`) | one `<answer>...</answer>` block unmasked **per turn** |
 
 ---
 
@@ -42,7 +45,7 @@ methods follow the same shape; per-method differences are listed in §5.
 
 #### 1.1.1 Prompt template (built by the dataset class)
 
-`MindCube_Train_Dataset.__getitem__` ([train_dataset.py:240-258](../../src/dataset/train_dataset.py#L240-L258))
+`MindCube_Train_Dataset.__getitem__` ([train_dataset_qwen35.py](../../src/dataset/train_dataset_qwen35.py))
 wraps the bare letter from the JSONL into the standard format:
 
 ```python
@@ -121,7 +124,7 @@ positions** (the entire `<answer>{letter}</answer><|im_end|>\n` block).
 
 #### 1.2.1 Prompt template (eval dataset)
 
-`Eval_Dataset_Coord.__getitem__` ([eval_dataset.py:166-186](../../src/dataset/eval_dataset.py#L166-L186))
+`Eval_Dataset_Coord.__getitem__` ([eval_dataset_qwen35.py](../../src/dataset/eval_dataset_qwen35.py))
 uses **the same** `format_answer` + `enable_thinking=False` + 8-token
 suffix mask as training:
 
@@ -270,6 +273,38 @@ extend the loss mask to cover the reasoning tokens, and (c) flip
 `enable_thinking=True` everywhere. The current pipeline assumes no
 reasoning supervision is available, so the think block stays empty.
 
+### 1.4 VST extension (added 2026-04-30)
+
+`VST_Train_Dataset` / `VST_Train_Dataset_Coord` in
+[train_dataset_qwen35.py](../../src/dataset/train_dataset_qwen35.py) reuse the
+same `<answer>...</answer>` wrapper, with two modifications:
+
+1. **Free-form content inside the tag.** VST's GPT response is the raw
+   string from the parquet (e.g. `"C. left and forward"`, `"97 cm"`,
+   multi-line metric explanations) — no `format_answer(letter)` collapse.
+   Suffix length per turn varies; the dataset locates each
+   `<answer>{a}</answer><|im_end|>\n` token subsequence in the tokenized
+   chat and unmasks exactly those positions. Failure to locate raises
+   `RuntimeError` rather than silently dropping supervision.
+
+2. **Multi-turn supervision.** `si_measurement` rows hold 3 (Q, A) pairs
+   per sample (3 different objects in one image). `_vst_extract_qa_pairs`
+   returns the full list and `_vst_build_chat_with_labels` builds a
+   multi-turn chat: images attach to the first user turn only, subsequent
+   user turns are text-only, every assistant turn gets unmasked
+   independently.
+
+Tokenization mask is identical in spirit to §1.1.1 — `labels` start fully
+`-100`, then each `<answer>...</answer><|im_end|>\n` block is restored —
+just iterated per turn.
+
+The cross-method table (§5) is unchanged; this extension is orthogonal to
+the spatial-signal axis. A model SFT'd jointly on MindCube + VST learns
+both `<answer>{letter}</answer>` and `<answer>{free-form}</answer>`
+simultaneously, with `extract_answer_letter` / `extract_answer_number` /
+`extract_answer_content` (§2.2) handling the parse on whichever form
+appears at deploy time.
+
 ---
 
 ## 2. Concrete walkthrough — `evaluation.py` (deploy)
@@ -322,30 +357,52 @@ output        = processor.decode(
 )
 ```
 
-`_make_result` ([evaluation.py:1437-1450](../../evaluation.py#L1437-L1450))
-parses the decoded text with the **strict** regex parser:
+`_make_result` parses the decoded text via three small helpers in
+[evaluation.py](../../evaluation.py) (mirrored privately in
+[xyz_validation.py](../../xyz_validation.py)):
 
 ```python
-full_output = output                                            # no prepend
-prediction  = extract_answer_letter(full_output)                # see below
-```
+_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+_NUMBER_RE     = re.compile(r"(?<![A-Za-z\d])[-+]?\d+(?:\.\d+)?")
 
-[`extract_answer_letter`](../../evaluation.py#L186-L201):
+def extract_answer_content(text: str) -> str:
+    """Raw inner content of the *last* <answer>...</answer> tag (or "")."""
+    matches = _ANSWER_TAG_RE.findall(text or "")
+    return matches[-1].strip() if matches else ""
 
-```python
 def extract_answer_letter(text: str) -> str:
-    if not text or not isinstance(text, str):
-        return ""
-    m = re.search(r"<answer>\s*([A-Za-z])\s*</answer>", text, re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
-    return ""                                                   # no fallbacks
+    """Leading MCQ letter inside <answer>...</answer> (or "")."""
+    content = extract_answer_content(text)
+    if not content: return ""
+    m = re.match(r"\s*([A-Za-z])(?:\s|[.)]|$)", content)
+    return m.group(1).upper() if m else ""
+
+def extract_answer_number(text: str) -> str:
+    """First numeric token inside <answer>...</answer>, with a last-number
+    fallback over the full text. Lookbehind keeps `point-2` → 2 (not -2)."""
+    content = extract_answer_content(text)
+    if content:
+        m = _NUMBER_RE.search(content)
+        if m: return m.group(0)
+    nums = _NUMBER_RE.findall(text or "")
+    return nums[-1] if nums else ""
 ```
 
-The single regex requires the model to emit a complete `<answer>X</answer>`
-tag pair. Anything else (truncated, extra reasoning, malformed) yields `""`
-which scores as wrong. No `<answer>` prepend hack, no last-letter scan, no
-"the answer is X" fallback.
+Behavior matrix (16/16 unit-tested cases):
+
+| Model output | letter | number | content |
+|---|---|---|---|
+| `<answer>A</answer>` | A | "" | A |
+| `<answer>C. left and forward</answer>` (VST style) | C | "" | C. left and forward |
+| `<answer>D point-D</answer>` | D | "" | D point-D |
+| `<answer>97 cm</answer>` | "" | 97 | 97 cm |
+| `<answer>Distance[A,B]=0.7m\n...</answer>` | "" | 0.7 | (multi-line) |
+| `<answer>point-2</answer>` | "" | 2 | point-2 |
+
+The previous strict regex `<answer>\s*([A-Za-z])\s*</answer>` was tightened
+during the 04-28 unification, then loosened on 04-30 to absorb the richer
+content a model trained on VST may emit on MCQ benchmarks. Strict
+single-letter outputs still parse correctly (full backward compatibility).
 
 `compute_metrics` ([evaluation.py:1551-1575](../../evaluation.py#L1551-L1575))
 finally compares case-insensitively:
@@ -471,45 +528,49 @@ shims (`_eval_image_xyz` for atten, `_compute_xyz_pos` for decouple).
 
 ## 6. Backward compatibility
 
-**None.** Checkpoints saved before 2026-04-28 (bare-letter format) cannot
-be parsed by the current `evaluation.py` strict regex. Any model trained on
-the old format must be retrained.
+**MindCube-format checkpoints (`<answer>X</answer>`):** fully parseable by
+the 04-30 lenient extractors — strict single-letter content matches the
+leading-letter regex unchanged. No retraining required for stock MindCube
+runs.
 
-The single-source-of-truth helper [`src/dataset/answer_format.py`](../../src/dataset/answer_format.py)
-is the only place to bump the format from. If you change `format_answer`
-or `IM_END_NEWLINE`, every dataset class and `compute_letter_offset` will
-follow automatically — and the deploy parser regex in `evaluation.py` must
-be updated in lock-step.
+**Pre-04-28 bare-letter checkpoints (no `<answer>` wrapping at all):** still
+broken — extractors require the tag pair. Such models must be retrained.
+
+**VST-augmented checkpoints (jointly SFT'd on MindCube + VST):** parse on
+all eval datasets via the lenient extractors. Free-form `<answer>{...}</answer>`
+content from VST style is absorbed without scoring penalty.
+
+The single-source-of-truth helper
+[`src/dataset/answer_format.py`](../../src/dataset/answer_format.py) governs
+the MCQ wrapping `<answer>{letter}</answer>` and `IM_END_NEWLINE`. The
+extractor side ([evaluation.py](../../evaluation.py)
++ [xyz_validation.py](../../xyz_validation.py)) is now driven by
+`_ANSWER_TAG_RE` and `_NUMBER_RE` constants. Format bumps require updating
+both sides in lock-step.
 
 ---
 
-## 7. Verification checklist (before retraining)
+## 7. Verification (status as of 2026-04-30)
 
-- [x] All `apply_chat_template` calls pass `enable_thinking=False`
-  ([train_dataset.py](../../src/dataset/train_dataset.py),
-  [eval_dataset.py](../../src/dataset/eval_dataset.py),
-  [evaluation.py prepare_batch_spa](../../evaluation.py#L1233))
-- [x] All assistant content goes through `format_answer(letter)` =
-  `<answer>{letter}</answer>`
-- [x] `evaluation.py` parser drops 3-layer regex fallback and `<answer>`
-  prepend hack
-- [x] `compute_letter_offset(tokenizer)` returns 2 for Qwen3.5-VL
-  (BPE merges `>A`/`>B`/`>C`/`>D` into single tokens with distinct ids)
-- [x] All wrapper models (`AnswerOnlyModel` / `CoordinateModel` /
-  `RotationRoPEModel`) compute lm_loss as
+Routine pipeline invariants (each verified at the linked location):
+
+- `apply_chat_template(..., enable_thinking=False)` everywhere
+  ([train_dataset_qwen35.py](../../src/dataset/train_dataset_qwen35.py),
+  [eval_dataset_qwen35.py](../../src/dataset/eval_dataset_qwen35.py),
+  [evaluation.py prepare_batch_spa](../../evaluation.py))
+- MindCube assistant content via `format_answer(letter)` =
+  `<answer>{letter}</answer>`; VST wraps raw GPT response in `<answer>...</answer>`
+- `compute_letter_offset(tokenizer)` returns 2 for Qwen3.5-VL (BPE merges
+  `>A`/`>B`/`>C`/`>D` into distinct single-token ids)
+- All wrapper models compute lm_loss as
   `F.cross_entropy(shift_logits[masked], shift_labels[masked])`;
-  train_atten and train_correspondence inline eval uses
-  `F.cross_entropy(..., ignore_index=-100)` (mathematically equivalent for B=1)
-- [x] All training scripts set `model.letter_offset = compute_letter_offset(tok)`
-  after build (where the wrapper computes acc) or capture it locally in the
-  eval block (where the inline computation is used)
-- [x] LoRA wrap-order in `load_spa_model` puts `patch_attention_layers_*`
-  **before** `PeftModel.from_pretrained` for `atten` / `decouple` / `polar`
-- [x] Smoke test: untrained base Qwen3.5-VL forward gives reasonable
-  step-0 lm_loss (≈ 4.5 avg, dominated by token 0 = `<` which the base
-  model never had to emit; expected to drop within first few hundred steps)
-- [x] Leak regression test passes: TF logits[L_p − 1] ≡ gen logits[L_p − 1]
+  inline eval uses `ignore_index=-100` (equivalent for B=1)
+- All eval datasets parse correctly — all 10 benchmarks × ~200 samples
+  pass extractor round-trip (1950/1950 via simulated `<answer>{gt}</answer>`
+  inputs)
+- Leak regression test passes:
+  TF logits[L_p − 1] ≡ gen logits[L_p − 1]
+  ([tests/test_atten_no_leak.py](../../tests/test_atten_no_leak.py))
 
-After retraining: run `evaluation.py` with the new ckpt and confirm
-`metrics_*.json:overall_accuracy ≈ wandb eval/{ds}_acc`. They should agree
-to within statistical noise (sample-set differences + bf16 numerical drift).
+After retraining: `evaluation.py:overall_accuracy ≈ wandb eval/{ds}_acc`
+(within statistical noise from sample-set differences + bf16 drift).

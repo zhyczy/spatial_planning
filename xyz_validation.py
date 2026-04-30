@@ -52,6 +52,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.multiprocessing as mp
+from PIL import Image
 from tqdm import tqdm
 
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
@@ -97,23 +98,51 @@ def _method_flags(method: str) -> Dict[str, bool]:
 # Answer extraction
 # ===========================================================================
 
-def _extract_answer_letter(text: str) -> str:
-    """Match the training-time supervision format `<answer>X</answer>` only."""
+_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_answer_content(text: str) -> str:
+    """Return raw inner content of the last ``<answer>...</answer>`` tag."""
     if not text or not isinstance(text, str):
         return ""
-    m = re.search(r"<answer>\s*([A-Za-z])\s*</answer>", text, re.IGNORECASE)
+    matches = _ANSWER_TAG_RE.findall(text)
+    return matches[-1].strip() if matches else ""
+
+
+def _extract_answer_letter(text: str) -> str:
+    """Extract the leading MCQ letter from inside ``<answer>...</answer>``.
+
+    Supports both strict MindCube format (`<answer>X</answer>`) and VST-trained
+    richer variants (`<answer>X. option text</answer>` or even multi-line
+    explanations whose first non-whitespace char is a letter).
+    """
+    content = _extract_answer_content(text)
+    if not content:
+        return ""
+    m = re.match(r"\s*([A-Za-z])(?:\s|[.)]|$)", content)
     if m:
         return m.group(1).upper()
     return ""
 
 
+_NUMBER_RE = re.compile(r"(?<![A-Za-z\d])[-+]?\d+(?:\.\d+)?")
+# Lookbehind prevents a `-` glued onto a word (e.g. `point-2`) being read as
+# a sign. `point-2` → 2, `-2.5cm` → -2.5, `=0.7m` → 0.7.
+
+
 def _extract_answer_number(text: str) -> str:
-    if not text or not isinstance(text, str):
-        return ""
-    m = re.search(r"<answer>\s*([-+]?\d+(?:\.\d+)?)\s*</answer>", text, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
+    """Extract a numeric answer from inside `<answer>...</answer>`.
+
+    Picks the first numeric token inside the tag (matches VST si_measurement
+    style "97 cm" or "Distance[A,B]=0.7m"), with a last-standalone-number
+    fallback for un-tagged outputs.
+    """
+    content = _extract_answer_content(text)
+    if content:
+        m = _NUMBER_RE.search(content)
+        if m:
+            return m.group(0)
+    nums = _NUMBER_RE.findall(text or "")
     return nums[-1] if nums else ""
 
 
@@ -383,6 +412,13 @@ def _resize_xyz(
 
 
 def _load_precomputed_coords(item: Dict[str, Any]) -> Optional[List[Dict]]:
+    """Load per-view (pts3d, mask, camera_pose, image) from 3d_results/<index>/.
+
+    `image` comes from `view_XXXX/image.png` — coord_esti.py saved it at the
+    SAME shape as `pts3d.npy`, so feeding it to the processor (instead of the
+    raw benchmark image) makes pixel resolution == geometric resolution and
+    matches `_load_and_align_views` in train_dataset_qwen35.py.
+    """
     data_dir = item.get("data_dir")
     index = item.get("index")
     if data_dir is None or index is None:
@@ -398,6 +434,7 @@ def _load_precomputed_coords(item: Dict[str, Any]) -> Optional[List[Dict]]:
         pts3d_path = vd / "pts3d.npy"
         mask_path  = vd / "mask.npy"
         pose_path  = vd / "camera_pose.npy"
+        image_path = vd / "image.png"
         if not pts3d_path.exists():
             continue
         pts3d = np.load(str(pts3d_path))
@@ -405,7 +442,8 @@ def _load_precomputed_coords(item: Dict[str, Any]) -> Optional[List[Dict]]:
                  if mask_path.exists() else np.ones(pts3d.shape[:2], dtype=bool))
         pose  = (np.load(str(pose_path))
                  if pose_path.exists() else np.eye(4, dtype=np.float64))
-        results.append({"pts3d": pts3d, "camera_pose": pose, "mask": mask})
+        image = Image.open(str(image_path)).convert("RGB") if image_path.exists() else None
+        results.append({"pts3d": pts3d, "camera_pose": pose, "mask": mask, "image": image})
     return results if results else None
 
 
@@ -473,15 +511,21 @@ def _prepare_batch_spa(
                 f"_load_precomputed_coords raised: {exc!r}"
             ) from exc
 
-    # Qwen-align each view (image + pts3d + mask). Mirrors training:
-    # PIL LANCZOS for image (matches Qwen processor when given /28 input,
-    # vs. BICUBIC on raw input).
+    # Qwen-align each view (image + pts3d + mask). When 3d_results is
+    # available, swap the raw benchmark image for `view_XXXX/image.png` —
+    # coord_esti.py saved both pts3d and image.png at the same MapAny native
+    # shape, so pixel resolution == geometric resolution. Without this swap,
+    # the raw benchmark image and pts3d have different shapes and
+    # _qwen_align_view's pixel-alignment assertion fires. Mirrors training
+    # (_load_and_align_views in train_dataset_qwen35.py) so train and eval
+    # feed the model bit-equivalent (image, pts3d, mask) tuples.
     if image_inputs:
         aligned_imgs: list = []
         for k, img in enumerate(image_inputs):
             r = coord_results[k] if (coord_results is not None and k < len(coord_results)) else None
             if r is not None:
-                img_q, pts_q, mask_q = _qwen_align_view(img, r["pts3d"], r["mask"])
+                src_img = r.get("image") or img
+                img_q, pts_q, mask_q = _qwen_align_view(src_img, r["pts3d"], r["mask"])
                 r["pts3d"] = pts_q
                 r["mask"]  = mask_q
             else:

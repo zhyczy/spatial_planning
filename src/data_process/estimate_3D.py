@@ -124,15 +124,28 @@ def _iter_mindcube(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
 
 def _iter_mindcube_train(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
     img_root = _EVAL_ROOT / "MindCube"  # images shared with eval
-    json_path = _TRAIN_ROOT / "MindCube" / "train_10k.json"
+    json_path = _TRAIN_ROOT / "MindCube" / "MindCube_train.jsonl"
+    with open(json_path) as f:
+        for i, line in enumerate(f):
+            if limit > 0 and i >= limit:
+                break
+            entry = json.loads(line)
+            imgs = _load_images_from_paths(img_root, entry.get("images", []))
+            if imgs:
+                yield str(entry.get("id", i)), imgs
+
+
+def _iter_sat_train(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
+    img_root = _EVAL_ROOT / "SAT"  # images shared with eval (./data/train/...)
+    json_path = _TRAIN_ROOT / "SAT" / "train_36k.json"
     with open(json_path) as f:
         data = json.load(f)
     for i, entry in enumerate(data):
         if limit > 0 and i >= limit:
             break
-        imgs = _load_images_from_paths(img_root, entry.get("image", []))
+        imgs = _load_images_from_paths(img_root, entry.get("img_paths", []))
         if imgs:
-            yield str(entry.get("id", i)), imgs
+            yield str(entry.get("database_idx", i)), imgs
 
 
 def _iter_mmsibench(limit: int = -1) -> Iterator[Tuple[str, List[np.ndarray]]]:
@@ -349,6 +362,10 @@ DATASETS = {
     "mindcube_train": {
         "iter": _iter_mindcube_train,
         "out_dir": _TRAIN_ROOT / "MindCube" / "3d_results",
+    },
+    "sat_train": {
+        "iter": _iter_sat_train,
+        "out_dir": _TRAIN_ROOT / "SAT" / "3d_results",
     },
     "sparbench_mv": {
         "iter": lambda limit: _iter_sparbench(

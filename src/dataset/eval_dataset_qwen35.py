@@ -106,8 +106,8 @@ class Eval_Dataset_Coord(Dataset):
 
         content.append({"type": "text", "text": _question})
 
-        from .answer_format import format_answer, IM_END_NEWLINE
-        formatted_answer = format_answer(_answer)
+        from .answer_format import format_answer_with_text, IM_END_NEWLINE
+        formatted_answer = format_answer_with_text(_answer, _question)
         text_full = self.processor.apply_chat_template(
             [{"role": "user",      "content": content},
              {"role": "assistant", "content": formatted_answer}],
