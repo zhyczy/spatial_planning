@@ -63,7 +63,7 @@ from src.models import (
     SpaDecForConditionalGeneration,
     patch_attention_layers_dec,
 )
-from src.dataset import MindCube_Train_Dataset_Coord, MindCube_Train_Dataset_Coord_Polar, Eval_Dataset_Coord, xyz_to_polar
+from src.dataset import VST_Train_Dataset_Coord, VST_Train_Dataset_Coord_Polar, Eval_Dataset_Coord, xyz_to_polar
 
 logging.basicConfig(
     level=logging.INFO,
@@ -298,14 +298,27 @@ def train(args: argparse.Namespace) -> None:
         xyz_rope_dim       = args.xyz_rope_dim,
     )
     # Letter-position offset inside the masked answer suffix. Probed
-    # dynamically (see src/dataset/answer_format.py — Qwen BPE merges `>X`
-    # into one token, so the letter sits at index 2 not 3). Plumbed into
-    # CoordinateModel.forward so its eval-time `_ldict["acc"]` reports the
-    # letter-prediction accuracy instead of the trivial first-supervised-
-    # token argmax. See md/bug_fix/train_eval_paradigm_mismatch.md.
+    # dynamically (Qwen BPE merges `>X`, see src/dataset/answer_format.py).
+    # Plumbed into CoordinateModel.forward so its eval-time `_ldict["acc"]`
+    # reports the letter-prediction accuracy.
+    #
+    # ⚠️  WARNING: this is a TEACHER-FORCED probe — it gives the model the GT
+    # `<answer>` prefix and asks "what's the next token?". On datasets where
+    # the model doesn't reliably emit `<answer>` itself (e.g. SpinBench,
+    # where AR output is often `<image>X</image>` or a bare letter), this
+    # OVERESTIMATES real acc by 30-40 pp. Verified on atten_vst_1/step_500:
+    # spinbench LETTER_OFFSET acc = 62% vs deploy generative acc = 24%.
+    # Trust evaluation.py deploy eval for ground truth. See train_atten.py
+    # periodic eval for the upgraded generative + extract_answer_letter
+    # pattern.
     from src.dataset import compute_letter_offset
     model.letter_offset = compute_letter_offset(processor.tokenizer)
     log.info(f"letter_offset = {model.letter_offset}")
+    log.warning(
+        "[eval] using LETTER_OFFSET teacher-forced probe — acc is INFLATED "
+        "on datasets like SpinBench (model may not autoregressively emit "
+        "<answer>). Use evaluation.py deploy eval for true acc."
+    )
     log.info("Using CoordinateModel (camera transform prediction removed)")
 
     model = model.to(device)
@@ -322,10 +335,10 @@ def train(args: argparse.Namespace) -> None:
         _model = model
 
     # -- dataset / loader ------------------------------------------------------
-    _CoordDataset = MindCube_Train_Dataset_Coord_Polar if args.polar else MindCube_Train_Dataset_Coord
+    _CoordDataset = VST_Train_Dataset_Coord_Polar if args.polar else VST_Train_Dataset_Coord
     train_dataset = _CoordDataset(
         args.json_path,
-        args.mindcube_results_dir,
+        args.vst_results_dir,
         processor,
         log,
         max_images         = args.max_images,
@@ -723,13 +736,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--json_path",
-        default=os.path.join(_ROOT, "datasets/train/MindCube/MindCube_train.jsonl"),
-        help="Path to MindCube training JSONL",
+        default=os.path.join(_ROOT, "datasets/train/VST_parsed/vst_500k.json"),
+        help="Path to VST training JSON (vst_500k.json).",
     )
     p.add_argument(
-        "--mindcube_results_dir",
-        default=os.path.join(_ROOT, "datasets/train/MindCube/3d_results"),
-        help="Directory containing per-sample 3d_results folders for MindCube training",
+        "--vst_results_dir",
+        default=os.path.join(_ROOT, "datasets/train/VST/3d_results"),
+        help="Root of VST 3d_results tree (subdirs per task family).",
     )
     p.add_argument(
         "--output_dir",
@@ -758,7 +771,7 @@ def parse_args() -> argparse.Namespace:
              "(66 dims, rope_theta=1000) in pass-through dims 64..129 that "
              "consumes log-spherical (log r, θ=atan2(y,x), α=atan2(√(x²+y²),z)) "
              "instead of raw Cartesian xyz. Also switches the coord-loss GT "
-             "(via MindCube_Train_Dataset_Coord_Polar) to (log r, θ, α) so the "
+             "(via VST_Train_Dataset_Coord_Polar) to (log r, θ, α) so the "
              "coord head predicts in the same coordinate frame. Mutually "
              "exclusive with --decouple.",
     )

@@ -109,6 +109,7 @@ from src.models import (
 from src.dataset import (
     VST_Train_Dataset,
     Eval_Dataset_Coord,
+    extract_answer_letter,
 )
 
 logging.basicConfig(
@@ -555,18 +556,34 @@ def train(args: argparse.Namespace) -> None:
                     if _gc_flag:    _spa.gradient_checkpointing = False
                     if _lm and _lm_gc: _lm.gradient_checkpointing = False
 
-                    # Letter-position offset inside the supervised suffix.
-                    # Probed dynamically (see src/dataset/answer_format.py) —
-                    # not just `len(tokenize("<answer>"))`, because Qwen's
-                    # BPE merges `>` with the following character into a
-                    # single token (`>A`, `>B`, ... are 4 distinct ids), so
-                    # the letter sits at index 2 of the tokenized
-                    # `<answer>X</answer>...` suffix, not 3. Greedy logits
-                    # at letter_pos-1 should equal the letter — equivalent
-                    # to evaluation.py's first generated letter token under
-                    # no leak. See md/bug_fix/train_eval_paradigm_mismatch.md.
-                    from src.dataset import compute_letter_offset
-                    LETTER_OFFSET = compute_letter_offset(processor.tokenizer)
+                    # ── Install eval shim once: HF generate() validates kwargs
+                    # against forward signatures and strips image_xyz (because
+                    # Qwen3_5ForConditionalGeneration.forward doesn't accept it).
+                    # Stash image_xyz on the inner SpatialAttnVanillaModel and
+                    # inject it from a forward shim — same trick evaluation.py
+                    # uses in load_spa_model() for atten mode. Idempotent across
+                    # eval ticks via _atten_eval_shim_installed. The shim only
+                    # falls back to the stash when image_xyz=None, so training
+                    # forwards that pass image_xyz directly are unaffected.
+                    _backbone = next(
+                        m for m in _spa.modules()
+                        if isinstance(m, SpatialAttnVanillaModel)
+                    )
+                    if not getattr(_backbone, "_atten_eval_shim_installed", False):
+                        _orig_inner_forward = _backbone.forward
+                        def _atten_eval_forward(
+                            *args, image_xyz=None, mm_token_type_ids=None, **kw
+                        ):
+                            if image_xyz is None:
+                                image_xyz = getattr(_backbone, "_eval_image_xyz", None)
+                            return _orig_inner_forward(
+                                *args,
+                                image_xyz=image_xyz,
+                                mm_token_type_ids=mm_token_type_ids,
+                                **kw,
+                            )
+                        _backbone.forward = _atten_eval_forward
+                        _backbone._atten_eval_shim_installed = True
 
                     for ds_name, loader in test_loaders.items():
                         if test_samplers.get(ds_name) is not None:
@@ -586,13 +603,15 @@ def train(args: argparse.Namespace) -> None:
                             if t_lbl is not None: t_lbl = t_lbl.to(device)
                             if t_xyz is not None: t_xyz = [x.to(device) for x in t_xyz]
 
+                            # Stash image_xyz so the eval shim picks it up on prefill.
+                            _backbone._eval_image_xyz = t_xyz
+
                             with torch.no_grad():
-                                # Mirror AnswerOnlyModel.forward's kwargs so the
-                                # eval forward goes through the exact same code
-                                # path as training (only difference is bypassing
-                                # the LM-loss head, which we recompute below).
-                                # mm_token_type_ids is REQUIRED for the spatial
-                                # cache to be built; see train loop's note above.
+                                # ── lm_loss: cheap teacher-forced forward over
+                                # the full sequence (kept for monitoring train
+                                # distribution drift across heterogeneous VST
+                                # subsets — generative acc alone is too noisy
+                                # for early-step trends).
                                 out = _spa(
                                     input_ids            = t_ids,
                                     attention_mask       = t_mask,
@@ -614,19 +633,51 @@ def train(args: argparse.Namespace) -> None:
                                 loss_sum += lm_loss.item()
                                 count += 1
 
-                                # Letter-position argmax — equivalent to
-                                # evaluation.py's first generated letter token
-                                # under greedy decoding & no leak.
-                                first_ans = (t_lbl[0] != -100).nonzero(as_tuple=False)
-                                if first_ans.numel() > 0:
-                                    ans_start = first_ans[0, 0].item()
-                                    letter_pos = ans_start + LETTER_OFFSET
-                                    sl_idx = letter_pos - 1
-                                    if 0 <= sl_idx < sl.shape[1]:
-                                        pred = sl[0, sl_idx, :].argmax(-1).item()
-                                        target = sb[0, sl_idx].item()
-                                        if pred == target:
-                                            acc_sum += 1.0
+                                # ── Generative acc: deploy-aligned with
+                                # evaluation.py — slice prompt to end right
+                                # before the supervised answer span,
+                                # autoregressively generate, then run
+                                # extract_answer_letter on the decoded text.
+                                # No fixed-offset probe → no letter/non-letter
+                                # bias, works the same for any answer style
+                                # the model emits.
+                                ans_idx = (t_lbl[0] != -100).nonzero(as_tuple=False).flatten()
+                                if ans_idx.numel() == 0:
+                                    continue
+                                ans_start = ans_idx[0].item()
+
+                                p_ids  = t_ids[:, :ans_start]
+                                p_mask = t_mask[:, :ans_start]
+                                p_mm   = t_mm[:, :ans_start] if t_mm is not None else None
+
+                                generated = _spa.generate(
+                                    input_ids         = p_ids,
+                                    attention_mask    = p_mask,
+                                    pixel_values      = t_pv,
+                                    image_grid_thw    = t_thw,
+                                    mm_token_type_ids = p_mm,
+                                    max_new_tokens    = args.eval_max_new_tokens,
+                                    do_sample         = False,
+                                    pad_token_id      = tokenizer.eos_token_id,
+                                )
+
+                            # Decode model output and supervised GT, extract letter.
+                            trimmed = generated[0][p_ids.shape[1]:]
+                            pred_text = tokenizer.decode(
+                                trimmed.tolist(), skip_special_tokens=True,
+                            )
+                            pred_letter = extract_answer_letter(pred_text)
+
+                            gt_ids = t_lbl[0, ans_start:]
+                            gt_ids = gt_ids[gt_ids != -100]
+                            gt_text = tokenizer.decode(
+                                gt_ids.tolist(), skip_special_tokens=True,
+                            )
+                            gt_letter = extract_answer_letter(gt_text)
+
+                            if (pred_letter and gt_letter
+                                    and pred_letter.lower() == gt_letter.lower()):
+                                acc_sum += 1.0
 
                         if world_size > 1:
                             stats = torch.tensor([loss_sum, acc_sum, count],
@@ -687,6 +738,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_accum",  type=int,   default=8)
     p.add_argument("--save_steps",  type=int,   default=200)
     p.add_argument("--eval_steps",  type=int,   default=100)
+    p.add_argument("--eval_max_new_tokens", type=int, default=20,
+                   help="max_new_tokens for periodic generative eval (deploy-aligned). "
+                        "20 fits `<answer>X. {short option}</answer>` for MCQ benches; "
+                        "raise if eval datasets supervise long answers.")
     p.add_argument("--num_workers", type=int,   default=4)
     p.add_argument("--max_samples", type=int,   default=None,
                    help="Truncate dataset to this many samples (per source).")

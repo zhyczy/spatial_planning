@@ -113,7 +113,10 @@ from src.models import (
     SpatialAttnVanillaModel,
     patch_attention_layers_spatial,
 )
-from src.dataset import load_testing_dataset, chunk_dataset, _qwen_align_view
+from src.dataset import (
+    load_testing_dataset, chunk_dataset, _qwen_align_view,
+    build_interleaved_content,
+)
 
 # ── sys.path: ensure spatial_planning/ root is importable ──────────────────
 _ROOT = Path(__file__).resolve().parent
@@ -957,7 +960,7 @@ def build_image_xyz(
 
 def _build_user_message(item: Dict[str, Any], thinking: bool = False,
                         train_template: bool = False) -> Dict:
-    image_contents = [{"type": "image", "image": p} for p in item["image"]]
+    image_paths = item["image"]
     if train_template or item.get("format_type") == "robospatial":
         text = QUESTION_TEMPLATE.format(Question=item["question"])
     else:
@@ -972,7 +975,8 @@ def _build_user_message(item: Dict[str, Any], thinking: bool = False,
             f"{QUESTION_TEMPLATE.format(Question=item['question'])}\n"
             f"{instruction}"
         )
-    return {"role": "user", "content": image_contents + [{"type": "text", "text": text}]}
+
+    return {"role": "user", "content": build_interleaved_content(text, image_paths)}
 
 
 def prepare_batch_baseline(
@@ -1113,8 +1117,10 @@ def prepare_batch_spa(
     question = item.get("question", "")
 
     # ── image content ────────────────────────────────────────────────────────
-    content: list = [{"type": "image", "image": p} for p in image_paths]
-    content.append({"type": "text", "text": question})
+    # Interleave each `<image>` placeholder with the corresponding image
+    # (see answer_format.build_interleaved_content for the policy + the
+    # SpinBench `<image>X</image>` pollution it fixes).
+    content = build_interleaved_content(question, image_paths)
 
     # ── build messages (no system prompt — matches training) ─────────────────
     # Pass `enable_thinking=False` to mirror the training-time chat template

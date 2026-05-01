@@ -1,6 +1,10 @@
 from .answer_format import (
     IM_END_NEWLINE,
+    build_interleaved_content,
     compute_letter_offset,
+    extract_answer_content,
+    extract_answer_letter,
+    extract_answer_number,
     format_answer,
     format_answer_with_text,
 )

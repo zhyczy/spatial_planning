@@ -133,7 +133,13 @@ formatted_answer = format_answer_with_text(_answer, _question)
 # → "<answer>C. Light purple sofa</answer>"
 ```
 
-抽取代码 [answer_format.py:format_answer_with_text](../../src/dataset/answer_format.py)：在 question 末尾用 `(letter)\.\s+(.+?)(?=\s+[A-Z]\.\s+|\s*$)` 非贪婪匹配，对 first/middle/last 选项以及 "2.5 cm" 这种含小数点的选项都正确（10/10 单元测试通过）。**抽取失败时 fallback 回 `<answer>{letter}</answer>` 保证不爆**。
+抽取代码 [answer_format.py:format_answer_with_text](../../src/dataset/answer_format.py)：
+
+1. **Precheck**：question 必须同时含 `A.\s` 和 `B.\s` inline 标记，否则直接 fallback 到 `<answer>{letter}</answer>`。这避免了 spinbench 这种"描述里偶有 `View C.`"的 question 被误识别成 MCQ。
+2. **正则抽取**：`\b(letter)\.\s+(.+?)(?=\s+[A-Z]\.\s+|\s*$)` 非贪婪匹配，对 first/middle/last 选项以及 "2.5 cm" 这种含小数点的选项都正确。
+3. **长度上限**：抽到的 option text 必须 ≤ 200 字符（兜底，runaway match 也不会污染 suffix）。
+
+10/10 单元测试 + 真实数据集（MindCube/SAT 抽取，spinbench 全 fallback）round-trip 全部通过。
 
 **Suffix 长度变化**：原本固定 8 token，现在按选项长度浮动（`<` `answer` `>C` `.` ` Light` ` purple` ` sofa` `</` `answer` `>` `<|im_end|>` `\n`）。但 **letter 仍在 masked subset 第 2 个位置**（`>C`），所以 `LETTER_OFFSET=2` 跟 train_atten / train_correspondence 的 letter-pos argmax 公式都不需要改。
 

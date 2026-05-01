@@ -70,7 +70,13 @@ from src.models import (
     SpatialAttnVanillaModel,
     patch_attention_layers_spatial,
 )
-from src.dataset import load_testing_dataset, chunk_dataset, _qwen_align_view
+from src.dataset import (
+    load_testing_dataset, chunk_dataset, _qwen_align_view,
+    build_interleaved_content,
+    extract_answer_letter as _extract_answer_letter,
+    extract_answer_number as _extract_answer_number,
+    extract_answer_content as _extract_answer_content,
+)
 
 
 # ===========================================================================
@@ -94,56 +100,9 @@ def _method_flags(method: str) -> Dict[str, bool]:
     }
 
 
-# ===========================================================================
-# Answer extraction
-# ===========================================================================
-
-_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
-
-
-def _extract_answer_content(text: str) -> str:
-    """Return raw inner content of the last ``<answer>...</answer>`` tag."""
-    if not text or not isinstance(text, str):
-        return ""
-    matches = _ANSWER_TAG_RE.findall(text)
-    return matches[-1].strip() if matches else ""
-
-
-def _extract_answer_letter(text: str) -> str:
-    """Extract the leading MCQ letter from inside ``<answer>...</answer>``.
-
-    Supports both strict MindCube format (`<answer>X</answer>`) and VST-trained
-    richer variants (`<answer>X. option text</answer>` or even multi-line
-    explanations whose first non-whitespace char is a letter).
-    """
-    content = _extract_answer_content(text)
-    if not content:
-        return ""
-    m = re.match(r"\s*([A-Za-z])(?:\s|[.)]|$)", content)
-    if m:
-        return m.group(1).upper()
-    return ""
-
-
-_NUMBER_RE = re.compile(r"(?<![A-Za-z\d])[-+]?\d+(?:\.\d+)?")
-# Lookbehind prevents a `-` glued onto a word (e.g. `point-2`) being read as
-# a sign. `point-2` → 2, `-2.5cm` → -2.5, `=0.7m` → 0.7.
-
-
-def _extract_answer_number(text: str) -> str:
-    """Extract a numeric answer from inside `<answer>...</answer>`.
-
-    Picks the first numeric token inside the tag (matches VST si_measurement
-    style "97 cm" or "Distance[A,B]=0.7m"), with a last-standalone-number
-    fallback for un-tagged outputs.
-    """
-    content = _extract_answer_content(text)
-    if content:
-        m = _NUMBER_RE.search(content)
-        if m:
-            return m.group(0)
-    nums = _NUMBER_RE.findall(text or "")
-    return nums[-1] if nums else ""
+# Answer extractors — re-exported from src.dataset.answer_format above
+# (`_extract_answer_letter`, `_extract_answer_number`, `_extract_answer_content`).
+# Single source of truth: see [src/dataset/answer_format.py](src/dataset/answer_format.py).
 
 
 # ===========================================================================
@@ -487,8 +446,10 @@ def _prepare_batch_spa(
     image_paths = item["image"]
     question = item.get("question", "")
 
-    content: list = [{"type": "image", "image": p} for p in image_paths]
-    content.append({"type": "text", "text": question})
+    # Interleave each `<image>` placeholder with the corresponding image (see
+    # answer_format.build_interleaved_content for the policy + the SpinBench
+    # `<image>X</image>` pollution it fixes).
+    content = build_interleaved_content(question, image_paths)
 
     messages = [{"role": "user", "content": content}]
     prompt_text = processor.apply_chat_template(

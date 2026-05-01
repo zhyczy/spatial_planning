@@ -58,7 +58,7 @@ from src.models import (
     patch_attention_layers_dec,
 )
 from src.dataset import (
-    MindCube_Train_Dataset,
+    VST_Train_Dataset,
     Eval_Dataset_Coord,
 )
 
@@ -362,12 +362,12 @@ def train(args: argparse.Namespace) -> None:
 
     # ── dataset / loader ──────────────────────────────────────────────────────
     rank0_print(
-        f"Loading MindCube_Train_Dataset from {args.json_path} "
-        f"(results: {args.mindcube_results_dir})"
+        f"Loading VST_Train_Dataset from {args.json_path} "
+        f"(results: {args.vst_results_dir})"
     )
-    train_dataset = MindCube_Train_Dataset(
-        jsonl_path         = args.json_path,
-        results_dir        = args.mindcube_results_dir,
+    train_dataset = VST_Train_Dataset(
+        json_path          = args.json_path,
+        results_dir        = args.vst_results_dir,
         processor          = processor,
         log                = log,
         max_images         = args.max_images,
@@ -604,12 +604,30 @@ def train(args: argparse.Namespace) -> None:
                         _lm.gradient_checkpointing = False
 
                     # Letter-position offset inside the supervised suffix
-                    # `<answer>{letter}</answer><|im_end|>\n` —
-                    # equivalent to evaluation.py's first generated letter
-                    # token under greedy + no leak. Probed dynamically
-                    # (BPE merges `>X`, see src/dataset/answer_format.py).
+                    # `<answer>{letter}</answer><|im_end|>\n`. Probed
+                    # dynamically (BPE merges `>X`, see src/dataset/answer_format.py).
+                    #
+                    # ⚠️  WARNING: this is a TEACHER-FORCED probe — it gives the
+                    # model the GT `<answer>` prefix and asks "what's the next
+                    # token?". On datasets where the model doesn't reliably
+                    # emit `<answer>` itself (e.g. SpinBench, where the
+                    # autoregressive output is often `<image>X</image>` or
+                    # bare letters), this OVERESTIMATES real acc by 30-40
+                    # percentage points. Verified on atten_vst_1/step_500:
+                    # spinbench LETTER_OFFSET acc = 62%, deploy generative
+                    # acc = 24%. Trust evaluation.py deploy eval for ground
+                    # truth; this number is only useful as a coarse trend.
+                    # See train_atten.py periodic eval for the upgraded
+                    # generative + extract_answer_letter pattern.
                     from src.dataset import compute_letter_offset
                     LETTER_OFFSET = compute_letter_offset(processor.tokenizer)
+                    if local_rank == 0 and global_step // args.eval_steps <= 1:
+                        log.warning(
+                            "[eval] using LETTER_OFFSET teacher-forced probe — "
+                            "acc number is INFLATED on datasets like SpinBench "
+                            "(model may not autoregressively emit <answer>). "
+                            "Use evaluation.py deploy eval for true acc."
+                        )
 
                     for ds_name, loader in test_loaders.items():
                         if ds_name in test_samplers and test_samplers[ds_name] is not None:
@@ -756,13 +774,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--json_path",
-        default=os.path.join(_ROOT, "datasets/train/MindCube/MindCube_train.jsonl"),
-        help="Path to MindCube training JSONL",
+        default=os.path.join(_ROOT, "datasets/train/VST_parsed/vst_500k.json"),
+        help="Path to VST training JSON (vst_500k.json).",
     )
     p.add_argument(
-        "--mindcube_results_dir",
-        default=os.path.join(_ROOT, "datasets/train/MindCube/3d_results"),
-        help="Directory containing per-sample 3d_results folders for MindCube training",
+        "--vst_results_dir",
+        default=os.path.join(_ROOT, "datasets/train/VST/3d_results"),
+        help="Root of VST 3d_results tree (subdirs per task family).",
     )
     p.add_argument(
         "--output_dir",

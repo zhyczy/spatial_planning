@@ -23,6 +23,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from .answer_format import build_interleaved_content
 from .train_dataset_qwen35 import _load_and_align_views, resize_xyz
 
 
@@ -95,8 +96,6 @@ class Eval_Dataset_Coord(Dataset):
         N = len(images)
 
         # ── build prompt (images + QA) ───────────────────────────────────────
-        content: list = [{"type": "image", "image": img} for img in images]
-
         _question = entry.get(self.question_key, "")
         _answer   = entry.get(self.answer_key, "")
         if not (_question and _answer):
@@ -104,7 +103,7 @@ class Eval_Dataset_Coord(Dataset):
                 f"Eval_Dataset_Coord sample {idx} (id={entry.get('id')}) has no QA pair."
             )
 
-        content.append({"type": "text", "text": _question})
+        content = build_interleaved_content(_question, images)
 
         from .answer_format import format_answer_with_text, IM_END_NEWLINE
         formatted_answer = format_answer_with_text(_answer, _question)

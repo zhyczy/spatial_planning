@@ -340,16 +340,15 @@ class MindCube_Train_Dataset(Dataset):
             )
 
         # ── build prompt (images only, no pose sentences) ─────────────────────
-        content: list = [{"type": "image", "image": img} for img in images]
-
         _question = entry.get("question", "")
         _answer   = entry.get("gt_answer", "")
 
         labels = None
         if _question and _answer:
-            qa_content = list(content)
-            qa_content.append({"type": "text", "text": _question})
-            from .answer_format import format_answer_with_text, IM_END_NEWLINE
+            from .answer_format import (
+                build_interleaved_content, format_answer_with_text, IM_END_NEWLINE,
+            )
+            qa_content = build_interleaved_content(_question, images)
             formatted_answer = format_answer_with_text(_answer, _question)
             text_full = self.processor.apply_chat_template(
                 [{"role": "user",      "content": qa_content},
@@ -367,6 +366,9 @@ class MindCube_Train_Dataset(Dataset):
             labels = proc_out["input_ids"].clone()
             labels[0, :-len(suffix_ids)] = -100
         else:
+            # No QA pair → image-only prompt (used by some MindCube preprocessing
+            # entries that lack a question/answer field).
+            content = [{"type": "image", "image": img} for img in images]
             messages = [{"role": "user", "content": content}]
             prompt_text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False,
@@ -472,8 +474,6 @@ class MindCube_Train_Dataset_Coord(Dataset):
             )
 
         # ── build prompt (images + QA) ────────────────────────────────────────
-        content: list = [{"type": "image", "image": img} for img in images]
-
         _question = entry.get("question", "")
         _answer   = entry.get("gt_answer", "")
 
@@ -482,8 +482,10 @@ class MindCube_Train_Dataset_Coord(Dataset):
                 f"MindCube sample {idx} (id={entry.get('id')}) has no QA pair."
             )
 
-        content.append({"type": "text", "text": _question})
-        from .answer_format import format_answer_with_text, IM_END_NEWLINE
+        from .answer_format import (
+            build_interleaved_content, format_answer_with_text, IM_END_NEWLINE,
+        )
+        content = build_interleaved_content(_question, images)
         formatted_answer = format_answer_with_text(_answer, _question)
         text_full = self.processor.apply_chat_template(
             [{"role": "user",      "content": content},
@@ -651,13 +653,18 @@ def _vst_build_chat_with_labels(
     A failure to locate a span (BPE drift across special-token boundaries)
     raises loudly rather than silently dropping supervision.
     """
-    from .answer_format import IM_END_NEWLINE
+    from .answer_format import IM_END_NEWLINE, build_interleaved_content
 
     messages: list = []
     for i, (q, a) in enumerate(qa_pairs):
         if i == 0:
-            user_content = [{"type": "image", "image": img} for img in images]
-            user_content.append({"type": "text", "text": q})
+            # First user turn carries all the images. Interleave any literal
+            # `<image>` placeholders in the question with the actual image
+            # objects (no-op for VST since its conversations don't contain
+            # the placeholder string — verified — but kept consistent with
+            # MindCube/SpinBench so all train+eval prompt builders share one
+            # policy).
+            user_content = build_interleaved_content(q, images)
         else:
             user_content = [{"type": "text", "text": q}]
         messages.append({"role": "user", "content": user_content})
