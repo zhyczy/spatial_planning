@@ -93,10 +93,12 @@ class SpatialAttnWrapper(nn.Module):
                     dimension so each head gets its own bias scalar per pair).
     """
 
-    def __init__(self, attn: nn.Module, num_heads: int):
+    def __init__(self, attn: nn.Module, num_heads: int, bias_init_scale: float = 0.0):
         super().__init__()
         self.attn = attn
-        self.bias_module = SpatialAttentionBias(num_heads=num_heads, zero_init=True)
+        self.bias_module = SpatialAttentionBias(
+            num_heads=num_heads, zero_init=True, w2_init_scale=bias_init_scale,
+        )
 
     def forward(
         self,
@@ -208,7 +210,7 @@ class SpatialAttnWrapper(nn.Module):
 # 2. Post-LoRA attention patching
 # ─────────────────────────────────────────────────────────────────────────────
 
-def patch_attention_layers_spatial(model: nn.Module) -> int:
+def patch_attention_layers_spatial(model: nn.Module, bias_init_scale: float = 0.0) -> int:
     """
     Replace standard-attention self_attn modules in the language model with
     SpatialAttnWrapper. **Linear-attention layers are skipped** — their kernel
@@ -270,7 +272,7 @@ def patch_attention_layers_spatial(model: nn.Module) -> int:
         if isinstance(layer.self_attn, SpatialAttnWrapper):
             continue
         layer.self_attn = SpatialAttnWrapper(
-            layer.self_attn, num_heads=num_heads,
+            layer.self_attn, num_heads=num_heads, bias_init_scale=bias_init_scale,
         )
         n_wrapped += 1
 

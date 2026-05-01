@@ -69,15 +69,17 @@ MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
 JSON_PATH="$SPATIAL_DIR/datasets/train/VST_parsed/vst_500k.json"
 VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/VST/3d_results"
 
-EPOCHS=1
+EPOCHS=3
 LR=2e-4
 LORA_RANK=16
 MAX_IMAGES=8
 GRAD_ACCUM=8
 NUM_WORKERS=4
+BIAS_LR_SCALE=10.0
+BIAS_W2_INIT_SCALE=0.01
 
 SAVE_STEPS=1000
-EVAL_STEPS=1000
+EVAL_STEPS=200
 
 WANDB_PROJECT="spc"
 WANDB_ENTITY="actmrv"
@@ -97,6 +99,8 @@ echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
+echo "[INFO] BIAS_LR_SCALE        = $BIAS_LR_SCALE"
+echo "[INFO] BIAS_W2_INIT_SCALE   = $BIAS_W2_INIT_SCALE"
 echo "[INFO] Dataset              : VST 500K"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Mode                 : SpatialAttn (3D M-RoPE UNCHANGED + per-layer geometric MLP bias)"
@@ -131,6 +135,8 @@ $TORCHRUN \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
+    --bias_lr_scale          "$BIAS_LR_SCALE"          \
+    --bias_w2_init_scale     "$BIAS_W2_INIT_SCALE"     \
     $MAX_SAMPLES_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

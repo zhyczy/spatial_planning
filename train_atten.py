@@ -146,9 +146,10 @@ def collate_fn(batch):
 # ── model building ────────────────────────────────────────────────────────────
 
 def build_model(
-    model_path:    str,
-    lora_rank:     int  = 16,
-    freeze_vision: bool = True,
+    model_path:      str,
+    lora_rank:       int   = 16,
+    freeze_vision:   bool  = True,
+    bias_init_scale: float = 0.0,
 ) -> nn.Module:
     """
     Load stock Qwen3.5-VL → swap inner backbone for SpatialAttnVanillaModel
@@ -198,7 +199,7 @@ def build_model(
     spa.print_trainable_parameters()
 
     # ── Wrap every self_attn with SpatialAttnWrapper (AFTER LoRA) ─────────────
-    n_wrapped = patch_attention_layers_spatial(spa)
+    n_wrapped = patch_attention_layers_spatial(spa, bias_init_scale=bias_init_scale)
     log.info(f"Wrapped {n_wrapped} self_attn layers with SpatialAttnWrapper.")
 
     # Cast newly-created bias_module params to bf16 so they match the rest
@@ -364,8 +365,9 @@ def train(args: argparse.Namespace) -> None:
     tokenizer = processor.tokenizer
     model = build_model(
         args.model_path,
-        lora_rank     = args.lora_rank,
-        freeze_vision = not args.train_vision,
+        lora_rank       = args.lora_rank,
+        freeze_vision   = not args.train_vision,
+        bias_init_scale = args.bias_w2_init_scale,
     ).to(device)
 
     # ── spatial_merge_size from config.json ───────────────────────────────────
@@ -445,8 +447,27 @@ def train(args: argparse.Namespace) -> None:
 
 
     # ── optimiser ─────────────────────────────────────────────────────────────
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
+    # bias_module params get a boosted LR so W₂ (zero/small-init output layer)
+    # builds up meaningful scale faster, allowing gradients to flow to W₁.
+    bias_params  = [(n, p) for n, p in model.named_parameters()
+                    if p.requires_grad and "bias_module" in n]
+    other_params = [(n, p) for n, p in model.named_parameters()
+                    if p.requires_grad and "bias_module" not in n]
+    trainable = [p for _, p in other_params] + [p for _, p in bias_params]
+    bias_lr = args.lr * args.bias_lr_scale
+    log.info(
+        f"Optimizer param groups: "
+        f"LoRA/other {len(other_params)} params @ lr={args.lr:.2e}  |  "
+        f"bias_module {len(bias_params)} params @ lr={bias_lr:.2e} "
+        f"(scale={args.bias_lr_scale}x)"
+    )
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [p for _, p in other_params], "lr": args.lr},
+            {"params": [p for _, p in bias_params],  "lr": bias_lr},
+        ],
+        weight_decay=0.01,
+    )
     total_steps = args.epochs * len(train_loader) // args.grad_accum
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1)
@@ -738,15 +759,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_accum",  type=int,   default=8)
     p.add_argument("--save_steps",  type=int,   default=200)
     p.add_argument("--eval_steps",  type=int,   default=100)
-    p.add_argument("--eval_max_new_tokens", type=int, default=20,
-                   help="max_new_tokens for periodic generative eval (deploy-aligned). "
-                        "20 fits `<answer>X. {short option}</answer>` for MCQ benches; "
-                        "raise if eval datasets supervise long answers.")
+    p.add_argument("--eval_max_new_tokens", type=int, default=128,
+                   help="Safety cap on tokens generated during periodic eval. "
+                        "Generation stops naturally at <|im_end|> (EOS); this "
+                        "only prevents runaway loops on malformed outputs.")
     p.add_argument("--num_workers", type=int,   default=4)
     p.add_argument("--max_samples", type=int,   default=None,
                    help="Truncate dataset to this many samples (per source).")
     p.add_argument("--train_vision", action="store_true",
                    help="Also unfreeze the ViT.")
+    p.add_argument("--bias_lr_scale", type=float, default=10.0,
+                   help="LR multiplier for SpatialAttentionBias params vs LoRA. "
+                        "bias_module gets lr * bias_lr_scale. Default 10.")
+    p.add_argument("--bias_w2_init_scale", type=float, default=0.01,
+                   help="W₂ (output layer) init std for SpatialAttentionBias. "
+                        "0 = exact zero-init (pretrained behavior preserved but "
+                        "W₁ gradients dead until W₂ moves); >0 = N(0,scale) init "
+                        "allowing W₁ to train from step 0. Default 0.01.")
     p.add_argument("--wandb_project", default="")
     p.add_argument("--wandb_entity",  default="")
     p.add_argument("--wandb_run_name", default="")

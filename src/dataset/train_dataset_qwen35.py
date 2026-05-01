@@ -754,6 +754,8 @@ class VST_Train_Dataset(Dataset):
         id_index = _build_vst_id_index(results_dir)
 
         self.samples = []
+        n_no_dir = 0
+        n_no_qa  = 0
         for entry in raw:
             eid   = str(entry.get("id", ""))
             etype = entry.get("type", "")
@@ -761,6 +763,10 @@ class VST_Train_Dataset(Dataset):
                 results_dir, etype, eid, id_index,
             )
             if sample_dir is None:
+                n_no_dir += 1
+                continue
+            if not _vst_extract_qa_pairs(entry):
+                n_no_qa += 1
                 continue
             self.samples.append((entry, sample_dir))
 
@@ -773,7 +779,8 @@ class VST_Train_Dataset(Dataset):
         self.log                = log
         log.info(
             f"VST_Train_Dataset: {len(self.samples)} valid entries "
-            f"(out of {len(raw)} total) from {json_path}"
+            f"(out of {len(raw)} total, skipped {n_no_dir} missing-dir, "
+            f"{n_no_qa} empty-QA) from {json_path}"
         )
 
     def __len__(self):

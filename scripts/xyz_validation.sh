@@ -158,7 +158,7 @@ if [[ -n "$GPUS" ]]; then
     export CUDA_VISIBLE_DEVICES="$GPUS"
 fi
 
-N_GPU=$(python3 -c "import torch; print(torch.cuda.device_count())")
+N_GPU=$(/egr/research-actionlab/caizhon2/miniconda3/envs/spc/bin/python -c "import torch; print(torch.cuda.device_count())")
 if [[ "$N_GPU" -eq 0 ]]; then
     echo "[ERROR] No CUDA GPUs available." >&2
     exit 1

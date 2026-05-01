@@ -375,6 +375,14 @@ class SpaDecTextModel(Qwen3_5TextModel):
             position_ids = position_ids[None, ...].expand(
                 3, position_ids.shape[0], -1
             )
+        # 4D M-RoPE from generation: strip the text axis to get (3, B, S)
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            position_ids = position_ids[1:]
+        # Decode step: position_ids covers full prefill length; fall back to cache_position
+        if position_ids.shape[-1] != inputs_embeds.shape[1]:
+            position_ids = cache_position.view(1, 1, -1).expand(
+                3, inputs_embeds.shape[0], -1
+            )
 
         causal_mask = create_causal_mask(
             config=self.config,

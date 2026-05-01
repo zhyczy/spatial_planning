@@ -80,9 +80,10 @@ class SpatialAttentionBias(nn.Module):
 
     def __init__(
         self,
-        num_heads:  int,
-        hidden_dim: int  = 128,
-        zero_init:  bool = True,
+        num_heads:     int,
+        hidden_dim:    int   = 128,
+        zero_init:     bool  = True,
+        w2_init_scale: float = 0.0,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -137,17 +138,19 @@ class SpatialAttentionBias(nn.Module):
             nn.Linear(hidden_dim, num_heads), # W₂: (num_heads, hidden_dim),  b₂: (num_heads,)
         )
 
-        if zero_init:
-            # Only zero the OUTPUT layer (W₂, b₂). That alone forces M_vis ≡ 0
-            # at step 0 → B ≡ 0 → pretrained attention is undisturbed.
-            # W₁ keeps PyTorch's default Kaiming-uniform init so the gradient
-            # path through Linear-1 is healthy from step 1 onward.
-            #   (If we also zero W₁, then ∂L/∂W₂ = h(x)ᵀ · grad ≡ 0 at step 0
-            #    because h(x) = GELU(W₁x + b₁) = GELU(0) ≠ 0 actually — but
-            #    the gradient flowing INTO W₁ is W₂ᵀ · grad which is zero,
-            #    so W₁ can't move. Keeping W₁ at Kaiming avoids this trap.)
-            nn.init.zeros_(self.mlp[-1].weight)   # (num_heads, hidden_dim) → all zeros
-            nn.init.zeros_(self.mlp[-1].bias)     # (num_heads,)            → all zeros
+        if w2_init_scale > 0.0:
+            # Small-random W₂ init: bias ≈ w2_init_scale * O(1) at step 0,
+            # negligible perturbation to pretrained attention. Unlike exact
+            # zero-init, this lets gradients flow to W₁ immediately (since
+            # ∂L/∂W₁ ∝ W₂ᵀ which is now non-zero from step 0).
+            nn.init.normal_(self.mlp[-1].weight, mean=0.0, std=w2_init_scale)
+            nn.init.zeros_(self.mlp[-1].bias)
+        elif zero_init:
+            # Exact zero W₂: bias ≡ 0 at step 0 → pretrained behavior fully
+            # preserved. W₁ cannot receive gradients until W₂ moves away from
+            # zero (typically takes many steps at standard LR).
+            nn.init.zeros_(self.mlp[-1].weight)
+            nn.init.zeros_(self.mlp[-1].bias)
 
     @staticmethod
     def compute_geometry_features(xyz: torch.Tensor) -> torch.Tensor:
