@@ -60,6 +60,7 @@ from src.models import (
 from src.dataset import (
     VST_Train_Dataset,
     Eval_Dataset_Coord,
+    extract_answer_letter,
 )
 
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
@@ -90,6 +91,28 @@ def collate_fn(batch):
     """
     assert len(batch) == 1, "Only batch_size=1 is supported"
     return batch[0]
+
+
+def _resolve_language_model(root: nn.Module) -> nn.Module | None:
+    """BFS through PEFT/DDP/AnswerOnly wrapper layers to find the inner
+    Qwen3_5/Spa/SpaDec text-decoder module. Mirrors the helper in
+    train_atten.py so both scripts find LM the same way regardless of mode.
+    """
+    queue = [root]
+    seen: set[int] = set()
+    while queue:
+        cur = queue.pop(0)
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        lm = getattr(cur, "language_model", None)
+        if isinstance(lm, nn.Module) and hasattr(lm, "layers"):
+            return lm
+        for attr in ("spa_model", "module", "base_model", "model"):
+            nxt = getattr(cur, attr, None)
+            if isinstance(nxt, nn.Module) and id(nxt) not in seen:
+                queue.append(nxt)
+    return None
 
 
 # ── model building ────────────────────────────────────────────────────────────
@@ -245,15 +268,12 @@ def build_model(
         n = patch_attention_layers_dec(spa)
         log.info(f"Wrapped {n} attention layers with SpaDecAttentionWrapper.")
 
-    # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
+    # Gradient checkpointing — same pattern as train_atten.py
     spa.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
-    # Verify checkpointing propagated to the language model
-    lm = spa.model.model.language_model if hasattr(spa.model, 'model') else spa.model.language_model
-    gc_flag = getattr(lm, 'gradient_checkpointing', False)
-    log.info(f"Gradient checkpointing enabled. language_model.gradient_checkpointing={gc_flag}")
-    if not gc_flag:
+    lm = _resolve_language_model(spa)
+    if lm is not None and not getattr(lm, "gradient_checkpointing", False):
         lm.gradient_checkpointing = True
         log.info("Manually set gradient_checkpointing=True on language_model")
 
@@ -441,35 +461,6 @@ def train(args: argparse.Namespace) -> None:
         optimizer, T_max=max(total_steps, 1)
     )
 
-    # Create output directory (all ranks can do this safely with exist_ok=True)
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # ── logging to file ───────────────────────────────────────────────────────
-    # Per-rank log file (all ranks)
-    rank_log_file = os.path.join(
-        args.output_dir,
-        f"train_rank{local_rank}.log" if world_size > 1 else "train.log"
-    )
-    rank_handler = logging.FileHandler(rank_log_file, mode="w", encoding="utf-8")
-    rank_handler.setFormatter(logging.Formatter(
-        "%(asctime)s  %(levelname)s  %(message)s",
-        datefmt="%H:%M:%S"
-    ))
-    log.addHandler(rank_handler)
-
-    # Aggregate log file (rank 0 only, for multi-GPU)
-    if world_size > 1 and local_rank == 0:
-        summary_log_file = os.path.join(args.output_dir, "train.log")
-        summary_handler = logging.FileHandler(summary_log_file, mode="w", encoding="utf-8")
-        summary_handler.setFormatter(logging.Formatter(
-            "%(asctime)s  %(levelname)s  %(message)s",
-            datefmt="%H:%M:%S"
-        ))
-        log.addHandler(summary_handler)
-        rank0_print(f"Per-rank logs: train_rank*.log  |  Summary log: {summary_log_file}")
-    else:
-        rank0_print(f"Logging to {rank_log_file}")
-
     # ── WandB (rank 0 only) ───────────────────────────────────────────────────
     use_wandb = _WANDB_AVAILABLE and args.wandb_project and local_rank == 0
     if use_wandb:
@@ -486,7 +477,6 @@ def train(args: argparse.Namespace) -> None:
 
     global_step = 0
     running_loss = 0.0
-    running_loss_dict: dict[str, float] = {}
     optimizer.zero_grad()
 
     for epoch in range(args.epochs):
@@ -495,16 +485,22 @@ def train(args: argparse.Namespace) -> None:
 
         for step, batch in enumerate(train_loader):
 
-            # ── move batch to device ──────────────────────────────────────────
+            # ── move batch to device (input template aligned with train_atten.py) ─
             input_ids      = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             pixel_values   = batch.get("pixel_values")
             image_grid_thw = batch.get("image_grid_thw")
-
+            # mm_token_type_ids: emitted by AutoProcessor. For atten this is
+            # required (vision_mask derivation); for 4D / decouple / polar it
+            # lets get_rope_index identify vision-token positions cleanly
+            # rather than rederiving from input_ids token ids.
+            mm_token_type_ids = batch.get("mm_token_type_ids")
             if pixel_values is not None:
                 pixel_values = pixel_values.to(device, dtype=torch.bfloat16)
             if image_grid_thw is not None:
                 image_grid_thw = image_grid_thw.to(device)
+            if mm_token_type_ids is not None:
+                mm_token_type_ids = mm_token_type_ids.to(device)
 
             # Move 3D position maps to device (list of tensors or None)
             image_xyz = batch.get("image_xyz")
@@ -516,26 +512,22 @@ def train(args: argparse.Namespace) -> None:
                 labels = labels.to(device)
 
             # ── forward + loss ────────────────────────────────────────────────
-            _, loss, loss_dict = model(
-                input_ids      = input_ids,
-                attention_mask = attention_mask,
-                pixel_values   = pixel_values,
-                image_grid_thw = image_grid_thw,
-                image_xyz      = image_xyz,
-                labels         = labels,
+            _, loss, _ldict = model(
+                input_ids         = input_ids,
+                attention_mask    = attention_mask,
+                pixel_values      = pixel_values,
+                image_grid_thw    = image_grid_thw,
+                image_xyz         = image_xyz,
+                mm_token_type_ids = mm_token_type_ids,
+                labels            = labels,
             )
-            
             if loss is None:
                 log.warning(f"[rank{local_rank}] Step {step}: loss is None, skipping.")
                 continue
 
             (loss / args.grad_accum).backward()
             running_loss += loss.item()
-            if loss_dict:
-                for k, v in loss_dict.items():
-                    running_loss_dict[k] = running_loss_dict.get(k, 0.0) + v
 
-            # ── gradient accumulation ─────────────────────────────────────────
             if (step + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
                 optimizer.step()
@@ -544,193 +536,232 @@ def train(args: argparse.Namespace) -> None:
                 global_step += 1
 
                 avg_loss = running_loss / args.grad_accum
-                avg_loss_dict = {
-                    k: v / args.grad_accum
-                    for k, v in running_loss_dict.items()
-                }
                 running_loss = 0.0
-                running_loss_dict.clear()
 
-                # All-reduce training losses across ranks
                 if world_size > 1:
-                    _loss_keys = sorted(avg_loss_dict.keys())
-                    _loss_vals = [avg_loss] + [avg_loss_dict[k] for k in _loss_keys]
-                    _loss_t = torch.tensor(_loss_vals, dtype=torch.float64, device=device)
-                    dist.all_reduce(_loss_t, op=dist.ReduceOp.SUM)
-                    _loss_t /= world_size
-                    avg_loss = _loss_t[0].item()
-                    avg_loss_dict = {k: _loss_t[i + 1].item() for i, k in enumerate(_loss_keys)}
+                    _t = torch.tensor([avg_loss], dtype=torch.float64, device=device)
+                    dist.all_reduce(_t, op=dist.ReduceOp.SUM)
+                    avg_loss = (_t / world_size)[0].item()
 
                 if local_rank == 0:
                     current_lr = scheduler.get_last_lr()[0]
-                    detail = "  ".join(
-                        f"{k}={v:.4f}" for k, v in avg_loss_dict.items()
-                    )
                     log.info(
                         f"[train] epoch={epoch+1:02d}  global_step={global_step:05d}  "
-                        f"loss={avg_loss:.4f}"
-                        + (f"  ({detail})" if detail else "")
-                        + f"  lr={current_lr:.2e}  "
+                        f"loss={avg_loss:.4f}  lr={current_lr:.2e}  "
                         f"(aggregated across {world_size} GPU{'s' if world_size > 1 else ''})"
                     )
                     if use_wandb:
                         wandb.log(
-                            {
-                                "train/loss": avg_loss,
-                                "train/lr":   current_lr,
-                                "epoch":      epoch + 1,
-                                **{f"train/{k}": v for k, v in avg_loss_dict.items()},
-                            },
+                            {"train/loss": avg_loss,
+                             "train/lr":   current_lr,
+                             "epoch":      epoch + 1},
                             step=global_step,
                         )
-
-                    # ── checkpoint ────────────────────────────────────────────
                     if global_step % args.save_steps == 0:
-                        _save_checkpoint(_model, tokenizer, args.output_dir,
-                                         global_step)
+                        _save_checkpoint(_model, tokenizer, args.output_dir, global_step)
 
-                # ── periodic evaluation on test sets ──────────────────────────
+                # ── periodic eval (deploy-aligned generative, mirrors train_atten.py) ─
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
-                    _spa = _model.spa_model if hasattr(_model, 'spa_model') else _model
+                    _spa = _model.spa_model if hasattr(_model, "spa_model") else _model
 
-                    # Save and disable gradient checkpointing during eval to enable kv_cache
-                    _spa_gc_flag = getattr(_spa, 'gradient_checkpointing', False)
-                    _lm = _spa.language_model if hasattr(_spa, 'language_model') else None
-                    _lm_gc_flag = getattr(_lm, 'gradient_checkpointing', False) if _lm else False
-                    if _spa_gc_flag:
-                        _spa.gradient_checkpointing = False
-                    if _lm and _lm_gc_flag:
-                        _lm.gradient_checkpointing = False
-
-                    # Letter-position offset inside the supervised suffix
-                    # `<answer>{letter}</answer><|im_end|>\n`. Probed
-                    # dynamically (BPE merges `>X`, see src/dataset/answer_format.py).
-                    #
-                    # ⚠️  WARNING: this is a TEACHER-FORCED probe — it gives the
-                    # model the GT `<answer>` prefix and asks "what's the next
-                    # token?". On datasets where the model doesn't reliably
-                    # emit `<answer>` itself (e.g. SpinBench, where the
-                    # autoregressive output is often `<image>X</image>` or
-                    # bare letters), this OVERESTIMATES real acc by 30-40
-                    # percentage points. Verified on atten_vst_1/step_500:
-                    # spinbench LETTER_OFFSET acc = 62%, deploy generative
-                    # acc = 24%. Trust evaluation.py deploy eval for ground
-                    # truth; this number is only useful as a coarse trend.
-                    # See train_atten.py periodic eval for the upgraded
-                    # generative + extract_answer_letter pattern.
-                    from src.dataset import compute_letter_offset
-                    LETTER_OFFSET = compute_letter_offset(processor.tokenizer)
-                    if local_rank == 0 and global_step // args.eval_steps <= 1:
-                        log.warning(
-                            "[eval] using LETTER_OFFSET teacher-forced probe — "
-                            "acc number is INFLATED on datasets like SpinBench "
-                            "(model may not autoregressively emit <answer>). "
-                            "Use evaluation.py deploy eval for true acc."
-                        )
+                    # Disable GC for KV cache during generate()
+                    _spa_gc_flag = getattr(_spa, "gradient_checkpointing", False)
+                    _lm = _resolve_language_model(_spa)
+                    _lm_gc_flag = getattr(_lm, "gradient_checkpointing", False) if _lm else False
+                    if _spa_gc_flag:    _spa.gradient_checkpointing = False
+                    if _lm and _lm_gc_flag: _lm.gradient_checkpointing = False
 
                     for ds_name, loader in test_loaders.items():
                         if ds_name in test_samplers and test_samplers[ds_name] is not None:
                             test_samplers[ds_name].set_epoch(global_step)
-                        local_loss_sum = 0.0
-                        local_acc_sum  = 0.0
-                        local_count    = 0
-                        for test_batch in loader:
-                            t_ids   = test_batch["input_ids"].to(device)
-                            t_mask  = test_batch["attention_mask"].to(device)
-                            t_pv    = test_batch.get("pixel_values")
-                            t_thw   = test_batch.get("image_grid_thw")
-                            t_labels = test_batch.get("labels")
-                            t_xyz     = test_batch.get("image_xyz")
-                            if t_pv is not None:
-                                t_pv = t_pv.to(device, dtype=torch.bfloat16)
-                            if t_thw is not None:
-                                t_thw = t_thw.to(device)
-                            if t_labels is not None:
-                                t_labels = t_labels.to(device)
-                            if t_xyz is not None:
-                                t_xyz = [x.to(device) for x in t_xyz]
-                            # Match training input distribution per mode:
-                            #   vanilla       — no xyz kwargs (stock Qwen)
-                            #   --polar       — image_xyz + polar=True (xyz→log-spherical in M-RoPE)
-                            #   default/decouple — image_xyz
-                            _eval_fwd_kwargs = dict(
-                                input_ids=t_ids, attention_mask=t_mask,
-                                pixel_values=t_pv, image_grid_thw=t_thw,
-                                return_dict=True,
-                                kv_cache=(ds_name == "spinbench"),
-                            )
-                            if not args.vanilla:
-                                if t_xyz is not None:
-                                    _eval_fwd_kwargs["image_xyz"] = t_xyz
-                                if args.polar:
-                                    _eval_fwd_kwargs["polar"] = True
+                        loss_sum, acc_sum, count = 0.0, 0.0, 0
+                        for tb in loader:
+                            t_ids   = tb["input_ids"].to(device)
+                            t_mask  = tb["attention_mask"].to(device)
+                            t_pv    = tb.get("pixel_values")
+                            t_thw   = tb.get("image_grid_thw")
+                            t_mm    = tb.get("mm_token_type_ids")
+                            t_lbl   = tb.get("labels")
+                            t_xyz   = tb.get("image_xyz")
+                            if t_pv  is not None: t_pv  = t_pv.to(device, dtype=torch.bfloat16)
+                            if t_thw is not None: t_thw = t_thw.to(device)
+                            if t_mm  is not None: t_mm  = t_mm.to(device)
+                            if t_lbl is not None: t_lbl = t_lbl.to(device)
+                            if t_xyz is not None: t_xyz = [x.to(device) for x in t_xyz]
+
                             with torch.no_grad():
-                                out = _spa(**_eval_fwd_kwargs)
+                                # ── lm_loss: cheap teacher-forced forward over
+                                # full sequence. Input template mirrors the
+                                # training step (incl. mm_token_type_ids) +
+                                # mode-conditional xyz / polar kwargs.
+                                _fwd_kwargs = dict(
+                                    input_ids            = t_ids,
+                                    attention_mask       = t_mask,
+                                    pixel_values         = t_pv,
+                                    image_grid_thw       = t_thw,
+                                    mm_token_type_ids    = t_mm,
+                                    output_hidden_states = False,
+                                    return_dict          = True,
+                                )
+                                if not args.vanilla and t_xyz is not None:
+                                    _fwd_kwargs["image_xyz"] = t_xyz
+                                if args.polar:
+                                    _fwd_kwargs["polar"] = True
+                                out = _spa(**_fwd_kwargs)
                                 logits = out.logits
-                                shift_logits = logits[..., :-1, :].contiguous()
-                                shift_labels = t_labels[..., 1:].contiguous()
+                                sl = logits[..., :-1, :].contiguous()
+                                sb = t_lbl[..., 1:].contiguous()
                                 lm_loss = F.cross_entropy(
-                                    shift_logits.view(-1, shift_logits.size(-1)),
-                                    shift_labels.view(-1),
+                                    sl.view(-1, sl.size(-1)),
+                                    sb.view(-1),
                                     ignore_index=-100,
                                 )
-                                local_loss_sum += lm_loss.item()
+                                loss_sum += lm_loss.item()
+                                count += 1
 
-                                # Letter-position argmax (Option C):
-                                # mask the suffix, take logits at the letter
-                                # position (index LETTER_OFFSET in masked
-                                # subset). Equivalent to evaluation.py's first
-                                # generated letter token under greedy + no
-                                # leak. See md/bug_fix/train_eval_paradigm_mismatch.md.
-                                _mask  = shift_labels[0] != -100
-                                _sl_m  = shift_logits[0, _mask]
-                                _sb_m  = shift_labels[0, _mask]
-                                if 0 <= LETTER_OFFSET < _sl_m.shape[0]:
-                                    _pred = _sl_m[LETTER_OFFSET].argmax(-1).item()
-                                    _tgt  = int(_sb_m[LETTER_OFFSET].item())
-                                    local_acc_sum += 1.0 if _pred == _tgt else 0.0
-                                local_count += 1
+                                # ── Generative acc (deploy-aligned with
+                                # evaluation.py): slice prompt to right before
+                                # the supervised answer span, autoregressively
+                                # generate, then run extract_answer_letter
+                                # on the decoded text. No fixed-offset probe →
+                                # no letter/non-letter bias. Matches
+                                # train_atten.py periodic eval.
+                                ans_idx = (t_lbl[0] != -100).nonzero(as_tuple=False).flatten()
+                                if ans_idx.numel() == 0:
+                                    continue
+                                ans_start = ans_idx[0].item()
 
-                        # Aggregate across all ranks
-                        if world_size > 1:
-                            stats = torch.tensor(
-                                [local_loss_sum, local_acc_sum, local_count],
-                                dtype=torch.float64, device=device,
+                                p_ids  = t_ids[:, :ans_start]
+                                p_mask = t_mask[:, :ans_start]
+                                p_mm   = t_mm[:, :ans_start] if t_mm is not None else None
+                                _coord_scale = 100.0
+                                _polar       = bool(args.polar)
+                                # Inner backbone for mode-specific position prep:
+                                #   vanilla  → Qwen3_5ForConditionalGeneration  (no prep)
+                                #   decouple → SpaDecForConditionalGeneration → .model = SpaDecModel  (._compute_xyz_pos)
+                                #   default  → SpaForConditionalGeneration → .model = SpaModel       (.get_rope_index)
+                                _backbone = _spa.base_model.model if hasattr(_spa, "base_model") else _spa
+
+                                # Per-mode generate prep + call. Each branch builds its own
+                                # gen_kwargs and calls _spa.generate(...) directly — no
+                                # indirection through evaluation.run_inference_spa.
+                                if args.vanilla:
+                                    # Stock Qwen 3D M-RoPE: HF computes position_ids itself.
+                                    generated = _spa.generate(
+                                        input_ids         = p_ids,
+                                        attention_mask    = p_mask,
+                                        pixel_values      = t_pv,
+                                        image_grid_thw    = t_thw,
+                                        mm_token_type_ids = p_mm,
+                                        max_new_tokens    = args.eval_max_new_tokens,
+                                        do_sample         = False,
+                                        pad_token_id      = tokenizer.eos_token_id,
+                                    )
+                                elif args.decouple or args.polar:
+                                    # Decouple / polar: keep Qwen 3D M-RoPE in rotary dims +
+                                    # new XYZ RoPE in pass-through. HF's generate() strips
+                                    # non-standard kwargs (mm_token_type_ids, image_xyz), so
+                                    # pre-compute xyz_pos on the prompt and stash on the
+                                    # language_model; SpaDecModel.forward picks it up when
+                                    # mm_token_type_ids is None on decode steps.
+                                    xyz_pos = _backbone.model._compute_xyz_pos(
+                                        input_ids         = p_ids,
+                                        mm_token_type_ids = p_mm,
+                                        image_grid_thw    = t_thw,
+                                        attention_mask    = p_mask,
+                                        image_xyz         = t_xyz,
+                                    )
+                                    _backbone.model.language_model._xyz_pos     = xyz_pos
+                                    _backbone.model.language_model._coord_scale = _coord_scale
+                                    _backbone.model.language_model._polar       = _polar
+                                    generated = _spa.generate(
+                                        input_ids      = p_ids,
+                                        attention_mask = p_mask,
+                                        pixel_values   = t_pv,
+                                        image_grid_thw = t_thw,
+                                        max_new_tokens = args.eval_max_new_tokens,
+                                        do_sample      = False,
+                                        pad_token_id   = tokenizer.eos_token_id,
+                                        coord_scale    = _coord_scale,
+                                        polar          = _polar,
+                                    )
+                                else:
+                                    # Default 4D M-RoPE: pre-compute 5D position_ids so
+                                    # generate()'s _prepare_position_ids_for_generation is
+                                    # bypassed (otherwise SpaForConditionalGeneration's
+                                    # *args/**kwargs forward signature defeats inspect-based
+                                    # detection and the model falls back to 3D position_ids).
+                                    position_ids, _ = _backbone.model.get_rope_index(
+                                        input_ids         = p_ids,
+                                        mm_token_type_ids = p_mm,
+                                        image_grid_thw    = t_thw,
+                                        video_grid_thw    = None,
+                                        attention_mask    = p_mask,
+                                        image_xyz         = t_xyz,
+                                        coord_scale       = _coord_scale,
+                                        polar             = _polar,
+                                    )
+                                    _gen_kwargs = dict(
+                                        input_ids      = p_ids,
+                                        attention_mask = p_mask,
+                                        pixel_values   = t_pv,
+                                        image_grid_thw = t_thw,
+                                        position_ids   = position_ids,
+                                        max_new_tokens = args.eval_max_new_tokens,
+                                        do_sample      = False,
+                                        pad_token_id   = tokenizer.eos_token_id,
+                                        coord_scale    = _coord_scale,
+                                    )
+                                    if t_xyz is not None:
+                                        _gen_kwargs["image_xyz"] = t_xyz
+                                    if _polar:
+                                        _gen_kwargs["polar"] = True
+                                    generated = _spa.generate(**_gen_kwargs)
+
+                            # Decode model output and supervised GT, extract letter.
+                            trimmed = generated[0][p_ids.shape[1]:]
+                            pred_text = tokenizer.decode(
+                                trimmed.tolist(), skip_special_tokens=True,
                             )
-                            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                            total_loss  = stats[0].item()
-                            total_acc   = stats[1].item()
-                            total_count = int(stats[2].item())
-                        else:
-                            total_loss  = local_loss_sum
-                            total_acc   = local_acc_sum
-                            total_count = local_count
+                            pred_letter = extract_answer_letter(pred_text)
 
-                        if total_count > 0 and local_rank == 0:
-                            avg_loss = total_loss / total_count
-                            avg_acc  = total_acc  / total_count
+                            gt_ids = t_lbl[0, ans_start:]
+                            gt_ids = gt_ids[gt_ids != -100]
+                            gt_text = tokenizer.decode(
+                                gt_ids.tolist(), skip_special_tokens=True,
+                            )
+                            gt_letter = extract_answer_letter(gt_text)
+
+                            if (pred_letter and gt_letter
+                                    and pred_letter.lower() == gt_letter.lower()):
+                                acc_sum += 1.0
+
+                        if world_size > 1:
+                            stats = torch.tensor([loss_sum, acc_sum, count],
+                                                 dtype=torch.float64, device=device)
+                            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                            loss_sum, acc_sum, count = (
+                                stats[0].item(), stats[1].item(), int(stats[2].item()),
+                            )
+
+                        if count > 0 and local_rank == 0:
+                            avg_l = loss_sum / count
+                            avg_a = acc_sum / count
                             log.info(
                                 f"[eval] global_step={global_step:05d}  "
-                                f"{ds_name}_lm_loss={avg_loss:.4f}  "
-                                f"{ds_name}_acc={avg_acc:.4f}  "
-                                f"(n={total_count} samples, aggregated across {world_size} GPU{'s' if world_size > 1 else ''})"
+                                f"{ds_name}_lm_loss={avg_l:.4f}  "
+                                f"{ds_name}_acc={avg_a:.4f}  (n={count})"
                             )
                             if use_wandb:
                                 wandb.log(
-                                    {
-                                        f"eval/{ds_name}_lm_loss": avg_loss,
-                                        f"eval/{ds_name}_acc":     avg_acc,
-                                    },
+                                    {f"eval/{ds_name}_lm_loss": avg_l,
+                                     f"eval/{ds_name}_acc":     avg_a},
                                     step=global_step,
                                 )
 
-                    # Restore gradient checkpointing
-                    if _spa_gc_flag:
-                        _spa.gradient_checkpointing = True
-                    if _lm and _lm_gc_flag:
-                        _lm.gradient_checkpointing = True
-
+                    if _spa_gc_flag:    _spa.gradient_checkpointing = True
+                    if _lm and _lm_gc_flag: _lm.gradient_checkpointing = True
                     model.train()
 
     # Final checkpoint (rank 0 only)
@@ -796,6 +827,10 @@ def parse_args() -> argparse.Namespace:
                    help="Gradient accumulation steps")
     p.add_argument("--save_steps",   type=int,   default=200)
     p.add_argument("--eval_steps",   type=int,   default=100)
+    p.add_argument("--eval_max_new_tokens", type=int, default=20,
+                   help="max_new_tokens for periodic generative eval (deploy-aligned). "
+                        "20 fits `<answer>X. {short option}</answer>` for MCQ benches; "
+                        "raise if eval datasets supervise long answers.")
     p.add_argument("--num_workers",  type=int,   default=4)
     p.add_argument("--max_samples",  type=int,   default=None,
                    help="Truncate dataset to this many samples (None = use all)")
