@@ -114,11 +114,18 @@ class SpatialAttnWrapper(nn.Module):
         # ──────────────────────────────────────────────────────────────────
         **kwargs,
     ):
-        # Decode short-circuit — KV cache already populated → query is text.
-        is_decode = (
-            past_key_values is not None
-            and past_key_values.get_seq_length() > 0
-        )
+        # Decode short-circuit — single-token query continuing a populated cache.
+        # Detect by query length, NOT by past_key_values.get_seq_length() > 0:
+        # Qwen3.5 has hybrid full/linear-attn layers, and a full-attn layer
+        # that runs earlier in the *current* prefill step has already pushed
+        # its KV into the shared DynamicCache. Subsequent full-attn layers
+        # would then see a non-zero seq length mid-prefill and erroneously
+        # skip bias — only the FIRST wrapped layer (e.g. layer 3) would ever
+        # apply spatial bias; layers 7, 11, 15, ... would all silently bypass
+        # it during both training and generation. Query length is the
+        # reliable signal: it's 1 only on the autoregressive decode path;
+        # full-sequence prefill (and every training step) has shape[1] > 1.
+        is_decode = hidden_states.shape[1] == 1
 
         if flat_xyz is None or vision_mask is None or is_decode:
             # SDPA requires `attn_mask.stride(-1) == 1`. The mask flowing through

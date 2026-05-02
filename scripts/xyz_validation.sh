@@ -12,21 +12,20 @@
 #
 # Usage:
 #   bash scripts/xyz_validation.sh \
-#       --method   {position_embedding|coordinate|polar|decouple|atten} \
+#       --method   {position_embedding|coordinate|decouple|atten} \
 #       --ckpt     <ckpt dir> \
 #       [--datasets "mindcube,sat_real,spinbench"]   # default: mindcube
 #       [--gpus 0,1,2,3]                              # default: all visible
 #       [--limit N]                                   # debug truncation
 #       [--output <base dir>]                         # default: vis_results/
 #       [--run_name <name>]                           # sub-folder per dataset
-#       [--xyz_rope_dim N]                            # polar/decouple only, default 66
-#       [--max_new_tokens N]                          # default 512
+#       [--xyz_rope_dim N]                            # decouple only, default 66
+#       [--max_new_tokens N]                          # default 4096
 #       [--only normal|zero|both]                     # default both
 #
 # Methods that ingest xyz at inference (others have no point ablating):
 #   position_embedding   — SPA LoRA + 4D M-RoPE (xyz fed through RoPE; no coord head)
 #   coordinate           — SPA LoRA + 4D M-RoPE + coord head (Cartesian readout)
-#   polar                — SpaDec + LoRA: log-spherical XYZ RoPE in pass-through, θ=1000
 #   decouple             — SpaDec + LoRA: Cartesian XYZ RoPE in pass-through, θ=10000
 #   atten                — Qwen3.5 + LoRA + per-layer SpatialAttentionBias on V↔V
 #                          (3D M-RoPE unchanged; matches train_atten.py)
@@ -77,7 +76,7 @@ OUTPUT_BASE="$SPATIAL_DIR/vis_results"
 RUN_NAME=""
 ONLY="both"
 XYZ_ROPE_DIM=""
-MAX_NEW_TOKENS=512
+MAX_NEW_TOKENS=4096
 DATASETS_ARG=""
 
 # Default dataset for this ablation: just MindCube (smallest meaningful set).
@@ -125,7 +124,7 @@ done
 # Validate arguments
 # =============================================================================
 
-VALID_METHODS="position_embedding coordinate polar decouple atten"
+VALID_METHODS="position_embedding coordinate decouple atten"
 if [[ -z "$METHOD" ]]; then
     echo "[ERROR] --method is required (one of: $VALID_METHODS)" >&2
     exit 1
@@ -220,7 +219,7 @@ echo "[INFO] CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES:-<all>}"
 echo "[INFO] N_GPU                : $N_GPU"
 echo "[INFO] only                 : $ONLY"
 echo "[INFO] limit                : ${LIMIT:-all}"
-echo "[INFO] xyz_rope_dim         : ${XYZ_ROPE_DIM:-66 (default; only used by polar/decouple)}"
+echo "[INFO] xyz_rope_dim         : ${XYZ_ROPE_DIM:-66 (default; only used by decouple)}"
 echo "[INFO] max_new_tokens       : $MAX_NEW_TOKENS"
 echo "[INFO] output base          : $OUTPUT_BASE"
 echo "[INFO] run name             : $RUN_NAME"

@@ -19,7 +19,7 @@ python curve_evaluation.py \\
     --start     500 \\
     --end       1000 \\
     --step_size 50 \\
-    --method    coordinate \\  # or polar / decouple / atten
+    --method    coordinate \\  # or decouple / atten
     --datasets  mindcube,sat_real \\
     --gpus      0,1,2,3 \\
     --output_dir eval_results/curves/coordinate_no_cam_mindcube
@@ -307,7 +307,7 @@ def main() -> None:
                         help="Step stride (default: 50).")
     parser.add_argument(
         "--method", type=str, default="coordinate",
-        choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
+        choices=["baseline", "vanilla", "position_embedding", "coordinate",
                  "decouple", "atten"],
         help="Evaluation method (default: coordinate).",
     )
@@ -330,8 +330,9 @@ def main() -> None:
              "(default: eval_results/curves/<ckpt_dir_basename>).",
     )
     parser.add_argument(
-        "--max_new_tokens", type=int, default=512,
-        help="Max new tokens for generation (default: 512).",
+        "--max_new_tokens", type=int, default=4096,
+        help="Max new tokens for generation (default: 4096; sized to fit "
+             "longest VST training answer ≈3987 tokens).",
     )
     args = parser.parse_args()
 

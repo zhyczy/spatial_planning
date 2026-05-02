@@ -1,35 +1,30 @@
 """
-train_coordinate.py
+train_enhance.py
 
-LoRA fine-tuning of SpaForConditionalGeneration (Qwen3.5-VL) with two
-simultaneous supervision signals:
-
-    1. LM answer   — causal cross-entropy on answer tokens
-                                     (question appended to prompt; answer supervised)
-    2. Coordinate  — L1 loss predicting sub-pixel 3D (x,y,z)
-                                     (decoded from vision-token hidden states)
+Baseline that does NOT fine-tune Qwen3.5-VL.  Instead, each merged-patch
+vision token receives a sinusoidal 3D positional encoding built from the
+patch-level (x, y, z) coordinate map.  The LLM weights stay frozen — the
+only optimised module is `coord_head`.
 
 Architecture:
-    CoordinateModel
-    +-- SpaForConditionalGeneration  [backbone + LoRA adapters]
-        |    +-- SpaVisionModel (ViT, optional frozen)
-    |    +-- SpaModel (LLM + 4D M-RoPE)
-        +-- CoordinateRegressionHead [DepthPredictionTransformer -> sub-pixel 3D]
+    EnhanceModel
+    ├── Qwen3_5ForConditionalGeneration   (frozen — vision + language)
+    │       └── 3D PE injected element-wise into merged image embeds
+    │           (formula: per-axis sinusoidal, see src/models/enhance_llm.py)
+    └── DepthPredictionTransformer        (trainable — sub-pixel xyz)
 
-Coordinate GT:
-  For each image and each LLM patch token (after spatial merge), the GT is the
-  mean (x,y,z) of all valid pixels that fall within that patch -- exactly the
-  values already computed by resize_xyz() and stored as image_xyz.
+Loss:
+    loss = answer_weight * lm_loss (logging only, frozen)
+         + coord_weight  * coord_loss   ← the real training signal
 
-Total loss:
-    loss = answer_weight * lm_loss + coord_weight * coord_loss
-
-Camera transform prediction is removed in this script.
+Compare against train_coordinate.py:
+  • train_coordinate.py: LoRA on Qwen + 4D M-RoPE (xyz)  + coord_head
+  • train_enhance.py:    Frozen Qwen + 3D PE on patches  + coord_head
 
 Usage:
-  python train_coordinate.py \\
+  python train_enhance.py \\
       --model_path checkpoints/Qwen3.5-4B \\
-      --output_dir checkpoints/spa_coordinate
+      --output_dir checkpoints/spa_enhance
 """
 
 import argparse
@@ -52,17 +47,16 @@ except ImportError:
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoProcessor
-from peft import LoraConfig, TaskType, get_peft_model
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
+)
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
 from src.models import (
     DepthPredictionTransformer,
-    CoordinateModel,
-    SpaForConditionalGeneration,
-    SpaDecForConditionalGeneration,
-    patch_attention_layers_dec,
+    EnhanceModel,
 )
 from src.dataset import VST_Train_Dataset_Coord, Eval_Dataset_Coord
 
@@ -95,132 +89,45 @@ def build_model(
     model_path:         str,
     image_token_id:     int,
     spatial_merge_size: int,
-    coord_upscale:      int = 4,
-    lora_rank:          int = 16,
-    freeze_vision:      bool = True,
+    coord_upscale:      int   = 4,
     skip_layers:        tuple[int, ...] = (-1,),
     answer_weight:      float = 1.0,
     coord_weight:       float = 1.0,
-    decouple:           bool  = False,
-    xyz_rope_dim:       int   = 66,
-) -> CoordinateModel:
+    use_coord_head:     bool  = True,
+) -> EnhanceModel:
     """
-    Build CoordinateModel with LM + coordinate supervision.
-    Camera transform prediction is removed.
-
-    ``decouple`` uses the decouple architecture (mirrors train_correspondence.py):
-    keep Qwen original 3D M-RoPE [11,11,10] in the rotary 64 dims (UNCHANGED)
-    and add a new XYZ RoPE (66 dims) in pass-through dims 64..129. Text tokens
-    get xyz=(0,0,0) → identity rotation. Cartesian xyz, rope_theta=10000.
+    Build EnhanceModel: frozen Qwen3.5-VL + sinusoidal 3D PE on patches +
+    optional coord_head.  No LoRA, no M-RoPE changes — Qwen is loaded with
+    its original config.
     """
-    if xyz_rope_dim % 6 != 0 or xyz_rope_dim <= 0 or xyz_rope_dim > 192:
-        raise ValueError(
-            f"--xyz_rope_dim must be a positive multiple of 6 ≤ 192 "
-            f"(pass-through region); got {xyz_rope_dim}."
-        )
-
-    use_decouple = decouple
-
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
-    if use_decouple:
-        # Keep Qwen's original 3D M-RoPE [11,11,10] and partial_rotary=0.25
-        # completely untouched; the XYZ RoPE lives in the pass-through 66 dims
-        # via SpaDecForConditionalGeneration + patch_attention_layers_dec.
-        orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
-        _xyz_theta = 10000.0
-        log.info(
-            f"mrope_section: {orig_section} (UNCHANGED — Qwen original 3D M-RoPE) "
-            f"+ new XYZ RoPE ({xyz_rope_dim} dims, rope_theta={_xyz_theta:g}) in pass-through region "
-            f"[input: Cartesian (x, y, z)]"
-        )
-        spa = SpaDecForConditionalGeneration.from_pretrained(
-            model_path,
-            config              = config,
-            torch_dtype         = torch.bfloat16,
-            attn_implementation = "sdpa",
-        )
-        # Swap in the requested xyz_dim. xyz_rotary_emb has no trainable params
-        # (only an inv_freq buffer), so replacing it post-from_pretrained is
-        # safe and happens before LoRA wrapping. SpaDecAttentionWrapper reads
-        # xyz_dim from cos.shape[-1] at runtime, so no other change needed.
-        if xyz_rope_dim != 66:
-            from src.models.spa_emb_dec import SpaXYZRotaryEmbedding
-            _lm  = spa.model.language_model
-            _old = _lm.xyz_rotary_emb
-            _new = SpaXYZRotaryEmbedding(
-                xyz_dim             = xyz_rope_dim,
-                rope_theta          = _xyz_theta,
-                default_coord_scale = _old.default_coord_scale,
-            )
-            _lm.xyz_rotary_emb = _new.to(next(_lm.parameters()).device)
-            log.info(
-                f"[XYZ RoPE] xyz_dim={xyz_rope_dim} (n_per_axis={xyz_rope_dim // 6}), "
-                f"theta={_xyz_theta:g}"
-            )
-    else:
-        orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
-        total = sum(orig_section)  # 32
-        t_size = 2
-        xyz_size = (total - t_size) // 3
-        new_section = [t_size, xyz_size, xyz_size, xyz_size]
-        config.text_config.rope_scaling["mrope_section"] = new_section
-        log.info(
-            f"mrope_section -> {new_section}  sum={sum(new_section)}  "
-            f"(4D M-RoPE: {t_size} for t, {xyz_size} each for x/y/z)"
-        )
-
-        spa = SpaForConditionalGeneration.from_pretrained(
-            model_path,
-            config              = config,
-            torch_dtype         = torch.bfloat16,
-            attn_implementation = "sdpa",
-        )
-
-    if freeze_vision:
-        for p in spa.model.visual.parameters():
-            p.requires_grad_(False)
-        log.info("Vision encoder frozen.")
-
-    lora_cfg = LoraConfig(
-        r              = lora_rank,
-        lora_alpha     = lora_rank * 2,
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        lora_dropout = 0.05,
-        bias         = "none",
-        task_type    = TaskType.CAUSAL_LM,
+    base = Qwen3_5ForConditionalGeneration.from_pretrained(
+        model_path,
+        config              = config,
+        torch_dtype         = torch.bfloat16,
+        attn_implementation = "sdpa",
     )
-    spa = get_peft_model(spa, lora_cfg)
-    spa.print_trainable_parameters()
 
-    # Patch attention layers for decouple (after LoRA) so each self_attn
-    # sees the XYZ RoPE frequencies in the pass-through 66 dims.
-    if use_decouple:
-        n = patch_attention_layers_dec(spa)
-        log.info(f"Wrapped {n} attention layers with SpaDecAttentionWrapper.")
+    # Freeze everything in the base model — vision + language.
+    for p in base.parameters():
+        p.requires_grad_(False)
+    base.eval()  # disable dropout for the frozen backbone
+    log.info("Qwen3.5-VL fully frozen (vision + language). No LoRA.")
 
-    # Gradient checkpointing: trade ~20% speed for ~60% activation memory savings
-    spa.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
-    lm = spa.model.model.language_model if hasattr(spa.model, 'model') else spa.model.language_model
-    gc_flag = getattr(lm, 'gradient_checkpointing', False)
-    log.info(f"Gradient checkpointing enabled. language_model.gradient_checkpointing={gc_flag}")
-    if not gc_flag:
-        lm.gradient_checkpointing = True
-        log.info("Manually set gradient_checkpointing=True on language_model")
+    coord_head: torch.nn.Module | None = None
+    if use_coord_head:
+        hidden_dim = config.text_config.hidden_size
+        coord_head = DepthPredictionTransformer(
+            hidden_dim=hidden_dim, upscale_factor=coord_upscale,
+        ).to(torch.bfloat16)
+        log.info(
+            f"DepthPredictionTransformer hidden_dim={hidden_dim} "
+            f"upscale={coord_upscale} (trainable)"
+        )
 
-    hidden_dim = config.text_config.hidden_size
-    coord_head = DepthPredictionTransformer(
-        hidden_dim=hidden_dim, upscale_factor=coord_upscale,
-    ).to(torch.bfloat16)
-    log.info(f"DepthPredictionTransformer hidden_dim={hidden_dim} upscale={coord_upscale}")
-
-    return CoordinateModel(
-        spa_model          = spa,
+    return EnhanceModel(
+        base_model         = base,
         coord_head         = coord_head,
         image_token_id     = image_token_id,
         spatial_merge_size = spatial_merge_size,
@@ -261,8 +168,6 @@ def train(args: argparse.Namespace) -> None:
         args.model_path, trust_remote_code=True
     )
     tokenizer = processor.tokenizer
-
-    # image_token_id: <|image_pad|> in Qwen-VL tokeniser
     image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     rank0_print(f"<|image_pad|> token id = {image_token_id}")
 
@@ -273,57 +178,44 @@ def train(args: argparse.Namespace) -> None:
     spatial_merge_size = int(_vcfg.get("spatial_merge_size", 2))
     rank0_print(f"spatial_merge_size = {spatial_merge_size}")
 
-    # -- coord_scale -----------------------------------------------------------
-    coord_scale_final = float(args.coord_scale)
-    rank0_print(f"coord_scale = {coord_scale_final}")
-
     # -- model -----------------------------------------------------------------
     model = build_model(
         args.model_path,
         image_token_id     = image_token_id,
         spatial_merge_size = spatial_merge_size,
         coord_upscale      = args.coord_upscale,
-        lora_rank          = args.lora_rank,
-        freeze_vision      = not args.train_vision,
         skip_layers        = tuple(args.skip_layers),
         answer_weight      = args.answer_weight,
         coord_weight       = args.coord_weight,
-        decouple           = args.decouple,
-        xyz_rope_dim       = args.xyz_rope_dim,
+        use_coord_head     = not args.no_coord_head,
     )
-    # Letter-position offset inside the masked answer suffix. Probed
-    # dynamically (Qwen BPE merges `>X`, see src/dataset/answer_format.py).
-    # Plumbed into CoordinateModel.forward so its eval-time `_ldict["acc"]`
-    # reports the letter-prediction accuracy.
-    #
-    # ⚠️  WARNING: this is a TEACHER-FORCED probe — it gives the model the GT
-    # `<answer>` prefix and asks "what's the next token?". On datasets where
-    # the model doesn't reliably emit `<answer>` itself (e.g. SpinBench,
-    # where AR output is often `<image>X</image>` or a bare letter), this
-    # OVERESTIMATES real acc by 30-40 pp. Verified on atten_vst_1/step_500:
-    # spinbench LETTER_OFFSET acc = 62% vs deploy generative acc = 24%.
-    # Trust evaluation.py deploy eval for ground truth. See train_atten.py
-    # periodic eval for the upgraded generative + extract_answer_letter
-    # pattern.
+
     from src.dataset import compute_letter_offset
     model.letter_offset = compute_letter_offset(processor.tokenizer)
     log.info(f"letter_offset = {model.letter_offset}")
     log.warning(
         "[eval] using LETTER_OFFSET teacher-forced probe — acc is INFLATED "
-        "on datasets like SpinBench (model may not autoregressively emit "
-        "<answer>). Use evaluation.py deploy eval for true acc."
+        "on datasets like SpinBench. Use evaluation.py deploy eval for true acc."
     )
-    log.info("Using CoordinateModel (camera transform prediction removed)")
+    log.info("Using EnhanceModel (frozen Qwen3.5 + sinusoidal 3D PE).")
 
     model = model.to(device)
     if local_rank == 0:
         mem_gb = torch.cuda.memory_allocated(device) / 1e9
         log.info(f"[MEM] After model.to(device): {mem_gb:.2f} GiB allocated")
 
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    rank0_print(
+        f"Trainable params: {n_train:,} / {n_total:,} "
+        f"({100.0 * n_train / max(n_total, 1):.4f}%)"
+    )
+
     # -- DDP -------------------------------------------------------------------
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank],
-                    find_unused_parameters=False)
+        # find_unused_parameters=True: the frozen base model has no grads,
+        # so DDP must tolerate parameters that are not used in backward.
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
         _model = model.module
     else:
         _model = model
@@ -353,7 +245,7 @@ def train(args: argparse.Namespace) -> None:
         sampler     = train_sampler,
     )
 
-    # -- test datasets (full format: same prompt as training) ------------------
+    # -- test datasets ---------------------------------------------------------
     _eval_dir = os.path.join(_ROOT, "datasets/evaluation")
     test_loaders = {}
     test_samplers = {}
@@ -391,16 +283,19 @@ def train(args: argparse.Namespace) -> None:
         test_samplers[_ds_name] = _eval_sampler
         log.info(f"Eval dataset '{_ds_name}': {len(ds)} samples")
 
-
     # -- optimiser -------------------------------------------------------------
-    trainable   = [p for p in model.parameters() if p.requires_grad]
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if not trainable:
+        raise RuntimeError(
+            "No trainable parameters found. Pass --coord_head (default) so "
+            "DepthPredictionTransformer is constructed."
+        )
     optimizer   = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
     total_steps = args.epochs * len(train_loader) // args.grad_accum
     scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(total_steps, 1)
     )
 
-    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
     # -- logging to file -------------------------------------------------------
@@ -427,7 +322,7 @@ def train(args: argparse.Namespace) -> None:
     else:
         rank0_print(f"Logging to {rank_log_file}")
 
-    # -- WandB (rank 0 only) ---------------------------------------------------
+    # -- WandB -----------------------------------------------------------------
     use_wandb = _WANDB_AVAILABLE and args.wandb_project and local_rank == 0
     if use_wandb:
         wandb.init(
@@ -441,9 +336,14 @@ def train(args: argparse.Namespace) -> None:
     elif args.wandb_project and not _WANDB_AVAILABLE and local_rank == 0:
         log.warning("wandb not installed -- logging disabled. `pip install wandb`")
 
+    # Keep frozen Qwen in eval() mode even after model.train() — this is
+    # important for layers with stochastic behaviour (dropout). Only the
+    # coord_head should be trained.
     model.train()
+    if hasattr(_model, "base_model"):
+        _model.base_model.eval()
 
-    global_step = 0
+    global_step  = 0
     running_loss = 0.0
     running_loss_dict: dict[str, float] = {}
     optimizer.zero_grad()
@@ -453,8 +353,6 @@ def train(args: argparse.Namespace) -> None:
             train_sampler.set_epoch(epoch)
 
         for step, batch in enumerate(train_loader):
-
-            # -- move batch to device ------------------------------------------
             input_ids      = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             pixel_values   = batch.get("pixel_values")
@@ -492,18 +390,15 @@ def train(args: argparse.Namespace) -> None:
                     f"mem_before_fwd={mem_before:.2f} GiB"
                 )
 
-            # -- forward + loss ------------------------------------------------
-  
             _, loss, loss_dict = model(
-                input_ids         = input_ids,
-                attention_mask    = attention_mask,
-                pixel_values      = pixel_values,
-                image_grid_thw    = image_grid_thw,
+                input_ids       = input_ids,
+                attention_mask  = attention_mask,
+                pixel_values    = pixel_values,
+                image_grid_thw  = image_grid_thw,
                 mm_token_type_ids = mm_token_type_ids,
-                image_xyz         = image_xyz,
-                image_xyz_hires   = image_xyz_hires,
-                coord_scale       = coord_scale_final,
-                labels            = labels,
+                image_xyz       = image_xyz,
+                image_xyz_hires = image_xyz_hires,
+                labels          = labels,
             )
 
             if loss is None:
@@ -516,7 +411,6 @@ def train(args: argparse.Namespace) -> None:
                 for k, v in loss_dict.items():
                     running_loss_dict[k] = running_loss_dict.get(k, 0.0) + v
 
-            # -- gradient accumulation -----------------------------------------
             if (step + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
                 optimizer.step()
@@ -532,7 +426,6 @@ def train(args: argparse.Namespace) -> None:
                 running_loss = 0.0
                 running_loss_dict.clear()
 
-                # All-reduce training losses across ranks
                 if world_size > 1:
                     _loss_keys = sorted(avg_loss_dict.keys())
                     _loss_vals = [avg_loss] + [avg_loss_dict[k] for k in _loss_keys]
@@ -565,25 +458,12 @@ def train(args: argparse.Namespace) -> None:
                             step=global_step,
                         )
 
-                    # -- checkpoint ------------------------------------------------
                     if global_step % args.save_steps == 0:
                         _save_checkpoint(_model, tokenizer, args.output_dir,
                                          global_step)
 
-                # -- periodic evaluation on test sets --------------------------
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
-                    _spa = _model.spa_model if hasattr(_model, 'spa_model') else _model
-
-                    # Disable gradient checkpointing during eval
-                    _spa_gc_flag = getattr(_spa, 'gradient_checkpointing', False)
-                    _lm = _spa.language_model if hasattr(_spa, 'language_model') else None
-                    _lm_gc_flag = getattr(_lm, 'gradient_checkpointing', False) if _lm else False
-                    if _spa_gc_flag:
-                        _spa.gradient_checkpointing = False
-                    if _lm and _lm_gc_flag:
-                        _lm.gradient_checkpointing = False
-
                     for ds_name, loader in test_loaders.items():
                         if ds_name in test_samplers and test_samplers[ds_name] is not None:
                             test_samplers[ds_name].set_epoch(global_step)
@@ -614,7 +494,6 @@ def train(args: argparse.Namespace) -> None:
                             if t_xyz_h is not None:
                                 t_xyz_h = [x.to(device) for x in t_xyz_h]
 
-
                             with torch.inference_mode():
                                 _, loss, loss_dict = model(
                                     input_ids         = t_ids,
@@ -624,18 +503,14 @@ def train(args: argparse.Namespace) -> None:
                                     mm_token_type_ids = t_mm,
                                     image_xyz         = t_xyz,
                                     image_xyz_hires   = t_xyz_h,
-                                    coord_scale       = coord_scale_final,
                                     labels            = t_labels,
                                 )
-                            if loss is None:
+                            if loss_dict is None:
                                 continue
                             local_count += 1
-                            if loss_dict:
-                                for k, v in loss_dict.items():
-                                    local_loss_sums[k] = local_loss_sums.get(k, 0.0) + v
-                            
+                            for k, v in loss_dict.items():
+                                local_loss_sums[k] = local_loss_sums.get(k, 0.0) + v
 
-                        # Aggregate across all ranks
                         _loss_keys = sorted(local_loss_sums.keys())
                         if world_size > 1:
                             _vals = [float(local_count)] + [local_loss_sums.get(k, 0.0) for k in _loss_keys]
@@ -648,8 +523,6 @@ def train(args: argparse.Namespace) -> None:
                             agg_sums = dict(local_loss_sums)
 
                         if total_count > 0 and local_rank == 0:
-                            # Pull `acc` to the front of the line for visibility;
-                            # other loss keys follow in sorted order.
                             _front  = f"acc={agg_sums['acc'] / total_count:.4f}  " if "acc" in agg_sums else ""
                             _rest   = "  ".join(
                                 f"{k}={agg_sums[k] / total_count:.4f}"
@@ -676,15 +549,10 @@ def train(args: argparse.Namespace) -> None:
                                     step=global_step,
                                 )
 
-                    # Restore gradient checkpointing
-                    if _spa_gc_flag:
-                        _spa.gradient_checkpointing = True
-                    if _lm and _lm_gc_flag:
-                        _lm.gradient_checkpointing = True
-
                     model.train()
+                    if hasattr(_model, "base_model"):
+                        _model.base_model.eval()
 
-    # Final checkpoint (rank 0 only)
     if local_rank == 0:
         _save_checkpoint(_model, tokenizer, args.output_dir, global_step,
                          suffix="final")
@@ -696,22 +564,28 @@ def train(args: argparse.Namespace) -> None:
 
 
 def _save_checkpoint(
-    model:      CoordinateModel,
+    model:      EnhanceModel,
     tokenizer,
     output_dir: str,
     step:       int,
     suffix:     str = "",
 ) -> None:
+    """Save only the trainable coord_head + tokenizer.
+
+    The frozen Qwen weights are unchanged from the pretrained checkpoint,
+    so we don't re-write them.  Loading is the inverse:
+        coord_head.load_state_dict(torch.load("coord_head.pt"))
+    """
     tag  = f"step_{step}" + (f"_{suffix}" if suffix else "")
     ckpt = os.path.join(output_dir, tag)
     os.makedirs(ckpt, exist_ok=True)
 
-    model.spa_model.save_pretrained(ckpt)
     tokenizer.save_pretrained(ckpt)
-    torch.save(
-        model.coord_head.state_dict(),
-        os.path.join(ckpt, "coord_head.pt"),
-    )
+    if model.coord_head is not None:
+        torch.save(
+            model.coord_head.state_dict(),
+            os.path.join(ckpt, "coord_head.pt"),
+        )
     log.info(f"Checkpoint saved -> {ckpt}")
 
 
@@ -719,8 +593,8 @@ def _save_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="LoRA fine-tuning of SpaForConditionalGeneration "
-                    "with answer + coordinate supervision."
+        description="Frozen Qwen3.5-VL + sinusoidal 3D PE on patches "
+                    "(baseline; only coord_head is trained)."
     )
     p.add_argument(
         "--model_path",
@@ -730,81 +604,43 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--json_path",
         default=os.path.join(_ROOT, "datasets/train/VST_parsed/vst_500k.json"),
-        help="Path to VST training JSON (vst_500k.json).",
     )
     p.add_argument(
         "--vst_results_dir",
         default=os.path.join(_ROOT, "datasets/train/VST/3d_results"),
-        help="Root of VST 3d_results tree (subdirs per task family).",
     )
     p.add_argument(
         "--output_dir",
-        default=os.path.join(_ROOT, "checkpoints/spa_coordinate"),
+        default=os.path.join(_ROOT, "checkpoints/spa_enhance"),
     )
-    p.add_argument("--epochs",      type=int,   default=3)
+    p.add_argument("--epochs",      type=int,   default=1)
     p.add_argument("--lr",          type=float, default=2e-4)
-    p.add_argument("--lora_rank",   type=int,   default=16)
     p.add_argument("--max_images",  type=int,   default=4)
     p.add_argument("--grad_accum",  type=int,   default=8)
-    p.add_argument("--save_steps",  type=int,   default=200)
-    p.add_argument("--eval_steps",  type=int,   default=100)
+    p.add_argument("--save_steps",  type=int,   default=1000)
+    p.add_argument("--eval_steps",  type=int,   default=200)
     p.add_argument("--num_workers", type=int,   default=4)
     p.add_argument("--max_samples", type=int,   default=None)
     p.add_argument(
-        "--train_vision",
-        action="store_true",
-        help="Unfreeze the vision encoder (ViT) for fine-tuning",
-    )
-    p.add_argument(
         "--skip_layers",
-        type=int, nargs="+", default=[-8, -4, -1],
-        help="LLM layer indices used by CoordinateModel. "
-             "e.g. --skip_layers -4 -1 (default: -8 -4 -1)",
+        type=int, nargs="+", default=[-1],
+        help="LLM layer index from which coord_head reads hidden states.",
+    )
+    p.add_argument("--answer_weight", type=float, default=1.0)
+    p.add_argument("--coord_weight",  type=float, default=1.0)
+    p.add_argument(
+        "--coord_upscale", type=int, default=4,
+        help="PixelShuffle factor for coord_head (each patch predicts "
+             "upscale^2 sub-pixel xyz).",
     )
     p.add_argument(
-        "--answer_weight",
-        type=float, default=1.0,
-        help="Weight for the LM answer-prediction loss.",
+        "--no_coord_head", action="store_true",
+        help="Skip the coord_head entirely (pure inference baseline — "
+             "nothing trainable; the script will refuse to start).",
     )
-    p.add_argument(
-        "--coord_weight",
-        type=float, default=1.0,
-        help="Weight for the per-patch coordinate prediction loss.",
-    )
-    p.add_argument(
-        "--coord_upscale",
-        type=int, default=4,
-        help="PixelShuffle upscale factor for coord head. "
-             "Each vision patch predicts upscale^2 sub-pixel (x,y,z) values.",
-    )
-    p.add_argument(
-        "--coord_scale",
-        type=float, default=100.0,
-        help="Scalar multiplier applied to xyz before RoPE discretization.",
-    )
-    p.add_argument(
-        "--decouple",
-        action="store_true",
-        help="Decoupled position embedding (mirrors train_correspondence.py "
-             "--decouple): keep Qwen original 3D M-RoPE [11,11,10] in the "
-             "rotary 64 dims (UNCHANGED) and add a NEW XYZ RoPE (66 dims, "
-             "sequential x|y|z each 11 bands, rope_theta=10000) in pass-through "
-             "dims 64..129, fed with Cartesian xyz. Text tokens default to "
-             "xyz=(0,0,0) → identity rotation.",
-    )
-    p.add_argument(
-        "--xyz_rope_dim",
-        type=int, default=66,
-        help="Total head_dim units allocated to the XYZ RoPE in the pass-through "
-             "region under --decouple (each axis x/y/z gets xyz_rope_dim/6 "
-             "frequency bands). Must be a positive multiple of 6 ≤ 192 "
-             "(pass-through region size). Default 66 (= 11 bands per axis). "
-             "No effect without --decouple.",
-    )
-    # -- WandB -----------------------------------------------------------------
-    p.add_argument("--wandb_project",  default="", help="WandB project name.")
-    p.add_argument("--wandb_entity",   default="", help="WandB entity.")
-    p.add_argument("--wandb_run_name", default="", help="WandB run name.")
+    p.add_argument("--wandb_project",  default="")
+    p.add_argument("--wandb_entity",   default="")
+    p.add_argument("--wandb_run_name", default="")
     return p.parse_args()
 
 

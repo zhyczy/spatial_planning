@@ -241,30 +241,6 @@ def resize_xyz(
     return torch.from_numpy(xyz_mean)
 
 
-def xyz_to_polar(xyz: torch.Tensor) -> torch.Tensor:
-    """
-    Convert Cartesian (x, y, z) → log-spherical (log r, θ, α).
-
-        r  = sqrt(x²+y²+z²)           — radial distance  ∈ [0, ∞)
-        log r                         — scale-invariant radial channel
-        θ  = atan2(y, x)              — azimuth          ∈ [-π, π]
-        α  = atan2(sqrt(x²+y²), z)    — inclination      ∈ [0, π]
-
-    Patches with zero xyz (no valid pixels) stay at (0, 0, 0).
-    """
-    x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
-    r = torch.sqrt(x**2 + y**2 + z**2)
-    zero_mask = (r == 0)
-    r_safe = r.clamp(min=1e-8)
-    log_r = torch.log(r_safe)
-    theta = torch.atan2(y, x)
-    alpha = torch.atan2(torch.sqrt(x**2 + y**2), z)
-    log_r = torch.where(zero_mask, torch.zeros_like(log_r), log_r)
-    theta = torch.where(zero_mask, torch.zeros_like(theta), theta)
-    alpha = torch.where(zero_mask, torch.zeros_like(alpha), alpha)
-    return torch.stack([log_r, theta, alpha], dim=-1)
-
-
 # ── MindCube training dataset ─────────────────────────────────────────────────
 
 class MindCube_Train_Dataset(Dataset):
@@ -537,22 +513,6 @@ class MindCube_Train_Dataset_Coord(Dataset):
             "image_xyz_hires": image_xyz_hires,
             "labels":         labels,
         }
-
-
-class MindCube_Train_Dataset_Coord_Polar(MindCube_Train_Dataset_Coord):
-    """
-    Variant of MindCube_Train_Dataset_Coord where image_xyz_hires is converted
-    from Cartesian (x, y, z) to log-spherical (log r, θ, α). Use with --polar
-    flag in train_coordinate.py.
-    """
-
-    def __getitem__(self, idx):
-        batch = super().__getitem__(idx)
-        if batch.get("image_xyz_hires") is not None:
-            batch["image_xyz_hires"] = [
-                xyz_to_polar(xyz) for xyz in batch["image_xyz_hires"]
-            ]
-        return batch
 
 
 # ── VST training dataset ──────────────────────────────────────────────────────
@@ -923,17 +883,3 @@ class VST_Train_Dataset_Coord(VST_Train_Dataset):
         }
 
 
-class VST_Train_Dataset_Coord_Polar(VST_Train_Dataset_Coord):
-    """
-    Variant of VST_Train_Dataset_Coord where image_xyz_hires is converted from
-    Cartesian (x, y, z) to log-spherical (log r, θ, α). Use with --polar in
-    train_coordinate.py.
-    """
-
-    def __getitem__(self, idx):
-        batch = super().__getitem__(idx)
-        if batch.get("image_xyz_hires") is not None:
-            batch["image_xyz_hires"] = [
-                xyz_to_polar(xyz) for xyz in batch["image_xyz_hires"]
-            ]
-        return batch

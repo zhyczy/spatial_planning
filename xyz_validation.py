@@ -15,7 +15,7 @@ coord_mae (when applicable) to clearly degrade in PASS 2. A near-zero delta
 means the xyz pathway is being ignored at inference.
 
 Supported methods (must touch xyz at inference time):
-  position_embedding, coordinate, polar, decouple, atten
+  position_embedding, coordinate, decouple, atten
 
 (`baseline` / `vanilla` don't ingest xyz — there's nothing to ablate, so the
 CLI rejects them.)
@@ -85,7 +85,7 @@ from src.dataset import (
 
 _XYZ_METHODS = (
     "position_embedding", "coordinate",
-    "polar", "decouple",
+    "decouple",
     "atten",
 )
 
@@ -94,8 +94,7 @@ def _method_flags(method: str) -> Dict[str, bool]:
     """Per-method routing flags into _load_spa_model / _run_inference_spa."""
     return {
         "vanilla":  False,
-        "decouple": method in ("polar", "decouple"),
-        "polar":    method == "polar",
+        "decouple": method == "decouple",
         "atten":    method == "atten",
     }
 
@@ -181,7 +180,6 @@ def _load_spa_model(
     ckpt_path: str,
     device: str,
     decouple: bool,
-    polar: bool,
     atten: bool,
     xyz_rope_dim: int = 66,
 ) -> Tuple[Any, Any]:
@@ -191,16 +189,14 @@ def _load_spa_model(
     ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path)
     logger.info(
         f"[spa] base={base_model_path}  ckpt={ckpt_dir}  "
-        f"decouple={decouple} polar={polar} atten={atten}"
+        f"decouple={decouple} atten={atten}"
     )
 
     config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
 
-    if atten and (decouple or polar):
-        raise ValueError("[spa] --atten is mutually exclusive with --decouple / --polar.")
-    if polar and not decouple:
-        raise ValueError("[spa] --polar requires --decouple.")
+    if atten and decouple:
+        raise ValueError("[spa] --atten is mutually exclusive with --decouple.")
 
     if atten:
         logger.info(f"[spa] mrope_section: {orig_section} (UNCHANGED — atten)")
@@ -221,17 +217,16 @@ def _load_spa_model(
                 f"[spa] xyz_rope_dim must be a positive multiple of 6 ≤ 192; "
                 f"got {xyz_rope_dim}."
             )
-        _xyz_theta = 1000.0 if polar else 10000.0
-        _mode = "log-spherical (log r, θ, α)" if polar else "Cartesian (x, y, z)"
+        _xyz_theta = 10000.0
         logger.info(
             f"[spa] mrope_section: {orig_section} (UNCHANGED — decouple) "
-            f"+ XYZ RoPE ({xyz_rope_dim} dims, theta={_xyz_theta:g}) [{_mode}]"
+            f"+ XYZ RoPE ({xyz_rope_dim} dims, theta={_xyz_theta:g}) [Cartesian (x, y, z)]"
         )
         spa = SpaDecForConditionalGeneration.from_pretrained(
             base_model_path, config=config,
             torch_dtype=torch.bfloat16, attn_implementation="sdpa",
         )
-        if _xyz_theta != 10000.0 or xyz_rope_dim != 66:
+        if xyz_rope_dim != 66:
             _lm = spa.model.language_model
             _old = _lm.xyz_rotary_emb
             _new = SpaXYZRotaryEmbedding(
@@ -564,14 +559,12 @@ def _run_inference_spa(
             )
         model.model.language_model._xyz_pos     = xyz_pos
         model.model.language_model._coord_scale = float(coord_scale)
-        model.model.language_model._polar       = bool(flags["polar"])
         gen_kwargs = dict(
             **inputs_dev,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=processor.tokenizer.eos_token_id,
             coord_scale=coord_scale,
-            polar=flags["polar"],
         )
         gen_kwargs.pop("mm_token_type_ids", None)
     else:
@@ -588,7 +581,6 @@ def _run_inference_spa(
                 attention_mask=inputs_dev.get("attention_mask"),
                 image_xyz=xyz_on_device,
                 coord_scale=coord_scale,
-                polar=False,
             )
         gen_kwargs = dict(
             **inputs_dev,
@@ -845,7 +837,7 @@ def _evaluate_one_pass(
 
     spa_model, spa_proc = _load_spa_model(
         model_path, ckpt, device,
-        decouple=flags["decouple"], polar=flags["polar"],
+        decouple=flags["decouple"],
         atten=flags["atten"], xyz_rope_dim=xyz_rope_dim,
     )
 
@@ -1041,10 +1033,10 @@ def main() -> None:
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--coord_scale", type=float, default=100.0)
-    ap.add_argument("--max_new_tokens", type=int, default=512)
+    ap.add_argument("--max_new_tokens", type=int, default=4096)
     ap.add_argument(
         "--xyz_rope_dim", type=int, default=66,
-        help="Match training; only relevant for --method polar / decouple.",
+        help="Match training; only relevant for --method decouple.",
     )
     ap.add_argument("--output_dir", required=True)
     ap.add_argument(

@@ -7,26 +7,23 @@
 # 3d_results). Multi-GPU via torchrun (DDP).
 #
 # Default mode: 4D M-RoPE (use_xyz=True, Cartesian xyz fed into vision-token
-# position). Three alternative modes via flags (mutually exclusive):
-#   --polar     : decouple architecture + log-spherical XYZ RoPE
-#                 (Qwen 3D M-RoPE [11,11,10] UNCHANGED in rotary 64 dims +
-#                 new XYZ RoPE in pass-through 64..129 with (log r, θ, α))
+# position). Two alternative modes via flags (mutually exclusive):
 #   --decouple  : decouple architecture + Cartesian XYZ RoPE
-#                 (same as --polar but with raw xyz instead of log-spherical)
+#                 (Qwen 3D M-RoPE [11,11,10] UNCHANGED in rotary 64 dims +
+#                 new XYZ RoPE in pass-through 64..129)
 #   --vanilla   : original Qwen 3D M-RoPE only (no image_xyz at all)
 #
 # Compare against train_atten.sh (per-layer attention bias) and
 # train_coordinate.sh (per-patch coord head loss).
 #
 # Usage:
-#   bash scripts/train_correspondence.sh [num_gpus] [--polar|--decouple|--vanilla]
+#   bash scripts/train_correspondence.sh [num_gpus] [--decouple|--vanilla]
 #                                        [--xyz_rope_dim N] [--max_samples N]
 #
 #   num_gpus         — first positional arg, number of GPUs (default: all visible)
-#   --polar          — decouple + log-spherical XYZ RoPE
 #   --decouple       — decouple + Cartesian XYZ RoPE
 #   --vanilla        — original Qwen 3D M-RoPE (no image_xyz)
-#   --xyz_rope_dim N — total head_dim units for XYZ RoPE under --decouple/--polar
+#   --xyz_rope_dim N — total head_dim units for XYZ RoPE under --decouple
 #                      (each axis gets N/6 freq bands). Multiple of 6 ≤ 192.
 #                      Default 66 (= 11 bands per axis). Stamped into RUN_NAME
 #                      when non-default and applicable.
@@ -35,7 +32,6 @@
 # Examples:
 #   bash scripts/train_correspondence.sh                       # all GPUs, 4D M-RoPE
 #   bash scripts/train_correspondence.sh 2                     # 2 GPUs, 4D M-RoPE
-#   bash scripts/train_correspondence.sh 2 --polar             # decouple + log-spherical
 #   bash scripts/train_correspondence.sh 2 --decouple          # decouple + Cartesian
 #   bash scripts/train_correspondence.sh 2 --vanilla           # original 3D M-RoPE
 #   bash scripts/train_correspondence.sh 1 --max_samples 6     # quick smoke run
@@ -52,7 +48,6 @@ cd "$SPATIAL_DIR"
 NPROC=""
 MAX_SAMPLES=""
 VANILLA_FLAG=""
-POLAR_FLAG=""
 DECOUPLE_FLAG=""
 XYZ_ROPE_DIM=""
 _positional=0
@@ -60,7 +55,6 @@ _positional=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --vanilla)      VANILLA_FLAG="--vanilla"; shift ;;
-        --polar)        POLAR_FLAG="--polar"; shift ;;
         --decouple)     DECOUPLE_FLAG="--decouple"; shift ;;
         --xyz_rope_dim) XYZ_ROPE_DIM="$2"; shift 2 ;;
         --max_samples)  MAX_SAMPLES="$2"; shift 2 ;;
@@ -83,14 +77,15 @@ fi
 # ── hyperparameters ─────────────────────────────────────────────────────────
 
 MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
-JSON_PATH="$SPATIAL_DIR/datasets/train/VST_parsed/vst_500k.json"
+JSON_PATH="$SPATIAL_DIR/datasets/train/VST_parsed/vst_mcq.json"
 VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/VST/3d_results"
 
 EPOCHS=3
-LR=2e-4
+LR=5e-5
+WARMUP_STEPS=100
 LORA_RANK=16
 MAX_IMAGES=8
-GRAD_ACCUM=8
+GRAD_ACCUM=16
 NUM_WORKERS=4
 
 SAVE_STEPS=1000
@@ -102,18 +97,17 @@ WANDB_ENTITY="actmrv"
 # ── run name ────────────────────────────────────────────────────────────────
 
 _vanilla_suffix="${VANILLA_FLAG:+_vanilla}"
-_polar_suffix="${POLAR_FLAG:+_polar}"
 _decouple_suffix="${DECOUPLE_FLAG:+_decouple}"
 
-# Stamp xyz_rope_dim only when overridden AND applicable (--decouple / --polar).
+# Stamp xyz_rope_dim only when overridden AND applicable (--decouple).
 _xrd_suffix=""
 if [ -n "$XYZ_ROPE_DIM" ] && [ "$XYZ_ROPE_DIM" != "66" ] \
-   && { [ -n "$DECOUPLE_FLAG" ] || [ -n "$POLAR_FLAG" ]; }; then
+   && [ -n "$DECOUPLE_FLAG" ]; then
     _xrd_suffix="_xrd${XYZ_ROPE_DIM}"
 fi
 
-RUN_NAME="correspondence_vst${_polar_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
-WANDB_RUN_NAME="corr_vst_r${LORA_RANK}_ep${EPOCHS}${_polar_suffix}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
+RUN_NAME="correspondence_vst${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
+WANDB_RUN_NAME="corr_vst_r${LORA_RANK}_ep${EPOCHS}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 # ── setup ───────────────────────────────────────────────────────────────────
@@ -124,7 +118,6 @@ mkdir -p "$OUTPUT_DIR"
 _mode_label="4D M-RoPE (image_xyz, Cartesian)"
 [ -n "$VANILLA_FLAG"  ] && _mode_label="vanilla 3D M-RoPE (no image_xyz)"
 [ -n "$DECOUPLE_FLAG" ] && _mode_label="decouple 3D M-RoPE + new XYZ RoPE (Cartesian)"
-[ -n "$POLAR_FLAG"    ] && _mode_label="decouple 3D M-RoPE + new XYZ RoPE (log-spherical)"
 
 echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
@@ -133,7 +126,7 @@ echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
 echo "[INFO] Dataset              : VST 500K"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Mode                 : $_mode_label"
-if [ -n "$DECOUPLE_FLAG" ] || [ -n "$POLAR_FLAG" ]; then
+if [ -n "$DECOUPLE_FLAG" ]; then
     echo "[INFO] xyz_rope_dim         = ${XYZ_ROPE_DIM:-66 (default)}"
 fi
 echo "[INFO] Loss                 : LM answer CE only"
@@ -163,6 +156,7 @@ $TORCHRUN \
     --output_dir             "$OUTPUT_DIR"             \
     --epochs                 "$EPOCHS"                 \
     --lr                     "$LR"                     \
+    --warmup_steps           "$WARMUP_STEPS"           \
     --lora_rank              "$LORA_RANK"              \
     --max_images             "$MAX_IMAGES"             \
     --grad_accum             "$GRAD_ACCUM"             \
@@ -172,7 +166,6 @@ $TORCHRUN \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
-    $POLAR_FLAG                                        \
     $DECOUPLE_FLAG                                     \
     $VANILLA_FLAG                                      \
     $XYZ_ROPE_DIM_FLAG                                 \

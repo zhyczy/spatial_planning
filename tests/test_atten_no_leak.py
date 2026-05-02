@@ -85,7 +85,7 @@ def main():
     print("=== Loading atten model …")
     spa, proc = load_spa_model(
         args.model_path, args.ckpt, device,
-        vanilla=False, decouple=False, polar=False, atten=True,
+        vanilla=False, decouple=False, atten=True,
     )
     spa.eval()
 

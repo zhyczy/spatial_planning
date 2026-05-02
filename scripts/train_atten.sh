@@ -18,7 +18,7 @@
 # never through position_ids. Full design notes:
 #   md/model_design/spatial_attention.md
 #
-# To compare against 4D M-RoPE / decouple / polar variants use train_correspondence.sh.
+# To compare against 4D M-RoPE / decouple variants use train_correspondence.sh.
 #
 # Usage:
 #   bash scripts/train_atten.sh [num_gpus] [--max_samples N]
@@ -70,10 +70,11 @@ JSON_PATH="$SPATIAL_DIR/datasets/train/VST_parsed/vst_500k.json"
 VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/VST/3d_results"
 
 EPOCHS=3
-LR=2e-4
+LR=5e-5
+WARMUP_STEPS=100
 LORA_RANK=16
 MAX_IMAGES=8
-GRAD_ACCUM=8
+GRAD_ACCUM=16
 NUM_WORKERS=4
 BIAS_LR_SCALE=10.0
 BIAS_W2_INIT_SCALE=0.01
@@ -126,6 +127,7 @@ $TORCHRUN \
     --output_dir             "$OUTPUT_DIR"             \
     --epochs                 "$EPOCHS"                 \
     --lr                     "$LR"                     \
+    --warmup_steps           "$WARMUP_STEPS"           \
     --lora_rank              "$LORA_RANK"              \
     --max_images             "$MAX_IMAGES"             \
     --grad_accum             "$GRAD_ACCUM"             \

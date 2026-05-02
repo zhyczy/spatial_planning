@@ -73,6 +73,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import logging
 import os
 import sys
@@ -84,7 +85,12 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from transformers import AutoProcessor
+from transformers import (
+    AutoProcessor,
+    StoppingCriteria,
+    StoppingCriteriaList,
+    get_cosine_schedule_with_warmup,
+)
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
 )
@@ -118,6 +124,34 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+# Eval generation cap. Sized to fit the longest VST supervised answer
+# (unknow type ≈ 3987 tokens incl. wrappers), so the model can finish
+# `</answer>` even when it has drifted to long-form outputs from training.
+# Greedy decoding stops at EOS naturally; this is the safety ceiling.
+_EVAL_MAX_NEW_TOKENS = 4096
+
+
+class _StopOnAnswerClose(StoppingCriteria):
+    """Halt generation as soon as the model emits the `</answer>` close tag.
+
+    extract_answer_letter only looks at `<answer>…</answer>`, so anything
+    after the close tag is dead weight. Stopping early bounds per-sample
+    eval time by the actual answer length rather than `_EVAL_MAX_NEW_TOKENS`,
+    which prevents NCCL all_reduce timeouts on the slowest rank when a few
+    samples would otherwise generate to the cap.
+    """
+
+    def __init__(self, tokenizer):
+        ids = tokenizer.encode("</answer>", add_special_tokens=False)
+        self._stop_ids = torch.tensor(ids, dtype=torch.long)
+        self._L = len(ids)
+
+    def __call__(self, input_ids, scores, **kwargs):
+        if input_ids.shape[1] < self._L:
+            return False
+        last = input_ids[0, -self._L:]
+        return bool(torch.equal(last, self._stop_ids.to(last.device)))
 
 
 # ── DDP helpers ───────────────────────────────────────────────────────────────
@@ -234,8 +268,8 @@ def build_model(
 
     # use_xyz=True: AnswerOnlyModel passes image_xyz down so the
     # SpatialAttnVanillaModel.forward can populate _spatial_cache for the
-    # per-layer attention bias. polar / coord_scale are not used in vanilla
-    # mode (the bias module learns its own scale via Linear).
+    # per-layer attention bias. coord_scale is not used in vanilla mode
+    # (the bias module learns its own scale via Linear).
     return AnswerOnlyModel(spa, use_xyz=True)
 
 
@@ -325,7 +359,14 @@ def train(args: argparse.Namespace) -> None:
     _env_rank = os.environ.get("LOCAL_RANK")
     if _env_rank is not None:
         local_rank = int(_env_rank)
-        dist.init_process_group(backend="nccl")
+        # 1h NCCL timeout. Default is 10min, which is too short when periodic
+        # eval has to generate up to _EVAL_MAX_NEW_TOKENS per sample on a few
+        # outlier samples — the slowest rank can fall behind the eval-loop
+        # all_reduce and trip the watchdog.
+        dist.init_process_group(
+            backend="nccl",
+            timeout=datetime.timedelta(hours=1),
+        )
         world_size = dist.get_world_size()
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
@@ -469,8 +510,10 @@ def train(args: argparse.Namespace) -> None:
         weight_decay=0.01,
     )
     total_steps = args.epochs * len(train_loader) // args.grad_accum
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(total_steps, 1)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=max(total_steps, 1),
     )
 
     # ── WandB (rank 0) ────────────────────────────────────────────────────────
@@ -570,6 +613,9 @@ def train(args: argparse.Namespace) -> None:
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
                     _spa = _model.spa_model
+                    _stop_criteria = StoppingCriteriaList(
+                        [_StopOnAnswerClose(tokenizer)]
+                    )
                     # disable GC for KV cache during eval
                     _gc_flag = getattr(_spa, "gradient_checkpointing", False)
                     _lm = _resolve_language_model(_spa)
@@ -677,9 +723,10 @@ def train(args: argparse.Namespace) -> None:
                                     pixel_values      = t_pv,
                                     image_grid_thw    = t_thw,
                                     mm_token_type_ids = p_mm,
-                                    max_new_tokens    = args.eval_max_new_tokens,
+                                    max_new_tokens    = _EVAL_MAX_NEW_TOKENS,
                                     do_sample         = False,
                                     pad_token_id      = tokenizer.eos_token_id,
+                                    stopping_criteria = _stop_criteria,
                                 )
 
                             # Decode model output and supervised GT, extract letter.
@@ -753,16 +800,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir",
                    default=os.path.join(_ROOT, "train_records/spatial_attn"))
     p.add_argument("--epochs",      type=int,   default=3)
-    p.add_argument("--lr",          type=float, default=2e-4)
+    p.add_argument("--lr",          type=float, default=5e-5)
+    p.add_argument("--warmup_steps",type=int,   default=100,
+                   help="Linear warmup steps before cosine decay.")
     p.add_argument("--lora_rank",   type=int,   default=16)
     p.add_argument("--max_images",  type=int,   default=4)
-    p.add_argument("--grad_accum",  type=int,   default=8)
+    p.add_argument("--grad_accum",  type=int,   default=16)
     p.add_argument("--save_steps",  type=int,   default=200)
     p.add_argument("--eval_steps",  type=int,   default=100)
-    p.add_argument("--eval_max_new_tokens", type=int, default=128,
-                   help="Safety cap on tokens generated during periodic eval. "
-                        "Generation stops naturally at <|im_end|> (EOS); this "
-                        "only prevents runaway loops on malformed outputs.")
     p.add_argument("--num_workers", type=int,   default=4)
     p.add_argument("--max_samples", type=int,   default=None,
                    help="Truncate dataset to this many samples (per source).")

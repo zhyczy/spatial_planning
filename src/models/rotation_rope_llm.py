@@ -396,7 +396,7 @@ class _MRoPEAttention(nn.Module):
                 "_MRoPEAttention.forward: xyz_pos required in decouple mode"
             )
             xyz_cos, xyz_sin = self.xyz_rotary_emb(
-                xyz_pos, coord_scale=coord_scale, polar=False,
+                xyz_pos, coord_scale=coord_scale,
             )                                                   # (1, T, xyz_dim)
             # _apply_xyz_rotary internally unsqueezes cos/sin to broadcast over
             # heads (default unsqueeze_dim=1). Pass raw (B, T, xyz_dim) tensors.
@@ -1052,7 +1052,6 @@ class RotationRoPEModel(nn.Module):
         # xyz_position_embeddings and dispatches to SpaDecAttentionWrapper.
         text_model._xyz_pos     = xyz_pos
         text_model._coord_scale = float(coord_scale)
-        text_model._polar       = False
 
         out = text_model(
             inputs_embeds  = inputs_embeds,

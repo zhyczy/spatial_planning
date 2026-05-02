@@ -466,7 +466,6 @@ class SpaModel(Qwen3_5Model):
         temp_merge_size: int = 1,
         spatial_merge_size: int = 1,
         coord_scale=100.0,
-        polar: bool = False,
         device=None,
     ) -> torch.LongTensor:
         """
@@ -491,25 +490,15 @@ class SpaModel(Qwen3_5Model):
             spatial_merge_size: spatial downscale factor (from vision_config).
             coord_scale: multiplier applied to float xyz before rounding to int.
                 Default 100 maps ±10 m → ±1000, which is a reasonable RoPE range.
-            polar: if True, convert Cartesian (x, y, z) → log-spherical
-                (log ρ, θ, α) first. Convention matches dataset xyz_to_polar:
-                    log ρ = log(||xyz||)             — scale-invariant radius
-                    θ     = atan2(y, x)  ∈ [-π, π]   — azimuth (raw radians)
-                    α     = atan2(√(x²+y²), z) ∈ [0, π] — inclination (raw radians)
-                RoPE positions are assigned as (no [0,1] normalization, so θ
-                and α share the same angular resolution under one scale):
-                    log ρ * coord_scale,
-                    θ     * coord_scale,
-                    α     * coord_scale.
             device: torch device.
 
         Returns:
             vision_position_ids: (5, llm_grid_t * llm_grid_h * llm_grid_w)
-                [0] = seq   — sequential position in sequence (for causal mask)
-                [1] = t     — start_position (same for every token in this image)
-                [2] = x/logρ — per-patch discretized x (Cartesian) or log ρ (spherical)
-                [3] = y/θ   — per-patch discretized y (Cartesian) or θ=azimuth (spherical)
-                [4] = z/α   — per-patch discretized z (Cartesian) or α=inclination (spherical)
+                [0] = seq — sequential position in sequence (for causal mask)
+                [1] = t   — start_position (same for every token in this image)
+                [2] = x   — per-patch discretized x (Cartesian)
+                [3] = y   — per-patch discretized y (Cartesian)
+                [4] = z   — per-patch discretized z (Cartesian)
 
         ── MODIFY BELOW ──────────────────────────────────────────────────────
         Ideas:
@@ -529,35 +518,9 @@ class SpaModel(Qwen3_5Model):
             xyz_flat = xyz_flat.repeat(llm_grid_t, 1)            # (num_tokens, 3)
 
         scale_vec = self._coord_scale_vec(coord_scale, device=device)         # (3,) float
-        if polar:
-            # Cartesian → log-spherical: (x, y, z) → (log ρ, θ, α)
-            # Convention matches dataset xyz_to_polar:
-            #   log ρ — scale-invariant radius (RoPE pos-diff = log(ρ_i/ρ_j),
-            #           invariant to global scene scaling ρ → k·ρ)
-            #   θ     = atan2(y, x)          ∈ [-π, π]  — azimuth
-            #   α     = atan2(√(x²+y²), z)   ∈ [0, π]   — inclination
-            rho     = torch.norm(xyz_flat, dim=-1).clamp(min=1e-6)            # (N,)
-            log_rho = torch.log(rho)                                           # (N,) ∈ ℝ
-            theta   = torch.atan2(xyz_flat[:, 1], xyz_flat[:, 0])              # (N,) ∈ [-π, π]
-            alpha   = torch.atan2(
-                torch.sqrt(xyz_flat[:, 0] ** 2 + xyz_flat[:, 1] ** 2),
-                xyz_flat[:, 2],
-            )                                                                  # (N,) ∈ [0, π]
-            # Per-axis scale interpreted as (scale_log_ρ, scale_θ, scale_α).
-            # Raw radians × scale — no [0,1] normalization — so θ and α share
-            # the same angular resolution (1 rad difference ⇒ same position
-            # delta for both). Float32, no round/long: RoPE uses position ×
-            # inv_freq, integer quantization would discard sub-unit precision.
-            rho_f   = (log_rho * scale_vec[0]).float()                         # (N,)
-            theta_f = (theta   * scale_vec[1]).float()                         # (N,) θ ∈ [-π, π]
-            alpha_f = (alpha   * scale_vec[2]).float()                         # (N,) α ∈ [0, π]
-            xyz_pos = torch.stack([rho_f, theta_f, alpha_f], dim=1)            # (N, 3)
-        else:
-            # Per-axis scale broadcasts (N, 3) * (3,) → (N, 3).
-            # Cartesian: round to integer-valued float (1 cm grid at scale=100).
-            # Only polar stays continuous — angle discretization at scale=100 is
-            # too coarse (~3.6°) for far-range patches.
-            xyz_pos = (xyz_flat * scale_vec).round().float()                   # (num_tokens, 3)
+        # Per-axis scale broadcasts (N, 3) * (3,) → (N, 3).
+        # Cartesian: round to integer-valued float (1 cm grid at scale=100).
+        xyz_pos = (xyz_flat * scale_vec).round().float()                       # (num_tokens, 3)
 
         pos_t = torch.full(
             (num_tokens,), float(start_position), dtype=torch.float32, device=device,
@@ -579,7 +542,6 @@ class SpaModel(Qwen3_5Model):
         attention_mask: torch.Tensor | None = None,
         image_xyz: torch.Tensor | None = None,
         coord_scale=100.0,
-        polar: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -631,9 +593,7 @@ class SpaModel(Qwen3_5Model):
         # position_ids is kept as float32 end-to-end. Dim 0 (seq) holds integer
         # values cast to float; the causal-mask call in SpaTextModel.forward
         # casts it back to long. Dims 1-4 (t, x, y, z) carry continuous RoPE
-        # positions (no round/long), which avoids sub-unit precision loss —
-        # especially important in --polar where one integer unit can be several
-        # degrees of angle.
+        # positions (no round/long).
         position_ids = torch.zeros(
             5,                      # ← 5D: (seq, t, x, y, z)
             input_ids.shape[0],
@@ -703,7 +663,6 @@ class SpaModel(Qwen3_5Model):
                         temp_merge_size=1,
                         spatial_merge_size=spatial_merge_size,
                         coord_scale=coord_scale,
-                        polar=polar,
                         device=input_ids.device,
                     )                                        # (5, num_tokens)
 
@@ -775,16 +734,13 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self.model = SpaModel(config)
 
     def forward(self, *args, image_xyz: torch.Tensor | None = None,
-                coord_scale=100.0,
-                polar: bool = False, **kwargs):
+                coord_scale=100.0, **kwargs):
         """
         Thin wrapper that injects image_xyz into get_rope_index() via kwargs.
 
         image_xyz: (num_images, 3) float tensor of 3D camera coordinates,
                    in the same order as images appear left-to-right in the batch.
         coord_scale: passed through to get_rope_index / get_vision_position_ids.
-        polar: if True, convert Cartesian (x, y, z) → log-spherical
-               (log ρ, θ, α) for the M-RoPE position embedding of vision tokens.
         """
         if image_xyz is not None:
             kwargs["image_xyz"] = image_xyz
@@ -795,6 +751,4 @@ class SpaForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         )
         if _pass_scale:
             kwargs["coord_scale"] = coord_scale
-        if polar:
-            kwargs["polar"] = polar
         return super().forward(*args, **kwargs)

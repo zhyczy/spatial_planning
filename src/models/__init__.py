@@ -11,6 +11,10 @@ from .coordinate_llm import (
     DepthPredictionTransformer,
     CoordinateModel,
 )
+from .enhance_llm import (
+    EnhanceModel,
+    sinusoidal_3d_pe,
+)
 from .rotation_rope_llm import (
     CameraTokenRotationEncoder,
     CameraTokenRotationEncoderRL,

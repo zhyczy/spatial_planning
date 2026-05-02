@@ -137,38 +137,16 @@ class SpaXYZRotaryEmbedding(nn.Module):
         self,
         xyz:         torch.Tensor,
         coord_scale: Optional[float] = None,
-        polar:       bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             xyz:         (batch, seq_len, 3) — per-token (x, y, z) in scene coords.
             coord_scale: runtime scale override; falls back to default_coord_scale.
-            polar:       if True, convert Cartesian (x, y, z) → log-spherical
-                         (log r, θ=atan2(y,x), α=atan2(√(x²+y²), z)) before
-                         scaling. Matches xyz_to_polar convention in the dataset.
-                         Text-token patches (xyz=0) stay at (0, 0, 0) ⇒ identity
-                         rotation, so the fallback is preserved.
         Returns:
             cos, sin: (batch, seq_len, xyz_dim) for SpaDecAttentionWrapper.
         """
         if coord_scale is None:
             coord_scale = self.default_coord_scale
-
-        if polar:
-            # Cartesian → log-spherical; zero-xyz rows (text tokens) stay zero.
-            x = xyz[..., 0]
-            y = xyz[..., 1]
-            z = xyz[..., 2]
-            r = torch.sqrt(x * x + y * y + z * z)
-            zero_mask = r == 0
-            r_safe = r.clamp(min=1e-8)
-            log_r = torch.log(r_safe)
-            theta = torch.atan2(y, x)                                      # [-π, π]
-            alpha = torch.atan2(torch.sqrt(x * x + y * y), z)              # [0, π]
-            log_r = torch.where(zero_mask, torch.zeros_like(log_r), log_r)
-            theta = torch.where(zero_mask, torch.zeros_like(theta), theta)
-            alpha = torch.where(zero_mask, torch.zeros_like(alpha), alpha)
-            xyz = torch.stack([log_r, theta, alpha], dim=-1)
 
         xyz = xyz.float() * float(coord_scale)                            # (B, S, 3)
 
@@ -335,7 +313,6 @@ class SpaDecTextModel(Qwen3_5TextModel):
         self.xyz_offset:   int   = 64       # dims 64..129 → XYZ RoPE
         self._xyz_pos            = None     # set per forward by SpaDecModel
         self._coord_scale: float = 100.0    # set per forward by SpaDecModel
-        self._polar:       bool  = False    # set per forward by SpaDecModel
 
     def forward(
         self,
@@ -409,7 +386,7 @@ class SpaDecTextModel(Qwen3_5TextModel):
             )
 
         xyz_position_embeddings = self.xyz_rotary_emb(
-            xyz_pos, coord_scale=self._coord_scale, polar=self._polar,
+            xyz_pos, coord_scale=self._coord_scale,
         )
         # Cast to match hidden_states dtype (bfloat16 typically)
         xyz_position_embeddings = (
@@ -554,7 +531,6 @@ class SpaDecModel(Qwen3_5Model):
         attention_mask:    Optional[torch.Tensor] = None,
         image_xyz:         Optional[list]         = None,
         coord_scale:       float                  = 100.0,
-        polar:             bool                   = False,
         **kwargs,
     ):
         # Compute per-token xyz BEFORE the parent forward (which calls
@@ -572,7 +548,6 @@ class SpaDecModel(Qwen3_5Model):
                 image_xyz         = image_xyz,
             )
         self.language_model._coord_scale = float(coord_scale)
-        self.language_model._polar       = bool(polar)
 
         return super().forward(
             input_ids         = input_ids,
@@ -609,13 +584,11 @@ class SpaDecForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         *args,
         image_xyz:   Optional[list] = None,
         coord_scale: float          = 100.0,
-        polar:       bool           = False,
         **kwargs,
     ):
         if image_xyz is not None:
             kwargs["image_xyz"] = image_xyz
         kwargs["coord_scale"] = float(coord_scale)
-        kwargs["polar"]       = bool(polar)
         return super().forward(*args, **kwargs)
 
 

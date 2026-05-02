@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import logging
 import os
 import sys
@@ -32,6 +33,7 @@ import sys
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from transformers import StoppingCriteria, StoppingCriteriaList
 
 try:
     import wandb
@@ -45,7 +47,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoConfig, AutoProcessor, get_cosine_schedule_with_warmup
 from peft import LoraConfig, TaskType, get_peft_model
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +73,34 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+# Eval generation cap. Sized to fit the longest VST supervised answer
+# (unknow type ≈ 3987 tokens incl. wrappers), so the model can finish
+# `</answer>` even when it has drifted to long-form outputs from training.
+# Greedy decoding stops at EOS naturally; this is the safety ceiling.
+_EVAL_MAX_NEW_TOKENS = 4096
+
+
+class _StopOnAnswerClose(StoppingCriteria):
+    """Halt generation as soon as the model emits the `</answer>` close tag.
+
+    extract_answer_letter only looks at `<answer>…</answer>`, so anything
+    after the close tag is dead weight. Stopping early bounds per-sample
+    eval time by the actual answer length rather than `_EVAL_MAX_NEW_TOKENS`,
+    which prevents NCCL all_reduce timeouts on the slowest rank when a few
+    samples would otherwise generate to the cap.
+    """
+
+    def __init__(self, tokenizer):
+        ids = tokenizer.encode("</answer>", add_special_tokens=False)
+        self._stop_ids = torch.tensor(ids, dtype=torch.long)
+        self._L = len(ids)
+
+    def __call__(self, input_ids, scores, **kwargs):
+        if input_ids.shape[1] < self._L:
+            return False
+        last = input_ids[0, -self._L:]
+        return bool(torch.equal(last, self._stop_ids.to(last.device)))
 
 # ── DDP helpers ───────────────────────────────────────────────────────────────
 
@@ -121,7 +151,6 @@ def build_model(
     lora_rank:     int = 16,
     freeze_vision: bool = True,
     vanilla:       bool = False,
-    polar:         bool = False,
     decouple:      bool = False,
     xyz_rope_dim:  int  = 66,
 ) -> nn.Module:
@@ -130,45 +159,21 @@ def build_model(
 
     vanilla=False  → 4D M-RoPE (t, x, y, z) with image_xyz spatial embedding
     vanilla=True   → original 3D M-RoPE, no image_xyz
-    polar=True     → use the decouple architecture (Qwen 3D M-RoPE in the
-                     rotary 64 dims + new XYZ RoPE in pass-through dims
-                     64..129) BUT feed log-spherical (log r, θ, α) into the
-                     XYZ RoPE. Matches xyz_to_polar convention:
-                         log r = log||xyz||,
-                         θ     = atan2(y, x) ∈ [-π, π],
-                         α     = atan2(√(x²+y²), z) ∈ [0, π].
-                     Text tokens stay xyz=(0,0,0) → identity rotation.
-                     Mutually exclusive with --vanilla and --decouple.
     decouple=True  → keep Qwen original 3D M-RoPE [11,11,10] in the rotary 64
                      dims (UNCHANGED) and add a NEW XYZ RoPE in dims 64..129
                      (66 dims, sequential x|y|z, rope_theta=10000) with
-                     **Cartesian** xyz. Text tokens get xyz=(0,0,0). For
-                     log-spherical input, use --polar (which is mutually
-                     exclusive with --decouple). Mutually exclusive with
-                     --vanilla / --polar.
+                     **Cartesian** xyz. Text tokens get xyz=(0,0,0). Mutually
+                     exclusive with --vanilla.
     """
-    if polar and vanilla:
-        raise ValueError("--polar and --vanilla are mutually exclusive.")
     if decouple and vanilla:
         raise ValueError("--decouple is mutually exclusive with --vanilla.")
-    if polar and decouple:
-        raise ValueError(
-            "--polar already implies the decouple architecture (with log-spherical "
-            "XYZ RoPE); don't combine it with --decouple. Use --polar alone for "
-            "log-spherical or --decouple alone for Cartesian."
-        )
     if xyz_rope_dim % 6 != 0 or xyz_rope_dim <= 0 or xyz_rope_dim > 192:
         raise ValueError(
             f"--xyz_rope_dim must be a positive multiple of 6 ≤ 192 "
             f"(pass-through region); got {xyz_rope_dim}."
         )
 
-    # --polar implies the decouple architecture with log-spherical XYZ RoPE in
-    # the pass-through region. --decouple alone uses Cartesian xyz. The two
-    # are mutually exclusive.
-    use_decouple = decouple or polar
-    polar_xyz    = polar
-    effective_polar = polar
+    use_decouple = decouple
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
@@ -184,22 +189,14 @@ def build_model(
         )
     elif use_decouple:
         # ── decouple: keep Qwen original 3D M-RoPE in the rotary 64 dims,
-        #             add new XYZ RoPE in pass-through dims 64..129.
-        # If polar_xyz=True (triggered by --polar), the XYZ RoPE consumes
-        # log-spherical (log r, θ, α) instead of raw Cartesian xyz. ──────────
-        # Theta choice:
-        #   decouple + Cartesian (--decouple): θ = 10000 — wider spectrum for
-        #       raw meters (wavelength 6.3..29K ≈ covers 0.06m..300m at scale=100).
-        #   decouple + log-spherical (--polar): θ = 1000 — narrower spectrum;
-        #       polar's effective dynamic range (log r ≈ O(1-3), angles ≤ 2π) is
-        #       smaller, so a tighter ladder keeps more of the 11 bands in the
-        #       useful region.
-        _xyz_theta = 1000.0 if polar_xyz else 10000.0
-        _mode = "log-spherical (log r, θ, α)" if polar_xyz else "Cartesian (x, y, z)"
+        #             add new XYZ RoPE in pass-through dims 64..129 (Cartesian).
+        # θ = 10000 — wider spectrum for raw meters (wavelength 6.3..29K ≈
+        # covers 0.06m..300m at scale=100). ─────────────────────────────────
+        _xyz_theta = 10000.0
         log.info(
             f"mrope_section: {orig_section} (UNCHANGED — Qwen original 3D M-RoPE) "
             f"+ new XYZ RoPE ({xyz_rope_dim} dims, rope_theta={_xyz_theta:g}) in pass-through region "
-            f"[input: {_mode}]"
+            f"[input: Cartesian (x, y, z)]"
         )
         spa = SpaDecForConditionalGeneration.from_pretrained(
             model_path,
@@ -207,11 +204,11 @@ def build_model(
             torch_dtype        = torch.bfloat16,
             attn_implementation= "sdpa",
         )
-        # Swap in the requested xyz_dim / theta. xyz_rotary_emb has no trainable
-        # params (only an inv_freq buffer), so replacing it post-from_pretrained
-        # is safe and happens before LoRA wrapping. SpaDecAttentionWrapper reads
+        # Swap in the requested xyz_dim. xyz_rotary_emb has no trainable params
+        # (only an inv_freq buffer), so replacing it post-from_pretrained is
+        # safe and happens before LoRA wrapping. SpaDecAttentionWrapper reads
         # xyz_dim from cos.shape[-1] at runtime, so no other change needed.
-        if _xyz_theta != 10000.0 or xyz_rope_dim != 66:
+        if xyz_rope_dim != 66:
             from src.models.spa_emb_dec import SpaXYZRotaryEmbedding
             _lm = spa.model.language_model
             _old = _lm.xyz_rotary_emb
@@ -278,19 +275,18 @@ def build_model(
         log.info("Manually set gradient_checkpointing=True on language_model")
 
     # All modes use the same coord_scale = 100 convention
-    # (4D / polar: cm-equivalent for M-RoPE position; decouple: cm-equivalent for
+    # (4D: cm-equivalent for M-RoPE position; decouple: cm-equivalent for
     # the pass-through XYZ RoPE → wavelength range 0.063m .. 272m at θ=10000)
     _coord_scale = 100.0
 
     use_xyz = not vanilla
     log.info(
-        f"AnswerOnlyModel (use_xyz={use_xyz}, polar={effective_polar and use_xyz}, "
+        f"AnswerOnlyModel (use_xyz={use_xyz}, "
         f"decouple={use_decouple}, coord_scale={_coord_scale})"
     )
     return AnswerOnlyModel(
         spa,
         use_xyz     = use_xyz,
-        polar       = effective_polar and use_xyz,
         coord_scale = _coord_scale,
     )
 
@@ -304,7 +300,14 @@ def train(args: argparse.Namespace) -> None:
     _env_rank = os.environ.get("LOCAL_RANK")
     if _env_rank is not None:
         local_rank = int(_env_rank)
-        dist.init_process_group(backend="nccl")
+        # 1h NCCL timeout. Default is 10min, which is too short when periodic
+        # eval has to generate up to _EVAL_MAX_NEW_TOKENS per sample on a few
+        # outlier samples — the slowest rank can fall behind the eval-loop
+        # all_reduce and trip the watchdog.
+        dist.init_process_group(
+            backend="nccl",
+            timeout=datetime.timedelta(hours=1),
+        )
         world_size = dist.get_world_size()
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
@@ -340,7 +343,7 @@ def train(args: argparse.Namespace) -> None:
         rank0_print(f"Logging to {rank_log_file}")
 
     # Stamp the full CLI args once so train.log captures every config knob
-    # (xyz_rope_dim, decouple, polar, lora_rank, etc.) regardless of mode.
+    # (xyz_rope_dim, decouple, lora_rank, etc.) regardless of mode.
     log.info(f"[CONFIG] {vars(args)}")
 
     # ── processor + tokeniser ─────────────────────────────────────────────────
@@ -355,7 +358,6 @@ def train(args: argparse.Namespace) -> None:
         lora_rank      = args.lora_rank,
         freeze_vision  = not args.train_vision,
         vanilla        = args.vanilla,
-        polar          = args.polar,
         decouple       = args.decouple,
         xyz_rope_dim   = args.xyz_rope_dim,
     )
@@ -412,7 +414,7 @@ def train(args: argparse.Namespace) -> None:
     # ── test datasets (for periodic LM loss + first-token acc evaluation) ─────
     # Uses Eval_Dataset_Coord so that image_xyz is loaded from pts3d and passed
     # to the model at eval time — matching the training input distribution for
-    # all xyz-using modes (default 4D / polar / decouple).
+    # all xyz-using modes (default 4D / decouple).
     # coord_upscale=1 to skip the unused image_xyz_hires (save memory).
     _eval_dir = os.path.join(_ROOT, "datasets/evaluation")
     test_loaders = {}
@@ -457,8 +459,10 @@ def train(args: argparse.Namespace) -> None:
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
     total_steps = args.epochs * len(train_loader) // args.grad_accum
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(total_steps, 1)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=max(total_steps, 1),
     )
 
     # ── WandB (rank 0 only) ───────────────────────────────────────────────────
@@ -491,9 +495,9 @@ def train(args: argparse.Namespace) -> None:
             pixel_values   = batch.get("pixel_values")
             image_grid_thw = batch.get("image_grid_thw")
             # mm_token_type_ids: emitted by AutoProcessor. For atten this is
-            # required (vision_mask derivation); for 4D / decouple / polar it
-            # lets get_rope_index identify vision-token positions cleanly
-            # rather than rederiving from input_ids token ids.
+            # required (vision_mask derivation); for 4D / decouple it lets
+            # get_rope_index identify vision-token positions cleanly rather
+            # than rederiving from input_ids token ids.
             mm_token_type_ids = batch.get("mm_token_type_ids")
             if pixel_values is not None:
                 pixel_values = pixel_values.to(device, dtype=torch.bfloat16)
@@ -564,6 +568,9 @@ def train(args: argparse.Namespace) -> None:
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
                     _spa = _model.spa_model if hasattr(_model, "spa_model") else _model
+                    _stop_criteria = StoppingCriteriaList(
+                        [_StopOnAnswerClose(tokenizer)]
+                    )
 
                     # Disable GC for KV cache during generate()
                     _spa_gc_flag = getattr(_spa, "gradient_checkpointing", False)
@@ -594,7 +601,7 @@ def train(args: argparse.Namespace) -> None:
                                 # ── lm_loss: cheap teacher-forced forward over
                                 # full sequence. Input template mirrors the
                                 # training step (incl. mm_token_type_ids) +
-                                # mode-conditional xyz / polar kwargs.
+                                # mode-conditional xyz kwargs.
                                 _fwd_kwargs = dict(
                                     input_ids            = t_ids,
                                     attention_mask       = t_mask,
@@ -606,8 +613,6 @@ def train(args: argparse.Namespace) -> None:
                                 )
                                 if not args.vanilla and t_xyz is not None:
                                     _fwd_kwargs["image_xyz"] = t_xyz
-                                if args.polar:
-                                    _fwd_kwargs["polar"] = True
                                 out = _spa(**_fwd_kwargs)
                                 logits = out.logits
                                 sl = logits[..., :-1, :].contiguous()
@@ -636,7 +641,6 @@ def train(args: argparse.Namespace) -> None:
                                 p_mask = t_mask[:, :ans_start]
                                 p_mm   = t_mm[:, :ans_start] if t_mm is not None else None
                                 _coord_scale = 100.0
-                                _polar       = bool(args.polar)
                                 # Inner backbone for mode-specific position prep:
                                 #   vanilla  → Qwen3_5ForConditionalGeneration  (no prep)
                                 #   decouple → SpaDecForConditionalGeneration → .model = SpaDecModel  (._compute_xyz_pos)
@@ -654,12 +658,13 @@ def train(args: argparse.Namespace) -> None:
                                         pixel_values      = t_pv,
                                         image_grid_thw    = t_thw,
                                         mm_token_type_ids = p_mm,
-                                        max_new_tokens    = args.eval_max_new_tokens,
+                                        max_new_tokens    = _EVAL_MAX_NEW_TOKENS,
                                         do_sample         = False,
                                         pad_token_id      = tokenizer.eos_token_id,
+                                        stopping_criteria = _stop_criteria,
                                     )
-                                elif args.decouple or args.polar:
-                                    # Decouple / polar: keep Qwen 3D M-RoPE in rotary dims +
+                                elif args.decouple:
+                                    # Decouple: keep Qwen 3D M-RoPE in rotary dims +
                                     # new XYZ RoPE in pass-through. HF's generate() strips
                                     # non-standard kwargs (mm_token_type_ids, image_xyz), so
                                     # pre-compute xyz_pos on the prompt and stash on the
@@ -674,17 +679,16 @@ def train(args: argparse.Namespace) -> None:
                                     )
                                     _backbone.model.language_model._xyz_pos     = xyz_pos
                                     _backbone.model.language_model._coord_scale = _coord_scale
-                                    _backbone.model.language_model._polar       = _polar
                                     generated = _spa.generate(
-                                        input_ids      = p_ids,
-                                        attention_mask = p_mask,
-                                        pixel_values   = t_pv,
-                                        image_grid_thw = t_thw,
-                                        max_new_tokens = args.eval_max_new_tokens,
-                                        do_sample      = False,
-                                        pad_token_id   = tokenizer.eos_token_id,
-                                        coord_scale    = _coord_scale,
-                                        polar          = _polar,
+                                        input_ids         = p_ids,
+                                        attention_mask    = p_mask,
+                                        pixel_values      = t_pv,
+                                        image_grid_thw    = t_thw,
+                                        max_new_tokens    = _EVAL_MAX_NEW_TOKENS,
+                                        do_sample         = False,
+                                        pad_token_id      = tokenizer.eos_token_id,
+                                        coord_scale       = _coord_scale,
+                                        stopping_criteria = _stop_criteria,
                                     )
                                 else:
                                     # Default 4D M-RoPE: pre-compute 5D position_ids so
@@ -700,23 +704,21 @@ def train(args: argparse.Namespace) -> None:
                                         attention_mask    = p_mask,
                                         image_xyz         = t_xyz,
                                         coord_scale       = _coord_scale,
-                                        polar             = _polar,
                                     )
                                     _gen_kwargs = dict(
-                                        input_ids      = p_ids,
-                                        attention_mask = p_mask,
-                                        pixel_values   = t_pv,
-                                        image_grid_thw = t_thw,
-                                        position_ids   = position_ids,
-                                        max_new_tokens = args.eval_max_new_tokens,
-                                        do_sample      = False,
-                                        pad_token_id   = tokenizer.eos_token_id,
-                                        coord_scale    = _coord_scale,
+                                        input_ids         = p_ids,
+                                        attention_mask    = p_mask,
+                                        pixel_values      = t_pv,
+                                        image_grid_thw    = t_thw,
+                                        position_ids      = position_ids,
+                                        max_new_tokens    = _EVAL_MAX_NEW_TOKENS,
+                                        do_sample         = False,
+                                        pad_token_id      = tokenizer.eos_token_id,
+                                        coord_scale       = _coord_scale,
+                                        stopping_criteria = _stop_criteria,
                                     )
                                     if t_xyz is not None:
                                         _gen_kwargs["image_xyz"] = t_xyz
-                                    if _polar:
-                                        _gen_kwargs["polar"] = True
                                     generated = _spa.generate(**_gen_kwargs)
 
                             # Decode model output and supervised GT, extract letter.
@@ -818,19 +820,17 @@ def parse_args() -> argparse.Namespace:
         default=os.path.join(_ROOT, "checkpoints/spa_correspondence"),
     )
     p.add_argument("--epochs",       type=int,   default=3)
-    p.add_argument("--lr",           type=float, default=2e-4)
+    p.add_argument("--lr",           type=float, default=5e-5)
+    p.add_argument("--warmup_steps", type=int,   default=100,
+                   help="Linear warmup steps before cosine decay.")
     p.add_argument("--lora_rank",    type=int,   default=16,
                    help="LoRA rank r")
     p.add_argument("--max_images",   type=int,   default=4,
                    help="Max images per scene (memory budget)")
-    p.add_argument("--grad_accum",   type=int,   default=8,
+    p.add_argument("--grad_accum",   type=int,   default=16,
                    help="Gradient accumulation steps")
     p.add_argument("--save_steps",   type=int,   default=200)
     p.add_argument("--eval_steps",   type=int,   default=100)
-    p.add_argument("--eval_max_new_tokens", type=int, default=20,
-                   help="max_new_tokens for periodic generative eval (deploy-aligned). "
-                        "20 fits `<answer>X. {short option}</answer>` for MCQ benches; "
-                        "raise if eval datasets supervise long answers.")
     p.add_argument("--num_workers",  type=int,   default=4)
     p.add_argument("--max_samples",  type=int,   default=None,
                    help="Truncate dataset to this many samples (None = use all)")
@@ -846,33 +846,22 @@ def parse_args() -> argparse.Namespace:
              "only LM answer loss.",
     )
     p.add_argument(
-        "--polar",
-        action="store_true",
-        help="Convert per-patch Cartesian (x, y, z) → log-spherical (log ρ, θ, α) "
-             "for the 4D M-RoPE vision-token position embedding. "
-             "log ρ = log||xyz|| (scale-invariant; RoPE pos-diff = log(ρ_i/ρ_j)), "
-             "θ = atan2(y,x) ∈ [-π,π] (azimuth), "
-             "α = atan2(√(x²+y²), z) ∈ [0,π] (inclination). "
-             "Matches train_coordinate.py polar convention. "
-             "No effect when --vanilla is set.",
-    )
-    p.add_argument(
         "--decouple",
         action="store_true",
         help="Decoupled position embedding: keep Qwen original 3D M-RoPE [11,11,10] "
              "in the rotary 64 dims (UNCHANGED) and add a NEW XYZ RoPE (66 dims, "
-             "sequential x|y|z each 11 bands, rope_theta=1000) in pass-through "
+             "sequential x|y|z each 11 bands, rope_theta=10000) in pass-through "
              "dims 64..129. Text tokens default to xyz=(0,0,0) → identity rotation. "
-             "Mutually exclusive with --vanilla / --polar.",
+             "Mutually exclusive with --vanilla.",
     )
     p.add_argument(
         "--xyz_rope_dim",
         type=int, default=66,
         help="Total head_dim units allocated to the XYZ RoPE in the pass-through "
-             "region under --decouple / --polar (each axis x/y/z gets xyz_rope_dim/6 "
+             "region under --decouple (each axis x/y/z gets xyz_rope_dim/6 "
              "frequency bands). Must be a positive multiple of 6 ≤ 192 "
              "(pass-through region size). Default 66 (= 11 bands per axis). "
-             "No effect without --decouple / --polar.",
+             "No effect without --decouple.",
     )
     # ── WandB ─────────────────────────────────────────────────────────────────
     p.add_argument(

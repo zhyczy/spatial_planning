@@ -11,11 +11,8 @@ from .answer_format import (
 from .train_dataset_qwen35 import (
     MindCube_Train_Dataset,
     MindCube_Train_Dataset_Coord,
-    MindCube_Train_Dataset_Coord_Polar,
     VST_Train_Dataset,
     VST_Train_Dataset_Coord,
-    VST_Train_Dataset_Coord_Polar,
-    xyz_to_polar,
     _qwen_align_view,
 )
 from .eval_dataset_qwen35 import (

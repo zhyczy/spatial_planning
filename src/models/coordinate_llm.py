@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -118,7 +117,6 @@ class CoordinateModel(nn.Module):
         skip_layers:        tuple[int, ...] = (-1,),
         answer_weight:      float = 1.0,
         coord_weight:       float = 1.0,
-        polar:              bool  = False,
     ):
         super().__init__()
         self.spa_model          = spa_model
@@ -128,7 +126,6 @@ class CoordinateModel(nn.Module):
         self.skip_layers        = list(skip_layers)
         self.answer_weight      = answer_weight
         self.coord_weight       = coord_weight
-        self.polar              = polar
 
         # Capture the probe hidden state via a hook, always. This avoids
         # `output_hidden_states=True`, which triggers a NaN bug on the
@@ -205,7 +202,6 @@ class CoordinateModel(nn.Module):
             return_dict          = True,
             image_xyz            = image_xyz,
             coord_scale          = coord_scale,
-            polar                = self.polar,
             **kwargs,
         )
 
@@ -265,13 +261,7 @@ class CoordinateModel(nn.Module):
                 pred_k    = self.coord_head(coord_h_k, llm_h, llm_w)
 
                 gt_k = coord_gt[k].to(pred_k.device, dtype=pred_k.dtype)
-                if self.polar:
-                    # (log r, θ=azimuth, α=inclination): weight angle channels
-                    # by 1/π so a π-radian error matches a 1-unit log r error.
-                    w = pred_k.new_tensor([1.0, 1.0 / math.pi, 1.0 / math.pi])
-                    per_img_losses.append((pred_k - gt_k).abs().mul(w).mean())
-                else:
-                    per_img_losses.append(F.l1_loss(pred_k, gt_k))
+                per_img_losses.append(F.l1_loss(pred_k, gt_k))
                 start += n_tok
 
             if per_img_losses:

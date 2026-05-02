@@ -22,13 +22,6 @@ Multi-method QA evaluation:
       3D pos: precomputed XYZ → 4D M-RoPE on image patches
       Coord : predicted in Cartesian (x, y, z) at vision-token positions
 
-  polar
-      Model : SpaDecForConditionalGeneration + LoRA  (trained with --polar)
-              [decoupled: Qwen 3D M-RoPE unchanged in rotary dims 0..63;
-               new XYZ RoPE in pass-through dims 64..129, θ=1000]
-      Input : images + question
-      3D pos: precomputed Cartesian XYZ → log-spherical inside SpaXYZRotaryEmbedding
-
   decouple
       Model : SpaDecForConditionalGeneration + LoRA  (trained with --decouple)
               [Qwen 3D M-RoPE unchanged in rotary dims 0..63;
@@ -103,7 +96,33 @@ import torch.multiprocessing as mp
 from PIL import Image
 from tqdm import tqdm
 
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoProcessor,
+    AutoTokenizer,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
+
+
+class _StopOnAnswerClose(StoppingCriteria):
+    """Halt generation as soon as the model emits the `</answer>` close tag.
+
+    extract_answer_letter only looks at `<answer>…</answer>`, so anything
+    after the close tag is dead weight. Stopping early bounds per-sample
+    eval time by the actual answer length rather than `--max_new_tokens`.
+    """
+
+    def __init__(self, tokenizer):
+        ids = tokenizer.encode("</answer>", add_special_tokens=False)
+        self._stop_ids = torch.tensor(ids, dtype=torch.long)
+        self._L = len(ids)
+
+    def __call__(self, input_ids, scores, **kwargs):
+        if input_ids.shape[1] < self._L:
+            return False
+        last = input_ids[0, -self._L:]
+        return bool(torch.equal(last, self._stop_ids.to(last.device)))
 from peft import PeftModel
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 from src.models import (
@@ -370,7 +389,6 @@ def load_spa_model(
     device: str = "cuda:0",
     vanilla: bool = False,
     decouple: bool = False,
-    polar: bool = False,
     atten: bool = False,
     xyz_rope_dim: int = 66,
 ) -> Tuple[Any, Any]:
@@ -380,9 +398,7 @@ def load_spa_model(
     train_atten.py):
       vanilla=True   → Qwen3_5ForConditionalGeneration (stock, 3D M-RoPE [11,11,10])
       decouple=True  → SpaDecForConditionalGeneration (3D M-RoPE UNCHANGED +
-                       new XYZ RoPE in pass-through dims 64..129);
-                       polar=True swaps XYZ RoPE θ from 10000 → 1000 and the
-                       RoPE consumes log-spherical (log r, θ, α) at forward time.
+                       new XYZ RoPE in pass-through dims 64..129, θ=10000).
       atten=True     → Qwen3_5ForConditionalGeneration with inner backbone swapped
                        for SpatialAttnVanillaModel + per-layer SpatialAttentionBias
                        on every full-attn self_attn. 3D M-RoPE UNCHANGED. Loads
@@ -393,28 +409,22 @@ def load_spa_model(
     ckpt_dir = _resolve_spa_ckpt_dir(ckpt_path, require_coord_head=False)
     logger.info(
         f"[spa] Loading SPA model: base={base_model_path}  ckpt={ckpt_dir}  "
-        f"vanilla={vanilla} decouple={decouple} polar={polar} atten={atten}"
+        f"vanilla={vanilla} decouple={decouple} atten={atten}"
     )
 
     config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     orig_section = config.text_config.rope_scaling.get("mrope_section", [11, 11, 10])
 
     # Mutex checks — enforce the same mutual exclusions as training scripts.
-    if vanilla and (decouple or polar or atten):
+    if vanilla and (decouple or atten):
         raise ValueError(
-            "[spa] --vanilla is mutually exclusive with --decouple / --polar / --atten."
+            "[spa] --vanilla is mutually exclusive with --decouple / --atten."
         )
-    if atten and (decouple or polar):
+    if atten and decouple:
         raise ValueError(
-            "[spa] --atten is mutually exclusive with --decouple / --polar "
+            "[spa] --atten is mutually exclusive with --decouple "
             "(atten keeps Qwen's original 3D M-RoPE; the spatial signal enters "
             "through per-layer SpatialAttentionBias instead)."
-        )
-    if polar and not decouple:
-        raise ValueError(
-            "[spa] --polar requires --decouple (matches train_correspondence.py "
-            "--polar, which routes through SpaDecForConditionalGeneration with "
-            "log-spherical XYZ RoPE at θ=1000)."
         )
 
     if vanilla:
@@ -450,9 +460,8 @@ def load_spa_model(
         spa.tie_weights()
     elif decouple:
         # decouple: keep original 3D M-RoPE in the rotary 64 dims (UNCHANGED)
-        # and add a new XYZ RoPE in pass-through dims 64..129 (66 dims).
-        # Must match train_correspondence.py --decouple (Cartesian, θ=10000) or
-        # --polar (log-spherical, θ=1000).
+        # and add a new XYZ RoPE in pass-through dims 64..129 (66 dims,
+        # Cartesian, θ=10000). Must match train_correspondence.py --decouple.
         from src.models.spa_emb_dec import (
             SpaDecForConditionalGeneration,
             SpaXYZRotaryEmbedding,
@@ -462,11 +471,10 @@ def load_spa_model(
                 f"[spa] xyz_rope_dim must be a positive multiple of 6 ≤ 192 "
                 f"(pass-through region); got {xyz_rope_dim}."
             )
-        _xyz_theta = 1000.0 if polar else 10000.0
-        _mode = "log-spherical (log r, θ, α)" if polar else "Cartesian (x, y, z)"
+        _xyz_theta = 10000.0
         logger.info(
             f"[spa] mrope_section: {orig_section} (UNCHANGED — decouple) "
-            f"+ XYZ RoPE (pass-through {xyz_rope_dim} dims, theta={_xyz_theta:g}) [{_mode}]"
+            f"+ XYZ RoPE (pass-through {xyz_rope_dim} dims, theta={_xyz_theta:g}) [Cartesian (x, y, z)]"
         )
         spa = SpaDecForConditionalGeneration.from_pretrained(
             base_model_path,
@@ -474,9 +482,9 @@ def load_spa_model(
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa",
         )
-        # Swap when either theta or xyz_dim differs from SpaDecTextModel defaults
-        # (xyz_dim=66, theta=10000). Must match training-time choice.
-        if _xyz_theta != 10000.0 or xyz_rope_dim != 66:
+        # Swap when xyz_dim differs from SpaDecTextModel default (66).
+        # Must match training-time choice.
+        if xyz_rope_dim != 66:
             _lm = spa.model.language_model
             _old = _lm.xyz_rotary_emb
             _new = SpaXYZRotaryEmbedding(
@@ -1048,18 +1056,22 @@ def run_inference_baseline(
     batch_inputs: Dict,
     model: Any,
     processor: Any,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 4096,
 ) -> List[str]:
     batch_inputs = {
         k: v.to(model.device) if isinstance(v, torch.Tensor) else v
         for k, v in batch_inputs.items()
     }
+    stop_criteria = StoppingCriteriaList(
+        [_StopOnAnswerClose(processor.tokenizer)]
+    )
     with torch.no_grad():
         generated_ids = model.generate(
             **batch_inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=processor.tokenizer.eos_token_id,
+            stopping_criteria=stop_criteria,
         )
     trimmed = [
         out[len(inp):]
@@ -1227,10 +1239,9 @@ def run_inference_spa(
     image_xyz: Optional[List[torch.Tensor]],
     model: Any,
     processor: Any,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 4096,
     coord_scale: float = 100.0,
     vanilla: bool = False,
-    polar: bool = False,
     decouple: bool = False,
     atten: bool = False,
 ) -> str:
@@ -1295,19 +1306,17 @@ def run_inference_spa(
             )
         model.model.language_model._xyz_pos     = xyz_pos
         model.model.language_model._coord_scale = float(coord_scale)
-        model.model.language_model._polar       = bool(polar)
 
-        # SpaDecForConditionalGeneration.forward has coord_scale=100.0 / polar=False
-        # defaults; without passing them through gen_kwargs, every generate() step
-        # would re-set language_model._coord_scale=100.0 / _polar=False and clobber
-        # the values we just stashed. Pass them explicitly so the user's values win.
+        # SpaDecForConditionalGeneration.forward has coord_scale=100.0 default;
+        # without passing it through gen_kwargs, every generate() step would
+        # re-set language_model._coord_scale=100.0 and clobber the value we
+        # just stashed. Pass it explicitly so the user's value wins.
         gen_kwargs: Dict[str, Any] = dict(
             **inputs_dev,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=processor.tokenizer.eos_token_id,
             coord_scale=coord_scale,
-            polar=polar,
         )
         # HF rejects these: prefill already consumed them into _xyz_pos.
         gen_kwargs.pop("mm_token_type_ids", None)
@@ -1332,7 +1341,6 @@ def run_inference_spa(
                 attention_mask=inputs_dev.get("attention_mask"),
                 image_xyz=xyz_on_device,
                 coord_scale=coord_scale,
-                polar=polar,
             )
 
         gen_kwargs: Dict[str, Any] = dict(
@@ -1349,9 +1357,10 @@ def run_inference_spa(
         gen_kwargs.pop("mm_token_type_ids", None)
         if xyz_on_device is not None:
             gen_kwargs["image_xyz"] = xyz_on_device
-        if polar:
-            gen_kwargs["polar"] = True
 
+    gen_kwargs["stopping_criteria"] = StoppingCriteriaList(
+        [_StopOnAnswerClose(processor.tokenizer)]
+    )
     with torch.no_grad():
         generated_ids = model.generate(**gen_kwargs)
 
@@ -1630,8 +1639,6 @@ def evaluate(
       vanilla            — SPA LoRA + 3D M-RoPE
       position_embedding — SPA LoRA + 4D M-RoPE
       coordinate         — SPA LoRA + 4D M-RoPE + coord head (vision-token readout); no_cam variant (Cartesian)
-      polar              — SpaDec + LoRA: 3D M-RoPE unchanged + log-spherical XYZ RoPE in pass-through, θ=1000;
-                           matches train_correspondence.py / train_coordinate.py --polar
       decouple           — SpaDec + LoRA: 3D M-RoPE unchanged + Cartesian XYZ RoPE in pass-through, θ=10000;
                            matches train_correspondence.py / train_coordinate.py --decouple
       atten              — Qwen3.5-VL + LoRA + per-layer SpatialAttentionBias on
@@ -1646,12 +1653,11 @@ def evaluate(
     run_vanilla = method == "vanilla"
     run_position_embedding = method == "position_embedding"
     run_coordinate = method in ("coordinate", "both")
-    run_polar = method == "polar"
     run_decouple = method == "decouple"
     run_atten = method == "atten"
     run_spa = (
         run_vanilla or run_position_embedding or run_coordinate
-        or run_polar or run_decouple or run_atten
+        or run_decouple or run_atten
     )
 
     # Methods whose RoPE / coord head / spatial bias depends on real per-patch
@@ -1660,7 +1666,7 @@ def evaluate(
     # proceed if the dataset has no 3d_results at all.
     methods_needing_xyz = (
         run_position_embedding or run_coordinate
-        or run_polar or run_decouple or run_atten
+        or run_decouple or run_atten
     )
     if methods_needing_xyz and len(data) > 0:
         # Check the first few samples; if NONE has 3d_results/, abort upfront.
@@ -1700,16 +1706,14 @@ def evaluate(
             )
         use_vanilla_arch = run_vanilla
         # Architecture flags routed to load_spa_model (must match training):
-        #   polar    → SpaDec + log-spherical XYZ RoPE (decouple=True, polar=True)
-        #   decouple → SpaDec + Cartesian XYZ RoPE     (decouple=True, polar=False)
+        #   decouple → SpaDec + Cartesian XYZ RoPE (decouple=True)
         #   atten    → Qwen3.5 + per-layer SpatialAttentionBias (3D M-RoPE unchanged)
-        _use_decouple = run_polar or run_decouple
-        _use_polar    = run_polar
+        _use_decouple = run_decouple
         _use_atten    = run_atten
         spa_model, spa_proc = load_spa_model(
             spa_base_model_path, correspondence_ckpt, device,
             vanilla=use_vanilla_arch,
-            decouple=_use_decouple, polar=_use_polar,
+            decouple=_use_decouple,
             atten=_use_atten,
             xyz_rope_dim=xyz_rope_dim,
         )
@@ -1731,26 +1735,23 @@ def evaluate(
             spa_coord_head = _load_coord_head(correspondence_ckpt, device)
 
     # Determine which SPA variants to run.
-    # Tuple: (name, use_coord, is_polar, is_decouple, is_atten)
+    # Tuple: (name, use_coord, is_decouple, is_atten)
     #   vanilla            : stock Qwen3.5 (3D M-RoPE, no xyz)
     #   position_embedding : 4D M-RoPE Cartesian on vision tokens
     #   coordinate (no_cam): 4D M-RoPE Cartesian + coord head (vision-token readout)
-    #   polar              : SpaDec + log-spherical XYZ RoPE (θ=1000)
     #   decouple           : SpaDec + Cartesian XYZ RoPE (θ=10000)
     #   atten              : 3D M-RoPE unchanged + per-layer SpatialAttentionBias on V↔V
-    spa_variants: List[Tuple[str, bool, bool, bool, bool]] = []
+    spa_variants: List[Tuple[str, bool, bool, bool]] = []
     if run_vanilla:
-        spa_variants.append(("vanilla",            False, False, False, False))
+        spa_variants.append(("vanilla",            False, False, False))
     if run_position_embedding:
-        spa_variants.append(("position_embedding", False, False, False, False))
+        spa_variants.append(("position_embedding", False, False, False))
     if run_coordinate:
-        spa_variants.append(("coordinate",         True,  False, False, False))
-    if run_polar:
-        spa_variants.append(("polar",              False, True,  True,  False))
+        spa_variants.append(("coordinate",         True,  False, False))
     if run_decouple:
-        spa_variants.append(("decouple",           False, False, True,  False))
+        spa_variants.append(("decouple",           False, True,  False))
     if run_atten:
-        spa_variants.append(("atten",              False, False, False, True))
+        spa_variants.append(("atten",              False, False, True))
 
     active_methods = (
         (["baseline"] if run_baseline else [])
@@ -1776,7 +1777,7 @@ def evaluate(
 
         # ---- SPA variants ----
         for (
-            spa_method_name, use_coord, is_polar, is_decouple, is_atten,
+            spa_method_name, use_coord, is_decouple, is_atten,
         ) in spa_variants:
             # All methods except `vanilla` rely on per-patch xyz from 3d_results
             # to produce meaningful position embeddings / coord supervision.
@@ -1795,7 +1796,6 @@ def evaluate(
                 inputs, image_xyz, spa_model, spa_proc,
                 max_new_tokens, coord_scale,
                 vanilla=use_vanilla_arch,
-                polar=is_polar,
                 decouple=is_decouple,
                 atten=is_atten,
             )
@@ -1965,7 +1965,7 @@ def main() -> None:
     # ── method ────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--method", type=str, default="both",
-        choices=["baseline", "vanilla", "position_embedding", "coordinate", "polar",
+        choices=["baseline", "vanilla", "position_embedding", "coordinate",
                  "decouple", "atten", "both"],
         help=(
             "Which method(s) to run. "
@@ -1973,7 +1973,6 @@ def main() -> None:
             "vanilla=SPA LoRA + 3D M-RoPE; "
             "position_embedding=SPA LoRA + 4D M-RoPE; "
             "coordinate=SPA LoRA + 4D M-RoPE + coord head (vision-token readout, no_cam, Cartesian); "
-            "polar=SpaDec + LoRA (3D M-RoPE unchanged + log-spherical XYZ RoPE in pass-through, θ=1000); "
             "decouple=SpaDec + LoRA (3D M-RoPE unchanged + Cartesian XYZ RoPE in pass-through, θ=10000); "
             "atten=Qwen3.5 + LoRA + per-layer SpatialAttentionBias on V↔V (3D M-RoPE unchanged; matches train_atten.py); "
             "both=baseline + coordinate."
@@ -2025,14 +2024,17 @@ def main() -> None:
              "<answer>X</answer>. Increases generation length significantly; "
              "raise --max_new_tokens to at least 4096 (recommend 8192).",
     )
-    parser.add_argument("--max_new_tokens", type=int, default=512,
-                        help="Max new tokens for generation. "
-                             "Use ≥4096 (recommend 8192) with --thinking.")
+    parser.add_argument("--max_new_tokens", type=int, default=4096,
+                        help="Max new tokens for generation. Sized to fit the "
+                             "longest VST training answer (≈3987 tokens) so a "
+                             "VST-finetuned model can finish </answer> even when "
+                             "drifted to long-form outputs. Recommend 8192 with "
+                             "--thinking.")
 
     parser.add_argument(
         "--xyz_rope_dim", type=int, default=66,
         help="Total head_dim units allocated to the XYZ RoPE in the pass-through "
-             "region under --method polar / decouple. Each axis (x/y/z) gets "
+             "region under --method decouple. Each axis (x/y/z) gets "
              "xyz_rope_dim/6 frequency bands. Must be a positive multiple of 6 ≤ 192. "
              "MUST match the value used during training (default 66). "
              "No effect for --method baseline / vanilla / position_embedding / coordinate.",
@@ -2189,7 +2191,6 @@ def main() -> None:
         "vanilla":            args.method == "vanilla",
         "position_embedding": args.method == "position_embedding",
         "coordinate":         args.method in ("coordinate", "both"),
-        "polar":              args.method == "polar",
         "decouple":           args.method == "decouple",
         "atten":              args.method == "atten",
     }
@@ -2217,7 +2218,6 @@ def main() -> None:
         "vanilla":            "vanilla            (SPA LoRA + 3D M-RoPE)",
         "position_embedding": "position_embedding (SPA LoRA + 4D M-RoPE)",
         "coordinate":         "coordinate         (SPA LoRA + 4D M-RoPE + coord head, no_cam, Cartesian)",
-        "polar":              "polar              (SpaDec + log-spherical XYZ RoPE, θ=1000)",
         "decouple":           "decouple           (SpaDec + Cartesian XYZ RoPE, θ=10000)",
     }
     _metrics_fn = compute_metrics_robospatial if args.dataset == "robospatial" else compute_metrics
@@ -2238,7 +2238,6 @@ def main() -> None:
     # baseline vs coordinate (the "both" mode).
     _compare_pairs = [
         ("baseline", "coordinate"),
-        ("baseline", "polar"),
         ("baseline", "decouple"),
         ("baseline", "position_embedding"),
         ("baseline", "vanilla"),

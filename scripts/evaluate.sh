@@ -10,7 +10,7 @@
 #   bash scripts/evaluate.sh [options]
 #
 # Options:
-#   --method    baseline | vanilla | position_embedding | coordinate | polar | decouple | atten | both
+#   --method    baseline | vanilla | position_embedding | coordinate | decouple | atten | both
 #               (default: both = baseline + coordinate)
 #   --ckpt      path to SPA LoRA checkpoint dir
 #               (required when method != baseline)
@@ -26,7 +26,7 @@
 #   --limit     truncate each dataset to N samples (debug / smoke test)
 #   --output    base output directory (default: train_records/eval_results)
 #   --run_name  optional sub-folder name (default: auto timestamp per dataset)
-#   --max_new_tokens  generation budget (default: 512)
+#   --max_new_tokens  generation budget (default: 4096)
 #
 # Method descriptions:
 #   baseline           — stock Qwen3.5-VL, no LoRA
@@ -34,9 +34,6 @@
 #   position_embedding — SPA LoRA + 4D M-RoPE (xyz fed through RoPE; no coord head)
 #   coordinate         — SPA LoRA + 4D M-RoPE + coord head (Cartesian xyz regression
 #                        at vision-token hidden states)
-#   polar              — SpaDec + LoRA: Qwen original 3D M-RoPE unchanged (rotary dims 0..63)
-#                        + new log-spherical XYZ RoPE in pass-through dims 64..129, θ=1000.
-#                        Matches train_correspondence.py / train_coordinate.py --polar.
 #   decouple           — SpaDec + LoRA: Qwen original 3D M-RoPE unchanged
 #                        + new Cartesian XYZ RoPE in pass-through dims 64..129, θ=10000.
 #                        Matches train_correspondence.py / train_coordinate.py --decouple.
@@ -97,7 +94,7 @@ LIMIT=""
 OUTPUT_BASE="$SPATIAL_DIR/eval_results"
 RUN_NAME=""
 THINKING=""
-MAX_NEW_TOKENS=512
+MAX_NEW_TOKENS=4096
 
 # All supported datasets (in evaluation order)
 ALL_DATASETS="mindcube sat_real spinbench robospatial viewspatial omnispatial_pt embspatial"
@@ -144,7 +141,7 @@ done
 # Validate arguments
 # =============================================================================
 
-VALID_METHODS="baseline vanilla position_embedding coordinate polar decouple atten both"
+VALID_METHODS="baseline vanilla position_embedding coordinate decouple atten both"
 if ! echo "$VALID_METHODS" | grep -qw "$METHOD"; then
     echo "[ERROR] --method must be one of: $VALID_METHODS" >&2
     exit 1

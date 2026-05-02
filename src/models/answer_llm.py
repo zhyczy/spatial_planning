@@ -15,13 +15,11 @@ class AnswerOnlyModel(nn.Module):
         self,
         spa_model:   nn.Module,
         use_xyz:     bool  = True,
-        polar:       bool  = False,
         coord_scale: float = 100.0,
     ):
         super().__init__()
         self.spa_model   = spa_model
         self.use_xyz     = use_xyz
-        self.polar       = polar
         self.coord_scale = coord_scale
 
     def forward(
@@ -54,8 +52,6 @@ class AnswerOnlyModel(nn.Module):
         if self.use_xyz:
             fwd_kwargs["image_xyz"]   = image_xyz
             fwd_kwargs["coord_scale"] = coord_scale
-            if self.polar:
-                fwd_kwargs["polar"] = True
 
         outputs = self.spa_model(**fwd_kwargs)
 
