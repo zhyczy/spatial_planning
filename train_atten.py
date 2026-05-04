@@ -87,8 +87,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     AutoProcessor,
-    StoppingCriteria,
-    StoppingCriteriaList,
     get_cosine_schedule_with_warmup,
 )
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -114,8 +112,9 @@ from src.models import (
 )
 from src.dataset import (
     VST_Train_Dataset,
+    MindCube_Train_Dataset,
     Eval_Dataset_Coord,
-    extract_answer_letter,
+    compute_letter_offset,
 )
 
 logging.basicConfig(
@@ -124,35 +123,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-# Eval generation cap. Sized to fit the longest VST supervised answer
-# (unknow type ≈ 3987 tokens incl. wrappers), so the model can finish
-# `</answer>` even when it has drifted to long-form outputs from training.
-# Greedy decoding stops at EOS naturally; this is the safety ceiling.
-_EVAL_MAX_NEW_TOKENS = 4096
-
-
-class _StopOnAnswerClose(StoppingCriteria):
-    """Halt generation as soon as the model emits the `</answer>` close tag.
-
-    extract_answer_letter only looks at `<answer>…</answer>`, so anything
-    after the close tag is dead weight. Stopping early bounds per-sample
-    eval time by the actual answer length rather than `_EVAL_MAX_NEW_TOKENS`,
-    which prevents NCCL all_reduce timeouts on the slowest rank when a few
-    samples would otherwise generate to the cap.
-    """
-
-    def __init__(self, tokenizer):
-        ids = tokenizer.encode("</answer>", add_special_tokens=False)
-        self._stop_ids = torch.tensor(ids, dtype=torch.long)
-        self._L = len(ids)
-
-    def __call__(self, input_ids, scores, **kwargs):
-        if input_ids.shape[1] < self._L:
-            return False
-        last = input_ids[0, -self._L:]
-        return bool(torch.equal(last, self._stop_ids.to(last.device)))
-
 
 # ── DDP helpers ───────────────────────────────────────────────────────────────
 
@@ -180,10 +150,12 @@ def collate_fn(batch):
 # ── model building ────────────────────────────────────────────────────────────
 
 def build_model(
-    model_path:      str,
-    lora_rank:       int   = 16,
-    freeze_vision:   bool  = True,
-    bias_init_scale: float = 0.0,
+    model_path:            str,
+    lora_rank:             int   = 16,
+    freeze_vision:         bool  = True,
+    bias_init_scale:       float = 0.0,
+    freeze_linear_attn:    bool  = False,
+    couple:                bool  = False,
 ) -> nn.Module:
     """
     Load stock Qwen3.5-VL → swap inner backbone for SpatialAttnVanillaModel
@@ -218,13 +190,45 @@ def build_model(
         log.info("Vision encoder frozen.")
 
     # ── LoRA on the language model ────────────────────────────────────────────
+    proj_names = ["q_proj", "k_proj", "v_proj", "o_proj",
+                  "gate_proj", "up_proj", "down_proj"]
+    target_modules: list[str] | str = proj_names
+    if freeze_linear_attn:
+        # Inspect layer_type BEFORE PEFT wrapping. Decoder layers live under
+        # spa.model.language_model.layers (Qwen3.5-VL keeps visual and LM
+        # separate). Reuse _resolve_language_model so we don't hard-code the
+        # path. Build a regex that only matches full-attn layer indices, so
+        # PEFT skips linear-attn layers entirely — no LoRA modules are created.
+        _lm_pre = _resolve_language_model(spa)
+        if _lm_pre is None:
+            raise RuntimeError(
+                "freeze_linear_attn=True but failed to locate language_model "
+                "with .layers under spa — cannot determine layer types."
+            )
+        full_idx, lin_idx = [], []
+        for i, layer in enumerate(_lm_pre.layers):
+            (lin_idx if getattr(layer, "layer_type", None) == "linear_attention"
+                     else full_idx).append(i)
+        if not lin_idx:
+            log.info("freeze_linear_attn=True but no linear-attn layers found; "
+                     "applying LoRA to all layers.")
+        else:
+            idx_alt = "|".join(str(i) for i in full_idx)
+            projs   = "|".join(proj_names)
+            # PEFT runs re.fullmatch against the full module name; restrict
+            # match to layers.{full_idx}.(self_attn|mlp).{proj}.
+            target_modules = (
+                rf"^.*\.layers\.({idx_alt})\.(self_attn|mlp)\.({projs})$"
+            )
+            log.info(
+                f"freeze_linear_attn=True: LoRA on {len(full_idx)} full-attn "
+                f"layers, skipping {len(lin_idx)} linear-attn layers "
+                f"(idx={lin_idx[:8]}{'...' if len(lin_idx) > 8 else ''})."
+            )
     lora_cfg = LoraConfig(
         r              = lora_rank,
         lora_alpha     = lora_rank * 2,
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
+        target_modules = target_modules,
         lora_dropout   = 0.05,
         bias           = "none",
         task_type      = TaskType.CAUSAL_LM,
@@ -256,6 +260,24 @@ def build_model(
         f"(={n_wrapped} layers × 2-layer MLP "
         f"[Linear(4→hidden) + GELU + Linear(hidden→num_heads)])"
     )
+
+    # ── decoupled (bias-only) mode ────────────────────────────────────────────
+    # When --couple is OFF (default), freeze every trainable parameter that is
+    # NOT inside a SpatialAttentionBias module — including LoRA adapters. This
+    # gives 100% of the gradient signal to the geometric MLP so W₁ can actually
+    # learn instead of staying near random init while LoRA absorbs the task.
+    if not couple:
+        n_frozen = 0
+        for name, p in spa.named_parameters():
+            if "bias_module" not in name and p.requires_grad:
+                p.requires_grad_(False)
+                n_frozen += 1
+        log.info(
+            f"[couple=False] froze {n_frozen} non-bias_module parameter tensors "
+            f"(LoRA + everything else); only SpatialAttentionBias trains."
+        )
+    else:
+        log.info("[couple=True] joint training: LoRA + SpatialAttentionBias both train.")
 
     # Gradient checkpointing — same pattern as train_correspondence.py
     spa.gradient_checkpointing_enable(
@@ -359,10 +381,8 @@ def train(args: argparse.Namespace) -> None:
     _env_rank = os.environ.get("LOCAL_RANK")
     if _env_rank is not None:
         local_rank = int(_env_rank)
-        # 1h NCCL timeout. Default is 10min, which is too short when periodic
-        # eval has to generate up to _EVAL_MAX_NEW_TOKENS per sample on a few
-        # outlier samples — the slowest rank can fall behind the eval-loop
-        # all_reduce and trip the watchdog.
+        # 1h NCCL timeout (default 10min) — kept generous so any periodic-eval
+        # rank skew or slow ckpt save can't trip the watchdog.
         dist.init_process_group(
             backend="nccl",
             timeout=datetime.timedelta(hours=1),
@@ -404,11 +424,17 @@ def train(args: argparse.Namespace) -> None:
     # ── processor / model ─────────────────────────────────────────────────────
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
     tokenizer = processor.tokenizer
+    # MCQ letter-probe: position of the letter token inside `<answer>X</answer>`.
+    # Qwen3.5 BPE merges `>X` into one token, so the letter sits at offset 2,
+    # not at ans_start (which is the `<` of `<answer>`).
+    letter_offset = compute_letter_offset(tokenizer)
     model = build_model(
         args.model_path,
-        lora_rank       = args.lora_rank,
-        freeze_vision   = not args.train_vision,
-        bias_init_scale = args.bias_w2_init_scale,
+        lora_rank          = args.lora_rank,
+        freeze_vision      = not args.train_vision,
+        bias_init_scale    = args.bias_w2_init_scale,
+        freeze_linear_attn = args.freeze,
+        couple             = args.couple,
     ).to(device)
 
     # ── spatial_merge_size from config.json ───────────────────────────────────
@@ -425,20 +451,33 @@ def train(args: argparse.Namespace) -> None:
     else:
         _model = model
 
-    # ── train dataset (VST 500K) ──────────────────────────────────────────────
-    rank0_print(
-        f"Loading VST_Train_Dataset from {args.json_path} "
-        f"(results: {args.vst_results_dir})"
-    )
-    train_dataset = VST_Train_Dataset(
-        json_path          = args.json_path,
-        results_dir        = args.vst_results_dir,
-        processor          = processor,
-        log                = log,
-        max_images         = args.max_images,
-        spatial_merge_size = spatial_merge_size,
-        max_samples        = args.max_samples,
-    )
+    # ── train dataset (VST or MindCube, dispatched via --dataset) ─────────────
+    if args.dataset == "mindcube":
+        rank0_print(
+            f"Loading MindCube_Train_Dataset from {args.json_path} "
+            f"(results: {args.vst_results_dir})"
+        )
+        train_dataset = MindCube_Train_Dataset(
+            jsonl_path         = args.json_path,
+            results_dir        = args.vst_results_dir,
+            processor          = processor,
+            log                = log,
+            spatial_merge_size = spatial_merge_size,
+            max_samples        = args.max_samples,
+        )
+    else:
+        rank0_print(
+            f"Loading VST_Train_Dataset from {args.json_path} "
+            f"(results: {args.vst_results_dir})"
+        )
+        train_dataset = VST_Train_Dataset(
+            json_path          = args.json_path,
+            results_dir        = args.vst_results_dir,
+            processor          = processor,
+            log                = log,
+            spatial_merge_size = spatial_merge_size,
+            max_samples        = args.max_samples,
+        )
 
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
@@ -454,7 +493,8 @@ def train(args: argparse.Namespace) -> None:
         sampler     = train_sampler,
     )
 
-    # ── eval datasets (MindCube tinybench + SpinBench, both with image_xyz) ───
+    # ── eval datasets (MindCube tinybench + SpinBench + MMSIBench,
+    #    all three with image_xyz) ─────────────────────────────────────────────
     _eval_dir = os.path.join(_ROOT, "datasets/evaluation")
     test_loaders, test_samplers = {}, {}
     for _ds_name, _ds_jsonl, _ds_results, _q_key, _a_key in [
@@ -466,12 +506,16 @@ def train(args: argparse.Namespace) -> None:
          os.path.join(_eval_dir, "spinbench_data", "test.jsonl"),
          os.path.join(_eval_dir, "spinbench_data", "3d_results"),
          "problem", "answer"),
+        ("mmsibench",
+         os.path.join(_eval_dir, "MMSIBench", "data", "test_data_final.json"),
+         os.path.join(_eval_dir, "MMSIBench", "3d_results"),
+         "question", "answer"),
     ]:
         ds = Eval_Dataset_Coord(
             _ds_jsonl, _ds_results, processor, log,
-            max_images         = args.max_images,
             spatial_merge_size = spatial_merge_size,
             coord_upscale      = 1,
+            max_samples        = args.max_eval_samples,
             question_key       = _q_key,
             answer_key         = _a_key,
         )
@@ -609,48 +653,16 @@ def train(args: argparse.Namespace) -> None:
                     if global_step % args.save_steps == 0:
                         _save_checkpoint(_model, tokenizer, args.output_dir, global_step)
 
-                # ── periodic eval ─────────────────────────────────────────────
+                # ── periodic eval (MCQ letter-probe via teacher-forced argmax) ─
+                # Free-form generative eval lives in evaluation.py. Here we run
+                # a single teacher-forced forward and check whether the logit
+                # that *predicts* the letter token argmaxes onto the GT letter
+                # token id. Cheap (one forward, no autoregressive decode) and
+                # monotone with generative MCQ acc, but not bit-equivalent —
+                # see evaluation.py for the deploy-aligned numbers.
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
                     _spa = _model.spa_model
-                    _stop_criteria = StoppingCriteriaList(
-                        [_StopOnAnswerClose(tokenizer)]
-                    )
-                    # disable GC for KV cache during eval
-                    _gc_flag = getattr(_spa, "gradient_checkpointing", False)
-                    _lm = _resolve_language_model(_spa)
-                    _lm_gc = getattr(_lm, "gradient_checkpointing", False) if _lm else False
-                    if _gc_flag:    _spa.gradient_checkpointing = False
-                    if _lm and _lm_gc: _lm.gradient_checkpointing = False
-
-                    # ── Install eval shim once: HF generate() validates kwargs
-                    # against forward signatures and strips image_xyz (because
-                    # Qwen3_5ForConditionalGeneration.forward doesn't accept it).
-                    # Stash image_xyz on the inner SpatialAttnVanillaModel and
-                    # inject it from a forward shim — same trick evaluation.py
-                    # uses in load_spa_model() for atten mode. Idempotent across
-                    # eval ticks via _atten_eval_shim_installed. The shim only
-                    # falls back to the stash when image_xyz=None, so training
-                    # forwards that pass image_xyz directly are unaffected.
-                    _backbone = next(
-                        m for m in _spa.modules()
-                        if isinstance(m, SpatialAttnVanillaModel)
-                    )
-                    if not getattr(_backbone, "_atten_eval_shim_installed", False):
-                        _orig_inner_forward = _backbone.forward
-                        def _atten_eval_forward(
-                            *args, image_xyz=None, mm_token_type_ids=None, **kw
-                        ):
-                            if image_xyz is None:
-                                image_xyz = getattr(_backbone, "_eval_image_xyz", None)
-                            return _orig_inner_forward(
-                                *args,
-                                image_xyz=image_xyz,
-                                mm_token_type_ids=mm_token_type_ids,
-                                **kw,
-                            )
-                        _backbone.forward = _atten_eval_forward
-                        _backbone._atten_eval_shim_installed = True
 
                     for ds_name, loader in test_loaders.items():
                         if test_samplers.get(ds_name) is not None:
@@ -670,15 +682,7 @@ def train(args: argparse.Namespace) -> None:
                             if t_lbl is not None: t_lbl = t_lbl.to(device)
                             if t_xyz is not None: t_xyz = [x.to(device) for x in t_xyz]
 
-                            # Stash image_xyz so the eval shim picks it up on prefill.
-                            _backbone._eval_image_xyz = t_xyz
-
                             with torch.no_grad():
-                                # ── lm_loss: cheap teacher-forced forward over
-                                # the full sequence (kept for monitoring train
-                                # distribution drift across heterogeneous VST
-                                # subsets — generative acc alone is too noisy
-                                # for early-step trends).
                                 out = _spa(
                                     input_ids            = t_ids,
                                     attention_mask       = t_mask,
@@ -690,6 +694,7 @@ def train(args: argparse.Namespace) -> None:
                                     return_dict          = True,
                                 )
                                 logits = out.logits
+
                                 sl = logits[..., :-1, :].contiguous()
                                 sb = t_lbl[..., 1:].contiguous()
                                 lm_loss = F.cross_entropy(
@@ -700,52 +705,21 @@ def train(args: argparse.Namespace) -> None:
                                 loss_sum += lm_loss.item()
                                 count += 1
 
-                                # ── Generative acc: deploy-aligned with
-                                # evaluation.py — slice prompt to end right
-                                # before the supervised answer span,
-                                # autoregressively generate, then run
-                                # extract_answer_letter on the decoded text.
-                                # No fixed-offset probe → no letter/non-letter
-                                # bias, works the same for any answer style
-                                # the model emits.
                                 ans_idx = (t_lbl[0] != -100).nonzero(as_tuple=False).flatten()
                                 if ans_idx.numel() == 0:
                                     continue
-                                ans_start = ans_idx[0].item()
-
-                                p_ids  = t_ids[:, :ans_start]
-                                p_mask = t_mask[:, :ans_start]
-                                p_mm   = t_mm[:, :ans_start] if t_mm is not None else None
-
-                                generated = _spa.generate(
-                                    input_ids         = p_ids,
-                                    attention_mask    = p_mask,
-                                    pixel_values      = t_pv,
-                                    image_grid_thw    = t_thw,
-                                    mm_token_type_ids = p_mm,
-                                    max_new_tokens    = _EVAL_MAX_NEW_TOKENS,
-                                    do_sample         = False,
-                                    pad_token_id      = tokenizer.eos_token_id,
-                                    stopping_criteria = _stop_criteria,
-                                )
-
-                            # Decode model output and supervised GT, extract letter.
-                            trimmed = generated[0][p_ids.shape[1]:]
-                            pred_text = tokenizer.decode(
-                                trimmed.tolist(), skip_special_tokens=True,
-                            )
-                            pred_letter = extract_answer_letter(pred_text)
-
-                            gt_ids = t_lbl[0, ans_start:]
-                            gt_ids = gt_ids[gt_ids != -100]
-                            gt_text = tokenizer.decode(
-                                gt_ids.tolist(), skip_special_tokens=True,
-                            )
-                            gt_letter = extract_answer_letter(gt_text)
-
-                            if (pred_letter and gt_letter
-                                    and pred_letter.lower() == gt_letter.lower()):
-                                acc_sum += 1.0
+                                # ans_start is the `<` of `<answer>`; the letter
+                                # token sits at ans_start + letter_offset (Qwen3.5
+                                # BPE merges `>X` into one token so it's not at
+                                # ans_start itself). The logit that predicts
+                                # position p is logits[p-1].
+                                letter_pos = ans_idx[0].item() + letter_offset
+                                if letter_pos == 0 or letter_pos >= t_lbl.shape[1]:
+                                    continue
+                                pred_id = logits[0, letter_pos - 1].argmax().item()
+                                gt_id   = t_lbl[0, letter_pos].item()
+                                if pred_id == gt_id:
+                                    acc_sum += 1.0
 
                         if world_size > 1:
                             stats = torch.tensor([loss_sum, acc_sum, count],
@@ -770,8 +744,6 @@ def train(args: argparse.Namespace) -> None:
                                     step=global_step,
                                 )
 
-                    if _gc_flag:        _spa.gradient_checkpointing = True
-                    if _lm and _lm_gc:  _lm.gradient_checkpointing = True
                     model.train()
 
     if local_rank == 0:
@@ -796,7 +768,13 @@ def parse_args() -> argparse.Namespace:
                    help="VST entries JSON (e.g. vst_500k.json).")
     p.add_argument("--vst_results_dir",
                    default=os.path.join(_ROOT, "datasets/train/VST/3d_results"),
-                   help="Root of VST 3d_results tree (subdirs per task family).")
+                   help="Root of VST 3d_results tree (subdirs per task family). "
+                        "For --dataset mindcube, point this at the flat MindCube "
+                        "3d_results dir instead.")
+    p.add_argument("--dataset", choices=["vst", "mindcube"], default="vst",
+                   help="Train dataset family: 'vst' uses VST_Train_Dataset "
+                        "(JSON list + subdir results tree); 'mindcube' uses "
+                        "MindCube_Train_Dataset (JSONL + flat results dir).")
     p.add_argument("--output_dir",
                    default=os.path.join(_ROOT, "train_records/spatial_attn"))
     p.add_argument("--epochs",      type=int,   default=3)
@@ -804,15 +782,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup_steps",type=int,   default=100,
                    help="Linear warmup steps before cosine decay.")
     p.add_argument("--lora_rank",   type=int,   default=16)
-    p.add_argument("--max_images",  type=int,   default=4)
     p.add_argument("--grad_accum",  type=int,   default=16)
     p.add_argument("--save_steps",  type=int,   default=200)
     p.add_argument("--eval_steps",  type=int,   default=100)
     p.add_argument("--num_workers", type=int,   default=4)
     p.add_argument("--max_samples", type=int,   default=None,
                    help="Truncate dataset to this many samples (per source).")
+    p.add_argument("--max_eval_samples", type=int, default=None,
+                   help="Truncate each eval dataset (mindcube/spinbench/mmsibench) to "
+                        "this many samples. Useful for smoke tests.")
     p.add_argument("--train_vision", action="store_true",
                    help="Also unfreeze the ViT.")
+    p.add_argument("--freeze", action="store_true",
+                   help="Do not apply LoRA to linear-attention layers — only "
+                       "full-attention layers (where SpatialAttentionBias also "
+                       "lives) receive LoRA on q/k/v/o + gate/up/down. "
+                       "Linear-attn layer params stay fully frozen.")
     p.add_argument("--bias_lr_scale", type=float, default=10.0,
                    help="LR multiplier for SpatialAttentionBias params vs LoRA. "
                         "bias_module gets lr * bias_lr_scale. Default 10.")
@@ -821,6 +806,11 @@ def parse_args() -> argparse.Namespace:
                         "0 = exact zero-init (pretrained behavior preserved but "
                         "W₁ gradients dead until W₂ moves); >0 = N(0,scale) init "
                         "allowing W₁ to train from step 0. Default 0.01.")
+    p.add_argument("--couple", action="store_true",
+                   help="Joint-train SpatialAttentionBias + LoRA together "
+                        "(historical behavior). Default OFF: only the bias "
+                        "module is trainable, LoRA adapters stay frozen at "
+                        "init so all gradient signal reaches W₁/W₂.")
     p.add_argument("--wandb_project", default="")
     p.add_argument("--wandb_entity",  default="")
     p.add_argument("--wandb_run_name", default="")

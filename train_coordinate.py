@@ -64,7 +64,11 @@ from src.models import (
     SpaDecForConditionalGeneration,
     patch_attention_layers_dec,
 )
-from src.dataset import VST_Train_Dataset_Coord, Eval_Dataset_Coord
+from src.dataset import (
+    VST_Train_Dataset_Coord,
+    MindCube_Train_Dataset_Coord,
+    Eval_Dataset_Coord,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -302,9 +306,9 @@ def train(args: argparse.Namespace) -> None:
     # where AR output is often `<image>X</image>` or a bare letter), this
     # OVERESTIMATES real acc by 30-40 pp. Verified on atten_vst_1/step_500:
     # spinbench LETTER_OFFSET acc = 62% vs deploy generative acc = 24%.
-    # Trust evaluation.py deploy eval for ground truth. See train_atten.py
-    # periodic eval for the upgraded generative + extract_answer_letter
-    # pattern.
+    # Trust evaluation.py deploy eval for ground truth. The other train_*.py
+    # scripts share this teacher-forced letter-probe (kept identical for
+    # cross-run comparability — same monotone-but-inflated acc curve).
     from src.dataset import compute_letter_offset
     model.letter_offset = compute_letter_offset(processor.tokenizer)
     log.info(f"letter_offset = {model.letter_offset}")
@@ -328,17 +332,29 @@ def train(args: argparse.Namespace) -> None:
     else:
         _model = model
 
-    # -- dataset / loader ------------------------------------------------------
-    train_dataset = VST_Train_Dataset_Coord(
-        args.json_path,
-        args.vst_results_dir,
-        processor,
-        log,
-        max_images         = args.max_images,
-        spatial_merge_size = spatial_merge_size,
-        coord_upscale      = args.coord_upscale,
-        max_samples        = args.max_samples,
-    )
+    # -- dataset / loader (VST or MindCube, dispatched via --dataset) ----------
+    if args.dataset == "mindcube":
+        train_dataset = MindCube_Train_Dataset_Coord(
+            jsonl_path         = args.json_path,
+            results_dir        = args.vst_results_dir,
+            processor          = processor,
+            log                = log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            coord_upscale      = args.coord_upscale,
+            max_samples        = args.max_samples,
+        )
+    else:
+        train_dataset = VST_Train_Dataset_Coord(
+            args.json_path,
+            args.vst_results_dir,
+            processor,
+            log,
+            max_images         = args.max_images,
+            spatial_merge_size = spatial_merge_size,
+            coord_upscale      = args.coord_upscale,
+            max_samples        = args.max_samples,
+        )
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
                            rank=local_rank, shuffle=True)
@@ -735,7 +751,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--vst_results_dir",
         default=os.path.join(_ROOT, "datasets/train/VST/3d_results"),
-        help="Root of VST 3d_results tree (subdirs per task family).",
+        help="Root of VST 3d_results tree (subdirs per task family). "
+             "For --dataset mindcube, point this at the flat MindCube "
+             "3d_results dir instead.",
+    )
+    p.add_argument(
+        "--dataset", choices=["vst", "mindcube"], default="vst",
+        help="Train dataset family: 'vst' uses VST_Train_Dataset_Coord (JSON "
+             "list + subdir results tree); 'mindcube' uses "
+             "MindCube_Train_Dataset_Coord (JSONL + flat results dir).",
     )
     p.add_argument(
         "--output_dir",

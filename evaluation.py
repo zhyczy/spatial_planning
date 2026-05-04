@@ -108,9 +108,11 @@ from transformers import (
 class _StopOnAnswerClose(StoppingCriteria):
     """Halt generation as soon as the model emits the `</answer>` close tag.
 
-    extract_answer_letter only looks at `<answer>…</answer>`, so anything
-    after the close tag is dead weight. Stopping early bounds per-sample
+    Once `</answer>` appears, anything generated after is dead weight for
+    `extract_answer_letter`'s T1 path. Stopping early bounds per-sample
     eval time by the actual answer length rather than `--max_new_tokens`.
+    Models that skip the tag entirely (e.g. SpinBench single-image bare
+    'A\\n') hit the eos token quickly anyway.
     """
 
     def __init__(self, tokenizer):
@@ -134,7 +136,9 @@ from src.models import (
 )
 from src.dataset import (
     load_testing_dataset, chunk_dataset, _qwen_align_view,
+    _qwen_params_from_processor,
     build_interleaved_content,
+    extract_answer_content, extract_answer_letter, extract_answer_number,
 )
 
 # ── sys.path: ensure spatial_planning/ root is importable ──────────────────
@@ -207,68 +211,11 @@ EVAL_SYSTEM_PROMPT_THINKING_FILL = (
 
 
 # ===========================================================================
-# Answer extraction
+# Answer extraction — single source of truth lives in
+# src/dataset/answer_format.py (re-exported via src.dataset). This module
+# imports them above so train + eval always agree on letter/number/content
+# parsing semantics.
 # ===========================================================================
-
-_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
-
-
-def extract_answer_content(text: str) -> str:
-    """Return the raw inner content of the *last* ``<answer>...</answer>`` tag.
-
-    Multi-line content is preserved (DOTALL). Used for free-form VST-style
-    outputs (captions, metric explanations, "C. left and forward").
-    Returns "" if no tag is present.
-    """
-    if not text or not isinstance(text, str):
-        return ""
-    matches = _ANSWER_TAG_RE.findall(text)
-    return matches[-1].strip() if matches else ""
-
-
-def extract_answer_letter(text: str) -> str:
-    """Extract the multiple-choice letter from a `<answer>...</answer>` tag.
-
-    Accepts both strict (`<answer>X</answer>`, MindCube training format) and
-    VST-trained richer variants (`<answer>X. option text</answer>`). The
-    leading letter inside the tag is returned if followed by a delimiter
-    (`.` / `)` / whitespace / end-of-content). Returns "" if no tag matches
-    or the content lacks a leading letter.
-
-    A model SFT'd on both MindCube + VST occasionally bleeds VST style onto
-    MCQ benchmarks, so we extract from inside the tag rather than reject
-    non-whitespace-padded content. See md/bug_fix/train_eval_paradigm_mismatch.md.
-    """
-    content = extract_answer_content(text)
-    if not content:
-        return ""
-    m = re.match(r"\s*([A-Za-z])(?:\s|[.)]|$)", content)
-    if m:
-        return m.group(1).upper()
-    return ""
-
-
-_NUMBER_RE = re.compile(r"(?<![A-Za-z\d])[-+]?\d+(?:\.\d+)?")
-# Lookbehind `(?<![A-Za-z\d])` prevents a `-` glued onto a word (e.g.
-# `point-2`) from being read as a sign. `point-2` → 2, `-2.5cm` → -2.5,
-# `=0.7m` → 0.7.
-
-
-def extract_answer_number(text: str) -> str:
-    """Extract a numeric answer from `<answer>...</answer>` (fill-format).
-
-    Looks inside the tag first (matching VST si_measurement style "97 cm" or
-    "Distance[A,B]=0.7m" — picks the first numeric token), then falls back
-    to the last standalone number anywhere in the text if no tag is present.
-    """
-    content = extract_answer_content(text)
-    if content:
-        m = _NUMBER_RE.search(content)
-        if m:
-            return m.group(0)
-    # Fallback: last standalone number in untagged text
-    nums = _NUMBER_RE.findall(text or "")
-    return nums[-1] if nums else ""
 
 
 # ===========================================================================
@@ -1030,6 +977,7 @@ def prepare_batch_baseline(
                 )
             )
 
+    _factor, _min_p, _max_p = _qwen_params_from_processor(processor)
     all_image_inputs, all_video_inputs = [], []
     for msgs in batch_messages:
         imgs, vids = process_vision_info(msgs)
@@ -1037,7 +985,13 @@ def prepare_batch_baseline(
             # Match training: pre-align image to Qwen smart_resize target via
             # PIL LANCZOS. Qwen's image_processor uses BICUBIC internally, so
             # without this the train and test interpolation kernels diverge.
-            imgs = [_qwen_align_view(img, None, None)[0] for img in imgs]
+            imgs = [
+                _qwen_align_view(
+                    img, None, None,
+                    factor=_factor, min_pixels=_min_p, max_pixels=_max_p,
+                )[0]
+                for img in imgs
+            ]
         all_image_inputs.extend(imgs or [])
         all_video_inputs.extend(vids or [])
 
@@ -1172,16 +1126,23 @@ def prepare_batch_spa(
     # tuples. Image-only fallback (raw benchmark image) is used only when no
     # pts3d is loaded for a view.
     if image_inputs:
+        _factor, _min_p, _max_p = _qwen_params_from_processor(processor)
         aligned_imgs: list = []
         for k, img in enumerate(image_inputs):
             r = coord_results[k] if (coord_results is not None and k < len(coord_results)) else None
             if r is not None:
                 src_img = r.get("image") or img
-                img_q, pts_q, mask_q = _qwen_align_view(src_img, r["pts3d"], r["mask"])
+                img_q, pts_q, mask_q = _qwen_align_view(
+                    src_img, r["pts3d"], r["mask"],
+                    factor=_factor, min_pixels=_min_p, max_pixels=_max_p,
+                )
                 r["pts3d"] = pts_q
                 r["mask"]  = mask_q
             else:
-                img_q = _qwen_align_view(img, None, None)[0]
+                img_q = _qwen_align_view(
+                    img, None, None,
+                    factor=_factor, min_pixels=_min_p, max_pixels=_max_p,
+                )[0]
             aligned_imgs.append(img_q)
         image_inputs = aligned_imgs
 

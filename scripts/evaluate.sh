@@ -20,7 +20,9 @@
 #                          sparbench_single_view  sparbench_mv  sat_real
 #                          spinbench  robospatial  viewspatial
 #                          omnispatial_pt  embspatial
-#               Default: all datasets
+#               Default: all datasets EXCEPT robospatial (run it explicitly
+#                        via --datasets robospatial if needed; uses mask-based
+#                        eval, not the standard MCQ accuracy path).
 #   --gpus      comma-separated GPU IDs, e.g. "0,1,2,3"
 #               Default: auto-detect all available GPUs
 #   --limit     truncate each dataset to N samples (debug / smoke test)
@@ -97,7 +99,7 @@ THINKING=""
 MAX_NEW_TOKENS=4096
 
 # All supported datasets (in evaluation order)
-ALL_DATASETS="mindcube sat_real spinbench robospatial viewspatial omnispatial_pt embspatial"
+ALL_DATASETS="mindcube sat_real spinbench viewspatial omnispatial_pt embspatial"
 
 # Dataset → data_dir mapping (relative to SPATIAL_DIR)
 declare -A DATASET_DIR

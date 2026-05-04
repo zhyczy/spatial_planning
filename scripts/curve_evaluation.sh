@@ -18,8 +18,9 @@
 #   --method    evaluation method           (default: coordinate)
 #               choices: baseline vanilla position_embedding coordinate decouple atten
 #   --datasets  comma-separated dataset list (single name OK, e.g. "mindcube")
-#               (default: mindcube,sat_real,spinbench,robospatial,
-#                         viewspatial,omnispatial_pt,embspatial)
+#               (default: mindcube,sat_real,spinbench,viewspatial,
+#                         omnispatial_pt,embspatial — robospatial excluded;
+#                         pass it explicitly to include)
 #   --gpus      comma-separated GPU IDs     (default: all visible)
 #   --limit     truncate each dataset to N samples (debug / smoke test)
 #   --output    output directory for results and plots
@@ -62,7 +63,7 @@ START=200
 END=1000
 STEP_SIZE=50
 METHOD="coordinate"
-DATASETS="mindcube,sat_real,spinbench,robospatial,viewspatial,omnispatial_pt,embspatial"
+DATASETS="mindcube,sat_real,spinbench,viewspatial,omnispatial_pt,embspatial"
 GPUS=""
 LIMIT=""
 OUTPUT=""

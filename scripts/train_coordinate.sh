@@ -14,13 +14,15 @@
 # train_correspondence.sh (LM-only, no coord head).
 #
 # Usage:
-#   bash scripts/train_coordinate.sh [num_gpus] [--decouple]
+#   bash scripts/train_coordinate.sh [num_gpus] [--decouple] [--mindcube|--vst]
 #                                    [--skip_layers LAYER] [--coord_weight W]
 #                                    [--lora_rank R] [--xyz_rope_dim N]
 #                                    [--max_samples N]
 #
 #   num_gpus            — first positional arg, number of GPUs (default: all visible)
 #   --decouple          — decouple + Cartesian XYZ RoPE
+#   --mindcube          — train on MindCube_train.jsonl + MindCube 3d_results
+#   --vst               — train on vst_500k.json + VST 3d_results (default)
 #   --skip_layers LAYER — coord head reads from this transformer layer
 #                         (-1 = last/Layer 32 post-norm, default; -2 = Layer 31, ...)
 #                         Stamped into RUN_NAME (_sl<LAYER>) when non-default.
@@ -32,8 +34,9 @@
 #   --max_samples N     — truncate dataset to N entries (default: all)
 #
 # Examples:
-#   bash scripts/train_coordinate.sh                       # all GPUs, Cartesian
-#   bash scripts/train_coordinate.sh 2                     # 2 GPUs, Cartesian
+#   bash scripts/train_coordinate.sh                       # all GPUs, VST
+#   bash scripts/train_coordinate.sh 2                     # 2 GPUs, VST
+#   bash scripts/train_coordinate.sh 2 --mindcube          # 2 GPUs, MindCube
 #   bash scripts/train_coordinate.sh 1 --skip_layers -2    # use Layer 31
 #   bash scripts/train_coordinate.sh 1 --max_samples 6     # quick smoke run
 # =============================================================================
@@ -53,6 +56,7 @@ SKIP_LAYERS_ARG=""
 COORD_WEIGHT_ARG=""
 LORA_RANK_ARG=""
 XYZ_ROPE_DIM=""
+DATASET="vst"
 _positional=0
 
 while [ $# -gt 0 ]; do
@@ -63,6 +67,8 @@ while [ $# -gt 0 ]; do
         --lora_rank)    LORA_RANK_ARG="$2"; shift 2 ;;
         --xyz_rope_dim) XYZ_ROPE_DIM="$2"; shift 2 ;;
         --max_samples)  MAX_SAMPLES="$2"; shift 2 ;;
+        --mindcube)     DATASET="mindcube"; shift ;;
+        --vst)          DATASET="vst"; shift ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -82,8 +88,13 @@ fi
 # ── hyperparameters ─────────────────────────────────────────────────────────
 
 MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
-JSON_PATH="$SPATIAL_DIR/datasets/train/VST_parsed/vst_500k.json"
-VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/VST/3d_results"
+if [ "$DATASET" = "mindcube" ]; then
+    JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
+    VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
+else
+    JSON_PATH="$SPATIAL_DIR/datasets/train/VST_parsed/vst_500k.json"
+    VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/VST/3d_results"
+fi
 
 EPOCHS=1
 LR=2e-4
@@ -136,8 +147,8 @@ if [ -n "$XYZ_ROPE_DIM" ] && [ "$XYZ_ROPE_DIM" != "66" ] \
     _xrd_suffix="_xrd${XYZ_ROPE_DIM}"
 fi
 
-RUN_NAME="coordinate_vst${_decouple_suffix}${_r_suffix}${_cw_suffix}${_sl_suffix}${_xrd_suffix}"
-WANDB_RUN_NAME="coord_vst_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}${_decouple_suffix}${_sl_suffix}${_xrd_suffix}"
+RUN_NAME="coordinate_${DATASET}${_decouple_suffix}${_r_suffix}${_cw_suffix}${_sl_suffix}${_xrd_suffix}"
+WANDB_RUN_NAME="coord_${DATASET}_r${LORA_RANK}_ep${EPOCHS}_coord${COORD_WEIGHT}${_decouple_suffix}${_sl_suffix}${_xrd_suffix}"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 # ── setup ───────────────────────────────────────────────────────────────────
@@ -152,7 +163,8 @@ echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
-echo "[INFO] Dataset              : VST 500K"
+echo "[INFO] DATASET              = $DATASET"
+echo "[INFO] Dataset              : $(basename "$JSON_PATH")"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Mode                 : $_mode_label"
 if [ -n "$DECOUPLE_FLAG" ]; then
@@ -198,6 +210,7 @@ $TORCHRUN \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
+    --dataset                "$DATASET"                \
     $SKIP_LAYERS_FLAG                                  \
     $DECOUPLE_FLAG                                     \
     $XYZ_ROPE_DIM_FLAG                                 \

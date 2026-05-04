@@ -33,7 +33,6 @@ import sys
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from transformers import StoppingCriteria, StoppingCriteriaList
 
 try:
     import wandb
@@ -61,8 +60,9 @@ from src.models import (
 )
 from src.dataset import (
     VST_Train_Dataset,
+    MindCube_Train_Dataset,
     Eval_Dataset_Coord,
-    extract_answer_letter,
+    compute_letter_offset,
 )
 
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
@@ -73,34 +73,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-# Eval generation cap. Sized to fit the longest VST supervised answer
-# (unknow type ≈ 3987 tokens incl. wrappers), so the model can finish
-# `</answer>` even when it has drifted to long-form outputs from training.
-# Greedy decoding stops at EOS naturally; this is the safety ceiling.
-_EVAL_MAX_NEW_TOKENS = 4096
-
-
-class _StopOnAnswerClose(StoppingCriteria):
-    """Halt generation as soon as the model emits the `</answer>` close tag.
-
-    extract_answer_letter only looks at `<answer>…</answer>`, so anything
-    after the close tag is dead weight. Stopping early bounds per-sample
-    eval time by the actual answer length rather than `_EVAL_MAX_NEW_TOKENS`,
-    which prevents NCCL all_reduce timeouts on the slowest rank when a few
-    samples would otherwise generate to the cap.
-    """
-
-    def __init__(self, tokenizer):
-        ids = tokenizer.encode("</answer>", add_special_tokens=False)
-        self._stop_ids = torch.tensor(ids, dtype=torch.long)
-        self._L = len(ids)
-
-    def __call__(self, input_ids, scores, **kwargs):
-        if input_ids.shape[1] < self._L:
-            return False
-        last = input_ids[0, -self._L:]
-        return bool(torch.equal(last, self._stop_ids.to(last.device)))
 
 # ── DDP helpers ───────────────────────────────────────────────────────────────
 
@@ -147,12 +119,13 @@ def _resolve_language_model(root: nn.Module) -> nn.Module | None:
 
 # ── model building ────────────────────────────────────────────────────────────
 def build_model(
-    model_path:    str,
-    lora_rank:     int = 16,
-    freeze_vision: bool = True,
-    vanilla:       bool = False,
-    decouple:      bool = False,
-    xyz_rope_dim:  int  = 66,
+    model_path:         str,
+    lora_rank:          int = 16,
+    freeze_vision:      bool = True,
+    vanilla:            bool = False,
+    decouple:           bool = False,
+    xyz_rope_dim:       int  = 66,
+    freeze_linear_attn: bool = False,
 ) -> nn.Module:
     """
     Load backbone, patch M-RoPE, apply LoRA, return an answer model.
@@ -246,13 +219,43 @@ def build_model(
         log.info("Vision encoder frozen.")
 
     # ── apply LoRA to the language model ──────────────────────────────────────
+    proj_names = ["q_proj", "k_proj", "v_proj", "o_proj",
+                  "gate_proj", "up_proj", "down_proj"]
+    target_modules: list[str] | str = proj_names
+    if freeze_linear_attn:
+        # Inspect layer_type BEFORE PEFT wrapping. Decoder layers live under
+        # spa.model.language_model.layers; reuse _resolve_language_model so
+        # we don't hard-code the path. Build a regex that matches only the
+        # full-attn layer indices, so PEFT skips linear-attn layers entirely
+        # (no LoRA modules created — saves params + memory).
+        _lm_pre = _resolve_language_model(spa)
+        if _lm_pre is None:
+            raise RuntimeError(
+                "freeze_linear_attn=True but failed to locate language_model "
+                "with .layers under spa — cannot determine layer types."
+            )
+        full_idx, lin_idx = [], []
+        for i, layer in enumerate(_lm_pre.layers):
+            (lin_idx if getattr(layer, "layer_type", None) == "linear_attention"
+                     else full_idx).append(i)
+        if not lin_idx:
+            log.info("freeze_linear_attn=True but no linear-attn layers found; "
+                     "applying LoRA to all layers.")
+        else:
+            idx_alt = "|".join(str(i) for i in full_idx)
+            projs   = "|".join(proj_names)
+            target_modules = (
+                rf"^.*\.layers\.({idx_alt})\.(self_attn|mlp)\.({projs})$"
+            )
+            log.info(
+                f"freeze_linear_attn=True: LoRA on {len(full_idx)} full-attn "
+                f"layers, skipping {len(lin_idx)} linear-attn layers "
+                f"(idx={lin_idx[:8]}{'...' if len(lin_idx) > 8 else ''})."
+            )
     lora_cfg = LoraConfig(
         r              = lora_rank,
         lora_alpha     = lora_rank * 2,
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
+        target_modules = target_modules,
         lora_dropout   = 0.05,
         bias           = "none",
         task_type      = TaskType.CAUSAL_LM,
@@ -300,10 +303,8 @@ def train(args: argparse.Namespace) -> None:
     _env_rank = os.environ.get("LOCAL_RANK")
     if _env_rank is not None:
         local_rank = int(_env_rank)
-        # 1h NCCL timeout. Default is 10min, which is too short when periodic
-        # eval has to generate up to _EVAL_MAX_NEW_TOKENS per sample on a few
-        # outlier samples — the slowest rank can fall behind the eval-loop
-        # all_reduce and trip the watchdog.
+        # 1h NCCL timeout (default 10min) — kept generous so any periodic-eval
+        # rank skew or slow ckpt save can't trip the watchdog.
         dist.init_process_group(
             backend="nccl",
             timeout=datetime.timedelta(hours=1),
@@ -351,15 +352,20 @@ def train(args: argparse.Namespace) -> None:
         args.model_path, trust_remote_code=True
     )
     tokenizer = processor.tokenizer
+    # MCQ letter-probe: position of the letter token inside `<answer>X</answer>`.
+    # Qwen3.5 BPE merges `>X` into one token, so the letter sits at offset 2,
+    # not at ans_start (which is the `<` of `<answer>`).
+    letter_offset = compute_letter_offset(tokenizer)
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = build_model(
         args.model_path,
-        lora_rank      = args.lora_rank,
-        freeze_vision  = not args.train_vision,
-        vanilla        = args.vanilla,
-        decouple       = args.decouple,
-        xyz_rope_dim   = args.xyz_rope_dim,
+        lora_rank          = args.lora_rank,
+        freeze_vision      = not args.train_vision,
+        vanilla            = args.vanilla,
+        decouple           = args.decouple,
+        xyz_rope_dim       = args.xyz_rope_dim,
+        freeze_linear_attn = args.freeze,
     )
 
     model = model.to(device)
@@ -382,20 +388,33 @@ def train(args: argparse.Namespace) -> None:
     else:
         _model = model
 
-    # ── dataset / loader ──────────────────────────────────────────────────────
-    rank0_print(
-        f"Loading VST_Train_Dataset from {args.json_path} "
-        f"(results: {args.vst_results_dir})"
-    )
-    train_dataset = VST_Train_Dataset(
-        json_path          = args.json_path,
-        results_dir        = args.vst_results_dir,
-        processor          = processor,
-        log                = log,
-        max_images         = args.max_images,
-        spatial_merge_size = spatial_merge_size,
-        max_samples        = args.max_samples,
-    )
+    # ── dataset / loader (VST or MindCube, dispatched via --dataset) ──────────
+    if args.dataset == "mindcube":
+        rank0_print(
+            f"Loading MindCube_Train_Dataset from {args.json_path} "
+            f"(results: {args.vst_results_dir})"
+        )
+        train_dataset = MindCube_Train_Dataset(
+            jsonl_path         = args.json_path,
+            results_dir        = args.vst_results_dir,
+            processor          = processor,
+            log                = log,
+            spatial_merge_size = spatial_merge_size,
+            max_samples        = args.max_samples,
+        )
+    else:
+        rank0_print(
+            f"Loading VST_Train_Dataset from {args.json_path} "
+            f"(results: {args.vst_results_dir})"
+        )
+        train_dataset = VST_Train_Dataset(
+            json_path          = args.json_path,
+            results_dir        = args.vst_results_dir,
+            processor          = processor,
+            log                = log,
+            spatial_merge_size = spatial_merge_size,
+            max_samples        = args.max_samples,
+        )
 
     train_sampler = (
         DistributedSampler(train_dataset, num_replicas=world_size,
@@ -428,6 +447,10 @@ def train(args: argparse.Namespace) -> None:
          os.path.join(_eval_dir, "spinbench_data", "test.jsonl"),
          os.path.join(_eval_dir, "spinbench_data", "3d_results"),
          "problem", "answer"),
+        ("mmsibench",
+         os.path.join(_eval_dir, "MMSIBench", "data", "test_data_final.json"),
+         os.path.join(_eval_dir, "MMSIBench", "3d_results"),
+         "question", "answer"),
     ]:
 
         ds = Eval_Dataset_Coord(
@@ -435,9 +458,9 @@ def train(args: argparse.Namespace) -> None:
             _ds_results,
             processor,
             log,
-            max_images         = args.max_images,
             spatial_merge_size = spatial_merge_size,
             coord_upscale      = 1,
+            max_samples        = args.max_eval_samples,
             question_key       = _q_key,
             answer_key         = _a_key,
         )
@@ -564,20 +587,16 @@ def train(args: argparse.Namespace) -> None:
                     if global_step % args.save_steps == 0:
                         _save_checkpoint(_model, tokenizer, args.output_dir, global_step)
 
-                # ── periodic eval (deploy-aligned generative, mirrors train_atten.py) ─
+                # ── periodic eval (MCQ letter-probe via teacher-forced argmax) ─
+                # Free-form generative eval lives in evaluation.py. Here we run
+                # a single teacher-forced forward and check whether the logit
+                # that *predicts* the letter token argmaxes onto the GT letter
+                # token id. Cheap (one forward, no autoregressive decode) and
+                # monotone with generative MCQ acc, but not bit-equivalent —
+                # see evaluation.py for the deploy-aligned numbers.
                 if test_loaders and global_step > 0 and global_step % args.eval_steps == 0:
                     model.eval()
                     _spa = _model.spa_model if hasattr(_model, "spa_model") else _model
-                    _stop_criteria = StoppingCriteriaList(
-                        [_StopOnAnswerClose(tokenizer)]
-                    )
-
-                    # Disable GC for KV cache during generate()
-                    _spa_gc_flag = getattr(_spa, "gradient_checkpointing", False)
-                    _lm = _resolve_language_model(_spa)
-                    _lm_gc_flag = getattr(_lm, "gradient_checkpointing", False) if _lm else False
-                    if _spa_gc_flag:    _spa.gradient_checkpointing = False
-                    if _lm and _lm_gc_flag: _lm.gradient_checkpointing = False
 
                     for ds_name, loader in test_loaders.items():
                         if ds_name in test_samplers and test_samplers[ds_name] is not None:
@@ -598,10 +617,6 @@ def train(args: argparse.Namespace) -> None:
                             if t_xyz is not None: t_xyz = [x.to(device) for x in t_xyz]
 
                             with torch.no_grad():
-                                # ── lm_loss: cheap teacher-forced forward over
-                                # full sequence. Input template mirrors the
-                                # training step (incl. mm_token_type_ids) +
-                                # mode-conditional xyz kwargs.
                                 _fwd_kwargs = dict(
                                     input_ids            = t_ids,
                                     attention_mask       = t_mask,
@@ -615,6 +630,7 @@ def train(args: argparse.Namespace) -> None:
                                     _fwd_kwargs["image_xyz"] = t_xyz
                                 out = _spa(**_fwd_kwargs)
                                 logits = out.logits
+
                                 sl = logits[..., :-1, :].contiguous()
                                 sb = t_lbl[..., 1:].contiguous()
                                 lm_loss = F.cross_entropy(
@@ -625,119 +641,21 @@ def train(args: argparse.Namespace) -> None:
                                 loss_sum += lm_loss.item()
                                 count += 1
 
-                                # ── Generative acc (deploy-aligned with
-                                # evaluation.py): slice prompt to right before
-                                # the supervised answer span, autoregressively
-                                # generate, then run extract_answer_letter
-                                # on the decoded text. No fixed-offset probe →
-                                # no letter/non-letter bias. Matches
-                                # train_atten.py periodic eval.
                                 ans_idx = (t_lbl[0] != -100).nonzero(as_tuple=False).flatten()
                                 if ans_idx.numel() == 0:
                                     continue
-                                ans_start = ans_idx[0].item()
-
-                                p_ids  = t_ids[:, :ans_start]
-                                p_mask = t_mask[:, :ans_start]
-                                p_mm   = t_mm[:, :ans_start] if t_mm is not None else None
-                                _coord_scale = 100.0
-                                # Inner backbone for mode-specific position prep:
-                                #   vanilla  → Qwen3_5ForConditionalGeneration  (no prep)
-                                #   decouple → SpaDecForConditionalGeneration → .model = SpaDecModel  (._compute_xyz_pos)
-                                #   default  → SpaForConditionalGeneration → .model = SpaModel       (.get_rope_index)
-                                _backbone = _spa.base_model.model if hasattr(_spa, "base_model") else _spa
-
-                                # Per-mode generate prep + call. Each branch builds its own
-                                # gen_kwargs and calls _spa.generate(...) directly — no
-                                # indirection through evaluation.run_inference_spa.
-                                if args.vanilla:
-                                    # Stock Qwen 3D M-RoPE: HF computes position_ids itself.
-                                    generated = _spa.generate(
-                                        input_ids         = p_ids,
-                                        attention_mask    = p_mask,
-                                        pixel_values      = t_pv,
-                                        image_grid_thw    = t_thw,
-                                        mm_token_type_ids = p_mm,
-                                        max_new_tokens    = _EVAL_MAX_NEW_TOKENS,
-                                        do_sample         = False,
-                                        pad_token_id      = tokenizer.eos_token_id,
-                                        stopping_criteria = _stop_criteria,
-                                    )
-                                elif args.decouple:
-                                    # Decouple: keep Qwen 3D M-RoPE in rotary dims +
-                                    # new XYZ RoPE in pass-through. HF's generate() strips
-                                    # non-standard kwargs (mm_token_type_ids, image_xyz), so
-                                    # pre-compute xyz_pos on the prompt and stash on the
-                                    # language_model; SpaDecModel.forward picks it up when
-                                    # mm_token_type_ids is None on decode steps.
-                                    xyz_pos = _backbone.model._compute_xyz_pos(
-                                        input_ids         = p_ids,
-                                        mm_token_type_ids = p_mm,
-                                        image_grid_thw    = t_thw,
-                                        attention_mask    = p_mask,
-                                        image_xyz         = t_xyz,
-                                    )
-                                    _backbone.model.language_model._xyz_pos     = xyz_pos
-                                    _backbone.model.language_model._coord_scale = _coord_scale
-                                    generated = _spa.generate(
-                                        input_ids         = p_ids,
-                                        attention_mask    = p_mask,
-                                        pixel_values      = t_pv,
-                                        image_grid_thw    = t_thw,
-                                        max_new_tokens    = _EVAL_MAX_NEW_TOKENS,
-                                        do_sample         = False,
-                                        pad_token_id      = tokenizer.eos_token_id,
-                                        coord_scale       = _coord_scale,
-                                        stopping_criteria = _stop_criteria,
-                                    )
-                                else:
-                                    # Default 4D M-RoPE: pre-compute 5D position_ids so
-                                    # generate()'s _prepare_position_ids_for_generation is
-                                    # bypassed (otherwise SpaForConditionalGeneration's
-                                    # *args/**kwargs forward signature defeats inspect-based
-                                    # detection and the model falls back to 3D position_ids).
-                                    position_ids, _ = _backbone.model.get_rope_index(
-                                        input_ids         = p_ids,
-                                        mm_token_type_ids = p_mm,
-                                        image_grid_thw    = t_thw,
-                                        video_grid_thw    = None,
-                                        attention_mask    = p_mask,
-                                        image_xyz         = t_xyz,
-                                        coord_scale       = _coord_scale,
-                                    )
-                                    _gen_kwargs = dict(
-                                        input_ids         = p_ids,
-                                        attention_mask    = p_mask,
-                                        pixel_values      = t_pv,
-                                        image_grid_thw    = t_thw,
-                                        position_ids      = position_ids,
-                                        max_new_tokens    = _EVAL_MAX_NEW_TOKENS,
-                                        do_sample         = False,
-                                        pad_token_id      = tokenizer.eos_token_id,
-                                        coord_scale       = _coord_scale,
-                                        stopping_criteria = _stop_criteria,
-                                    )
-                                    if t_xyz is not None:
-                                        _gen_kwargs["image_xyz"] = t_xyz
-                                    generated = _spa.generate(**_gen_kwargs)
-
-                            # Decode model output and supervised GT, extract letter.
-                            trimmed = generated[0][p_ids.shape[1]:]
-                            pred_text = tokenizer.decode(
-                                trimmed.tolist(), skip_special_tokens=True,
-                            )
-                            pred_letter = extract_answer_letter(pred_text)
-
-                            gt_ids = t_lbl[0, ans_start:]
-                            gt_ids = gt_ids[gt_ids != -100]
-                            gt_text = tokenizer.decode(
-                                gt_ids.tolist(), skip_special_tokens=True,
-                            )
-                            gt_letter = extract_answer_letter(gt_text)
-
-                            if (pred_letter and gt_letter
-                                    and pred_letter.lower() == gt_letter.lower()):
-                                acc_sum += 1.0
+                                # ans_start is the `<` of `<answer>`; the letter
+                                # token sits at ans_start + letter_offset (Qwen3.5
+                                # BPE merges `>X` into one token so it's not at
+                                # ans_start itself). The logit that predicts
+                                # position p is logits[p-1].
+                                letter_pos = ans_idx[0].item() + letter_offset
+                                if letter_pos == 0 or letter_pos >= t_lbl.shape[1]:
+                                    continue
+                                pred_id = logits[0, letter_pos - 1].argmax().item()
+                                gt_id   = t_lbl[0, letter_pos].item()
+                                if pred_id == gt_id:
+                                    acc_sum += 1.0
 
                         if world_size > 1:
                             stats = torch.tensor([loss_sum, acc_sum, count],
@@ -762,8 +680,6 @@ def train(args: argparse.Namespace) -> None:
                                     step=global_step,
                                 )
 
-                    if _spa_gc_flag:    _spa.gradient_checkpointing = True
-                    if _lm and _lm_gc_flag: _lm.gradient_checkpointing = True
                     model.train()
 
     # Final checkpoint (rank 0 only)
@@ -813,7 +729,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--vst_results_dir",
         default=os.path.join(_ROOT, "datasets/train/VST/3d_results"),
-        help="Root of VST 3d_results tree (subdirs per task family).",
+        help="Root of VST 3d_results tree (subdirs per task family). "
+             "For --dataset mindcube, point this at the flat MindCube "
+             "3d_results dir instead.",
+    )
+    p.add_argument(
+        "--dataset", choices=["vst", "mindcube"], default="vst",
+        help="Train dataset family: 'vst' uses VST_Train_Dataset (JSON list + "
+             "subdir results tree); 'mindcube' uses MindCube_Train_Dataset "
+             "(JSONL + flat results dir).",
     )
     p.add_argument(
         "--output_dir",
@@ -825,8 +749,6 @@ def parse_args() -> argparse.Namespace:
                    help="Linear warmup steps before cosine decay.")
     p.add_argument("--lora_rank",    type=int,   default=16,
                    help="LoRA rank r")
-    p.add_argument("--max_images",   type=int,   default=4,
-                   help="Max images per scene (memory budget)")
     p.add_argument("--grad_accum",   type=int,   default=16,
                    help="Gradient accumulation steps")
     p.add_argument("--save_steps",   type=int,   default=200)
@@ -834,10 +756,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers",  type=int,   default=4)
     p.add_argument("--max_samples",  type=int,   default=None,
                    help="Truncate dataset to this many samples (None = use all)")
+    p.add_argument("--max_eval_samples", type=int, default=None,
+                   help="Truncate each eval dataset (mindcube/spinbench/mmsibench) to "
+                        "this many samples. Useful for smoke tests.")
     p.add_argument(
         "--train_vision",
         action="store_true",
         help="Also unfreeze the vision encoder (ViT) for fine-tuning",
+    )
+    p.add_argument(
+        "--freeze",
+        action="store_true",
+        help="Do not apply LoRA to linear-attention layers — only "
+             "full-attention layers receive LoRA on q/k/v/o + gate/up/down. "
+             "Linear-attn layer params stay fully frozen.",
     )
     p.add_argument(
         "--vanilla",

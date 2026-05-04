@@ -14,6 +14,7 @@ from .train_dataset_qwen35 import (
     VST_Train_Dataset,
     VST_Train_Dataset_Coord,
     _qwen_align_view,
+    _qwen_params_from_processor,
 )
 from .eval_dataset_qwen35 import (
     Eval_Dataset_Coord,

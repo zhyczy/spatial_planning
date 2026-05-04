@@ -24,7 +24,13 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from .answer_format import build_interleaved_content
-from .train_dataset_qwen35 import _load_and_align_views, resize_xyz
+from .train_dataset_qwen35 import (
+    _filter_complete_samples,
+    _load_and_align_views,
+    _n_images_in_entry,
+    _qwen_params_from_processor,
+    resize_xyz,
+)
 
 
 class Eval_Dataset_Coord(Dataset):
@@ -48,26 +54,37 @@ class Eval_Dataset_Coord(Dataset):
         results_dir:        str,
         processor,
         log,
-        max_images:         int = 4,
+        max_images:         int | None = None,
         spatial_merge_size: int = 2,
         coord_upscale:      int = 4,
         max_samples:        int | None = None,
         question_key:       str = "question",
         answer_key:         str = "gt_answer",
     ):
-        raw = []
+        # Accept both JSONL (one object per line, MindCube/SpinBench) and
+        # JSON-array (single top-level list, MMSIBench's test_data_final.json).
+        # Detected by sniffing the first non-whitespace byte.
         with open(jsonl_path) as fh:
-            for line in fh:
-                if line.strip():
-                    raw.append(json.loads(line))
+            head = fh.read(64).lstrip()
+            fh.seek(0)
+            if head.startswith("["):
+                raw = json.load(fh)
+            else:
+                raw = [json.loads(line) for line in fh if line.strip()]
 
         self.samples = []
         for entry in raw:
-            eid = entry.get("id", "")
+            # MMSIBench ids are ints; MindCube/SpinBench are strings. Coerce
+            # so os.path.join doesn't choke on non-str.
+            eid = str(entry.get("id", ""))
             sample_dir = os.path.join(results_dir, eid)
             if not os.path.isdir(sample_dir):
                 continue
             self.samples.append((entry, sample_dir))
+
+        self.samples = _filter_complete_samples(
+            self.samples, log, "Eval_Dataset_Coord"
+        )
 
         if max_samples is not None and max_samples > 0:
             self.samples = self.samples[:max_samples]
@@ -79,9 +96,12 @@ class Eval_Dataset_Coord(Dataset):
         self.question_key       = question_key
         self.answer_key         = answer_key
         self.log                = log
+        self._qwen_params       = _qwen_params_from_processor(processor)
         log.info(
             f"Eval_Dataset_Coord: {len(self.samples)} valid entries "
-            f"(out of {len(raw)} total) from {jsonl_path}"
+            f"(out of {len(raw)} total) from {jsonl_path} "
+            f"[qwen_align factor={self._qwen_params[0]} "
+            f"min_pixels={self._qwen_params[1]} max_pixels={self._qwen_params[2]}]"
         )
 
     def __len__(self):
@@ -91,7 +111,8 @@ class Eval_Dataset_Coord(Dataset):
         entry, sample_dir = self.samples[idx]
 
         images, xyz_raw_list, mask_raw_list, _ = _load_and_align_views(
-            sample_dir, self.max_images,
+            sample_dir, _n_images_in_entry(entry) or self.max_images,
+            qwen_params=self._qwen_params,
         )
         N = len(images)
 

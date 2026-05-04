@@ -138,18 +138,67 @@ def extract_answer_content(text: str) -> str:
 
 
 def extract_answer_letter(text: str) -> str:
-    """Extract the multiple-choice letter from a `<answer>...</answer>` tag.
+    """Extract the multiple-choice letter from model output.
 
-    Accepts both strict (`<answer>X</answer>`) and richer
-    (`<answer>X. option text</answer>`) variants. Returns "" if no tag or
-    the content lacks a leading letter.
+    4-tier fallback by descending confidence:
+      T1a <answer>X...</answer> tag, content starts with letter+delim
+      T1b <answer>...</answer> tag, last A-F letter inside (handles VST
+          style "<answer>The answer is A</answer>")
+      T2  "the answer is X" / "Answer: X" / "I choose X" patterns in raw text
+      T3  raw text starts with a single A-F letter + delimiter (e.g. 'A\\n',
+          'A. blue chair', 'A) yes') — handles SpinBench single-image
+          "Only answer with a single capital letter ..." outputs
+      T4  last standalone A-F letter anywhere in raw text — covers prose
+          like 'Yes A is closer' / 'The answer is A.' / 'A is right'
+
+    Restricted to A-F (multi-choice options rarely exceed 6) to prevent
+    prose like "The answer ..." from being misread as 'T'.
+
+    See md/bug_fix/answer_letter_extractor_no_fallback.md for the bug this
+    addresses (single-image SpinBench was scored 0% / 0% accuracy because
+    the model emitted bare 'A\\n' that the strict tag-only extractor
+    returned "" for).
     """
-    content = extract_answer_content(text)
-    if not content:
+    if not text or not isinstance(text, str):
         return ""
-    m = re.match(r"\s*([A-Za-z])(?:\s|[.)]|$)", content)
+
+    # ── T1: <answer> tag ─────────────────────────────────────────────────
+    content = extract_answer_content(text)
+    if content:
+        # T1a: tag content starts with letter + delimiter
+        m = re.match(r"\s*([A-Fa-f])(?:\s|[.)]|$)", content)
+        if m:
+            return m.group(1).upper()
+        # T1b: tag content has prose, take last standalone A-F inside the tag
+        m = re.findall(r"\b([A-Fa-f])\b", content)
+        if m:
+            return m[-1].upper()
+        return ""
+
+    # ── No tag → fallback on raw text ────────────────────────────────────
+    text_s = text.strip()
+
+    # T2: explicit answer-indicator patterns (high confidence)
+    m = re.search(
+        r"(?:the\s+answer\s+is|answer\s*[:：]|"
+        r"i\s+(?:choose|pick|think|go\s+with))\s*"
+        r"(?:it'?s\s+)?\(?([A-Fa-f])\)?\b",
+        text_s,
+        flags=re.IGNORECASE,
+    )
     if m:
         return m.group(1).upper()
+
+    # T3: raw text starts with single letter + delimiter
+    m = re.match(r"([A-Fa-f])(?:\s|[.):]|$)", text_s)
+    if m:
+        return m.group(1).upper()
+
+    # T4: last standalone A-F letter anywhere
+    m = re.findall(r"\b([A-Fa-f])\b", text_s)
+    if m:
+        return m[-1].upper()
+
     return ""
 
 

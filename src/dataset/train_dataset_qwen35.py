@@ -1,21 +1,27 @@
-"""Training datasets for Qwen3.5-VL.
+"""Training datasets for Qwen-VL (Qwen2.5 / Qwen3.5).
 
 3d_results on disk live at the reconstruction model's MapAny native shape
-(one of RESOLUTION_MAPPINGS[518], all /14 multiples but **not** /28).
-Qwen3.5-VL's vision processor rounds image (H, W) to multiples of
-patch_size × spatial_merge_size = 14 × 2 = 28 via smart_resize, and
-resize_xyz block-averages pts3d to the LLM patch grid using *integer*
-stride. Feeding Qwen the MapAny-shape image directly works (Qwen runs
-smart_resize internally), but resize_xyz on the MapAny pts3d would
-truncate edge pixels with non-/28 H or W.
+(one of RESOLUTION_MAPPINGS[518], all /14 multiples). Qwen-VL's vision
+processor rounds image (H, W) to multiples of
+``patch_size × spatial_merge_size`` via smart_resize (Qwen2.5-VL: 14×2=28;
+Qwen3.5-VL: 16×2=32) and resize_xyz block-averages pts3d to the LLM patch
+grid with *integer* stride. Feeding Qwen the MapAny-shape image directly
+works (Qwen runs smart_resize internally), but resize_xyz on the MapAny
+pts3d would truncate edge pixels and silently mis-align with the patch
+grid the ViT actually sees.
 
 We resolve this in __getitem__ by Qwen-aligning each loaded view (image +
 pts3d + mask) to smart_resize's target shape *before* the Qwen processor
-and resize_xyz run.
+and resize_xyz run. The factor / min_pixels / max_pixels are read from
+``processor.image_processor`` at dataset init via
+:func:`_qwen_params_from_processor`, so the alignment always matches the
+loaded checkpoint and a Qwen2.5↔Qwen3.5 swap can't desync pts3d from the
+ViT patch grid.
 """
 
 import os
 import math
+from typing import Any, Dict
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -23,16 +29,41 @@ import numpy as np
 import torch
 
 
-# ── Qwen3.5-VL smart_resize alignment ─────────────────────────────────────────
-# patch_size 14 × spatial_merge_size 2 = 28. Qwen's image_processor.smart_resize
-# rounds H, W to multiples of this factor preserving aspect ratio, bounded by
-# [min_pixels, max_pixels]. The defaults below match Qwen2.5/3.5-VL config
-# (min = 56*56, max = 14*14*4*1280). If your processor uses different bounds,
-# pass them via _qwen_align_view's kwargs.
-
+# ── Qwen-VL smart_resize alignment ────────────────────────────────────────────
+# Qwen's image_processor.smart_resize rounds H, W to multiples of
+# ``patch_size * merge_size`` (preserving aspect ratio) and clamps area to
+# [shortest_edge, longest_edge]. The exact numbers differ per checkpoint:
+#   Qwen2.5-VL: factor=28 (14×2),  min=56²=3136,    max=14²·4·1280=1_003_520
+#   Qwen3.5-VL: factor=32 (16×2),  min=256²=65_536, max=4096²=16_777_216
+# Datasets read the actual values from ``processor.image_processor`` via
+# :func:`_qwen_params_from_processor` so a wrong factor here cannot silently
+# misalign pts3d with the ViT patch grid. The constants below are kept only
+# as fallback defaults for callers that have no processor in scope (e.g.
+# diagnostic ``probe_*`` scripts).
 _QWEN_FACTOR = 28
 _QWEN_MIN_PIXELS = 56 * 56
 _QWEN_MAX_PIXELS = 14 * 14 * 4 * 1280  # = 1_003_520
+
+
+def _qwen_params_from_processor(processor) -> tuple[int, int, int]:
+    """Return ``(factor, min_pixels, max_pixels)`` for a Qwen-VL processor.
+
+    ``factor = image_processor.patch_size * image_processor.merge_size``;
+    ``min_pixels`` / ``max_pixels`` come from ``image_processor.size``'s
+    ``shortest_edge`` / ``longest_edge`` keys (Qwen{2, 2.5, 3, 3.5}-VL all
+    expose this layout). Falls back to the module-level defaults when the
+    processor or any attribute is missing.
+    """
+    ip = getattr(processor, "image_processor", None)
+    if ip is None:
+        return _QWEN_FACTOR, _QWEN_MIN_PIXELS, _QWEN_MAX_PIXELS
+    ps = int(getattr(ip, "patch_size", _QWEN_FACTOR // 2))
+    ms = int(getattr(ip, "merge_size", 2))
+    factor = ps * ms
+    sz = getattr(ip, "size", None) or {}
+    min_p = int(sz.get("shortest_edge", _QWEN_MIN_PIXELS))
+    max_p = int(sz.get("longest_edge",  _QWEN_MAX_PIXELS))
+    return factor, min_p, max_p
 
 
 def _smart_resize_target(
@@ -125,22 +156,90 @@ def _qwen_align_view(
     return image_q, xyz_q, mask_q
 
 
+def _n_images_in_entry(entry: Dict[str, Any] | None) -> int | None:
+    """Return the number of images the JSON sample claims to have, or None.
+
+    The image-list field varies by dataset:
+      MindCube / SpinBench / VST → ``images``
+      MMSIBench                  → ``local_images``
+
+    The per-sample ``3d_results/<id>/`` directory is constructed by iterating
+    that list in order, so view_0000 = images[0], etc. Capping the load by
+    ``len(images)`` keeps train/eval aligned with the question's actual image
+    set even when a stale preprocessing run leaves extra view dirs on disk
+    (or when the JSON list is the source of truth).
+
+    Returns ``None`` when neither key is present or the list is empty, which
+    falls back to "load every view_XXXX/ on disk".
+    """
+    if not entry:
+        return None
+    for k in ("images", "local_images"):
+        v = entry.get(k)
+        if isinstance(v, list) and len(v) > 0:
+            return len(v)
+    return None
+
+
+def _disk_view_count(sample_dir: str) -> int:
+    """Number of view_XXXX/ directories on disk for *sample_dir*."""
+    if not os.path.isdir(sample_dir):
+        return 0
+    return sum(1 for d in os.listdir(sample_dir) if d.startswith("view_"))
+
+
+def _filter_complete_samples(samples, log, dataset_name: str):
+    """Drop entries where disk view dirs are fewer than the JSON image list.
+
+    The QA item is the source of truth for view count, so loading a sample
+    short of its required views would silently corrupt the prompt. We filter
+    at __init__ rather than raise at __getitem__ so DataLoader workers can't
+    crash mid-epoch on a known-incomplete sample.
+    """
+    kept, dropped = [], []
+    for entry, sample_dir in samples:
+        n_json = _n_images_in_entry(entry)
+        if n_json is None:
+            kept.append((entry, sample_dir))
+            continue
+        n_disk = _disk_view_count(sample_dir)
+        if n_disk >= n_json:
+            kept.append((entry, sample_dir))
+        else:
+            dropped.append((entry.get("id", "?"), n_json, n_disk))
+    if dropped:
+        log.warning(
+            f"{dataset_name}: dropped {len(dropped)} sample(s) where disk "
+            f"view count < JSON image count. First few: {dropped[:3]}"
+        )
+    return kept
+
+
 def _load_and_align_views(
     sample_dir: str,
-    max_images: int,
+    n_views: int | None,
+    qwen_params: tuple[int, int, int] | None = None,
 ) -> tuple[list[Image.Image], list[np.ndarray | None], list[np.ndarray | None], list[str]]:
-    """Load up to *max_images* views from <sample_dir>/view_XXXX/ and apply
+    """Load exactly *n_views* views from <sample_dir>/view_XXXX/ and apply
     Qwen alignment to each (image, pts3d, mask) tuple. Returns four parallel
-    lists of equal length (empty if no view loads).
+    lists of length n_views.
+
+    *n_views* is the JSON image-list count (``_n_images_in_entry(entry)``) —
+    the QA item is the source of truth for how many views to feed the model.
+    Loading fewer would silently corrupt the prompt; loading more would
+    surface views the question never references. Both are wrong, so this
+    function raises ``RuntimeError`` if any of the first n_views view dirs is
+    missing or its image fails to decode. Callers should pre-filter samples
+    where ``_disk_view_count(sample_dir) < _n_images_in_entry(entry)``.
+
+    Pass *n_views=None* only when the JSON has no image list and you genuinely
+    want every view_XXXX/ on disk.
 
     Per-view file layout:
         view_XXXX/
             image.png        — RGB
             pts3d.npy        — (H, W, 3) float, optional
             mask.npy         — (H, W)    bool,  optional
-
-    The first view that fails to decode the image breaks the loop (mirrors
-    the original behavior where missing views truncate the sample early).
     """
     view_dirs_all = sorted(
         d for d in os.listdir(sample_dir) if d.startswith("view_")
@@ -150,12 +249,25 @@ def _load_and_align_views(
     mask_list:  list[np.ndarray|None] = []
     kept_views: list[str]             = []
 
-    for vd in view_dirs_all[:max_images]:
+    if n_views is None:
+        selected = view_dirs_all
+    else:
+        if len(view_dirs_all) < n_views:
+            raise RuntimeError(
+                f"{sample_dir}: JSON requests {n_views} views but disk has "
+                f"only {len(view_dirs_all)} view_XXXX/ dirs. Filter at __init__."
+            )
+        selected = view_dirs_all[:n_views]
+
+    for vd in selected:
         img_path = os.path.join(sample_dir, vd, "image.png")
         try:
             img = Image.open(img_path).convert("RGB")
-        except (FileNotFoundError, OSError):
-            break
+        except (FileNotFoundError, OSError) as exc:
+            raise RuntimeError(
+                f"{sample_dir}/{vd}/image.png missing or unreadable; "
+                f"can't satisfy JSON view count. ({exc})"
+            )
 
         pts3d_path = os.path.join(sample_dir, vd, "pts3d.npy")
         mask_path  = os.path.join(sample_dir, vd, "mask.npy")
@@ -178,7 +290,14 @@ def _load_and_align_views(
                 f"at {sample_dir}/{vd}"
             )
 
-        img_q, xyz_q, mask_q = _qwen_align_view(img, xyz, mask)
+        if qwen_params is not None:
+            factor, min_pixels, max_pixels = qwen_params
+            img_q, xyz_q, mask_q = _qwen_align_view(
+                img, xyz, mask,
+                factor=factor, min_pixels=min_pixels, max_pixels=max_pixels,
+            )
+        else:
+            img_q, xyz_q, mask_q = _qwen_align_view(img, xyz, mask)
         images.append(img_q)
         xyz_list.append(xyz_q)
         mask_list.append(mask_q)
@@ -210,7 +329,8 @@ def resize_xyz(
         are set to zero.
 
     Note: expects (H, W) such that H % target_h == 0 and W % target_w == 0
-    (true after _qwen_align_view, where stride = factor / spatial_merge_size = 14).
+    (true after _qwen_align_view, where stride = factor / spatial_merge_size
+    — equals patch_size; 14 for Qwen2.5-VL, 16 for Qwen3.5-VL).
     """
     H, W = xyz.shape[:2]
     xyz_f = xyz.astype(np.float32)                     # (H, W, 3)
@@ -265,7 +385,7 @@ class MindCube_Train_Dataset(Dataset):
         results_dir:        str,
         processor,
         log,
-        max_images:         int = 4,
+        max_images:         int | None = None,
         spatial_merge_size: int = 2,
         max_samples:        int | None = None,
         plus:               bool = False,
@@ -285,6 +405,10 @@ class MindCube_Train_Dataset(Dataset):
                 continue
             self.samples.append((entry, sample_dir))
 
+        self.samples = _filter_complete_samples(
+            self.samples, log, "MindCube_Train_Dataset"
+        )
+
         if max_samples is not None and max_samples > 0:
             self.samples = self.samples[:max_samples]
 
@@ -293,9 +417,12 @@ class MindCube_Train_Dataset(Dataset):
         self.spatial_merge_size = spatial_merge_size
         self.plus               = plus
         self.log = log
+        self._qwen_params       = _qwen_params_from_processor(processor)
         log.info(
             f"MindCube_Train_Dataset: {len(self.samples)} valid entries "
-            f"(out of {len(raw)} total) from {jsonl_path}"
+            f"(out of {len(raw)} total) from {jsonl_path} "
+            f"[qwen_align factor={self._qwen_params[0]} "
+            f"min_pixels={self._qwen_params[1]} max_pixels={self._qwen_params[2]}]"
         )
 
     def __len__(self):
@@ -305,7 +432,8 @@ class MindCube_Train_Dataset(Dataset):
         entry, sample_dir = self.samples[idx]
 
         images, xyz_raw_list, mask_raw_list, _ = _load_and_align_views(
-            sample_dir, self.max_images,
+            sample_dir, _n_images_in_entry(entry) or self.max_images,
+            qwen_params=self._qwen_params,
         )
 
         N = len(images)
@@ -399,7 +527,7 @@ class MindCube_Train_Dataset_Coord(Dataset):
         results_dir:        str,
         processor,
         log,
-        max_images:         int = 4,
+        max_images:         int | None = None,
         spatial_merge_size: int = 2,
         coord_upscale:      int = 4,
         max_samples:        int | None = None,
@@ -419,6 +547,10 @@ class MindCube_Train_Dataset_Coord(Dataset):
                 continue
             self.samples.append((entry, sample_dir))
 
+        self.samples = _filter_complete_samples(
+            self.samples, log, "MindCube_Train_Dataset_Coord"
+        )
+
         if max_samples is not None and max_samples > 0:
             self.samples = self.samples[:max_samples]
 
@@ -427,9 +559,12 @@ class MindCube_Train_Dataset_Coord(Dataset):
         self.spatial_merge_size = spatial_merge_size
         self.coord_upscale      = coord_upscale
         self.log = log
+        self._qwen_params       = _qwen_params_from_processor(processor)
         log.info(
             f"MindCube_Train_Dataset_Coord: {len(self.samples)} valid entries "
-            f"(out of {len(raw)} total) from {jsonl_path}"
+            f"(out of {len(raw)} total) from {jsonl_path} "
+            f"[qwen_align factor={self._qwen_params[0]} "
+            f"min_pixels={self._qwen_params[1]} max_pixels={self._qwen_params[2]}]"
         )
 
     def __len__(self):
@@ -439,7 +574,8 @@ class MindCube_Train_Dataset_Coord(Dataset):
         entry, sample_dir = self.samples[idx]
 
         images, xyz_raw_list, mask_raw_list, _ = _load_and_align_views(
-            sample_dir, self.max_images,
+            sample_dir, _n_images_in_entry(entry) or self.max_images,
+            qwen_params=self._qwen_params,
         )
 
         N = len(images)
@@ -703,7 +839,7 @@ class VST_Train_Dataset(Dataset):
         results_dir:        str,
         processor,
         log,
-        max_images:         int = 8,
+        max_images:         int | None = None,
         spatial_merge_size: int = 2,
         max_samples:        int | None = None,
     ):
@@ -730,6 +866,10 @@ class VST_Train_Dataset(Dataset):
                 continue
             self.samples.append((entry, sample_dir))
 
+        self.samples = _filter_complete_samples(
+            self.samples, log, "VST_Train_Dataset"
+        )
+
         if max_samples is not None and max_samples > 0:
             self.samples = self.samples[:max_samples]
 
@@ -737,10 +877,13 @@ class VST_Train_Dataset(Dataset):
         self.max_images         = max_images
         self.spatial_merge_size = spatial_merge_size
         self.log                = log
+        self._qwen_params       = _qwen_params_from_processor(processor)
         log.info(
             f"VST_Train_Dataset: {len(self.samples)} valid entries "
             f"(out of {len(raw)} total, skipped {n_no_dir} missing-dir, "
-            f"{n_no_qa} empty-QA) from {json_path}"
+            f"{n_no_qa} empty-QA) from {json_path} "
+            f"[qwen_align factor={self._qwen_params[0]} "
+            f"min_pixels={self._qwen_params[1]} max_pixels={self._qwen_params[2]}]"
         )
 
     def __len__(self):
@@ -750,7 +893,8 @@ class VST_Train_Dataset(Dataset):
         entry, sample_dir = self.samples[idx]
 
         images, xyz_raw_list, mask_raw_list, _ = _load_and_align_views(
-            sample_dir, self.max_images,
+            sample_dir, _n_images_in_entry(entry) or self.max_images,
+            qwen_params=self._qwen_params,
         )
 
         N = len(images)
@@ -811,7 +955,7 @@ class VST_Train_Dataset_Coord(VST_Train_Dataset):
         results_dir:        str,
         processor,
         log,
-        max_images:         int = 8,
+        max_images:         int | None = None,
         spatial_merge_size: int = 2,
         coord_upscale:      int = 4,
         max_samples:        int | None = None,
@@ -828,7 +972,8 @@ class VST_Train_Dataset_Coord(VST_Train_Dataset):
         entry, sample_dir = self.samples[idx]
 
         images, xyz_raw_list, mask_raw_list, _ = _load_and_align_views(
-            sample_dir, self.max_images,
+            sample_dir, _n_images_in_entry(entry) or self.max_images,
+            qwen_params=self._qwen_params,
         )
 
         N = len(images)

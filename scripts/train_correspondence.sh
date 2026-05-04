@@ -3,8 +3,7 @@
 # train_correspondence.sh
 #
 # LoRA fine-tuning of SpaForConditionalGeneration (LM answer loss only)
-# on VST 500K (vst_500k.json, 563,190 entries → 551,013 unique ids in
-# 3d_results). Multi-GPU via torchrun (DDP).
+# on VST MCQ subset (vst_mcq.json). Multi-GPU via torchrun (DDP).
 #
 # Default mode: 4D M-RoPE (use_xyz=True, Cartesian xyz fed into vision-token
 # position). Two alternative modes via flags (mutually exclusive):
@@ -18,11 +17,14 @@
 #
 # Usage:
 #   bash scripts/train_correspondence.sh [num_gpus] [--decouple|--vanilla]
+#                                        [--mindcube|--vst]
 #                                        [--xyz_rope_dim N] [--max_samples N]
 #
 #   num_gpus         — first positional arg, number of GPUs (default: all visible)
 #   --decouple       — decouple + Cartesian XYZ RoPE
 #   --vanilla        — original Qwen 3D M-RoPE (no image_xyz)
+#   --mindcube       — train on MindCube_train.jsonl + MindCube 3d_results (default)
+#   --vst            — train on vst_mcq.json + VST 3d_results
 #   --xyz_rope_dim N — total head_dim units for XYZ RoPE under --decouple
 #                      (each axis gets N/6 freq bands). Multiple of 6 ≤ 192.
 #                      Default 66 (= 11 bands per axis). Stamped into RUN_NAME
@@ -30,8 +32,9 @@
 #   --max_samples N  — truncate dataset to N entries (default: all)
 #
 # Examples:
-#   bash scripts/train_correspondence.sh                       # all GPUs, 4D M-RoPE
-#   bash scripts/train_correspondence.sh 2                     # 2 GPUs, 4D M-RoPE
+#   bash scripts/train_correspondence.sh                       # all GPUs, VST, 4D M-RoPE
+#   bash scripts/train_correspondence.sh 2                     # 2 GPUs, VST, 4D M-RoPE
+#   bash scripts/train_correspondence.sh 2 --mindcube          # 2 GPUs, MindCube, 4D M-RoPE
 #   bash scripts/train_correspondence.sh 2 --decouple          # decouple + Cartesian
 #   bash scripts/train_correspondence.sh 2 --vanilla           # original 3D M-RoPE
 #   bash scripts/train_correspondence.sh 1 --max_samples 6     # quick smoke run
@@ -50,6 +53,8 @@ MAX_SAMPLES=""
 VANILLA_FLAG=""
 DECOUPLE_FLAG=""
 XYZ_ROPE_DIM=""
+FREEZE_FLAG=""
+DATASET="mindcube"
 _positional=0
 
 while [ $# -gt 0 ]; do
@@ -58,6 +63,9 @@ while [ $# -gt 0 ]; do
         --decouple)     DECOUPLE_FLAG="--decouple"; shift ;;
         --xyz_rope_dim) XYZ_ROPE_DIM="$2"; shift 2 ;;
         --max_samples)  MAX_SAMPLES="$2"; shift 2 ;;
+        --freeze)       FREEZE_FLAG="--freeze"; shift ;;
+        --mindcube)     DATASET="mindcube"; shift ;;
+        --vst)          DATASET="vst"; shift ;;
         *)
             if [ $_positional -eq 0 ]; then
                 NPROC="$1"
@@ -77,19 +85,23 @@ fi
 # ── hyperparameters ─────────────────────────────────────────────────────────
 
 MODEL_PATH="$SPATIAL_DIR/checkpoints/Qwen3.5-4B"
-JSON_PATH="$SPATIAL_DIR/datasets/train/VST_parsed/vst_mcq.json"
-VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/VST/3d_results"
+if [ "$DATASET" = "mindcube" ]; then
+    JSON_PATH="$SPATIAL_DIR/datasets/train/MindCube/MindCube_train.jsonl"
+    VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/MindCube/3d_results"
+else
+    JSON_PATH="$SPATIAL_DIR/datasets/train/VST_parsed/vst_mcq.json"
+    VST_RESULTS_DIR="$SPATIAL_DIR/datasets/train/VST/3d_results"
+fi
 
-EPOCHS=3
-LR=5e-5
+EPOCHS=9
+LR=2e-4
 WARMUP_STEPS=100
 LORA_RANK=16
-MAX_IMAGES=8
 GRAD_ACCUM=16
 NUM_WORKERS=4
 
-SAVE_STEPS=1000
-EVAL_STEPS=200
+SAVE_STEPS=200
+EVAL_STEPS=50
 
 WANDB_PROJECT="spc"
 WANDB_ENTITY="actmrv"
@@ -98,6 +110,7 @@ WANDB_ENTITY="actmrv"
 
 _vanilla_suffix="${VANILLA_FLAG:+_vanilla}"
 _decouple_suffix="${DECOUPLE_FLAG:+_decouple}"
+_freeze_suffix="${FREEZE_FLAG:+_freeze}"
 
 # Stamp xyz_rope_dim only when overridden AND applicable (--decouple).
 _xrd_suffix=""
@@ -106,8 +119,8 @@ if [ -n "$XYZ_ROPE_DIM" ] && [ "$XYZ_ROPE_DIM" != "66" ] \
     _xrd_suffix="_xrd${XYZ_ROPE_DIM}"
 fi
 
-RUN_NAME="correspondence_vst${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
-WANDB_RUN_NAME="corr_vst_r${LORA_RANK}_ep${EPOCHS}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}"
+RUN_NAME="correspondence_${DATASET}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}${_freeze_suffix}"
+WANDB_RUN_NAME="corr_${DATASET}_r${LORA_RANK}_ep${EPOCHS}${_decouple_suffix}${_vanilla_suffix}${_xrd_suffix}${_freeze_suffix}"
 OUTPUT_DIR="$SPATIAL_DIR/train_records/$RUN_NAME"
 
 # ── setup ───────────────────────────────────────────────────────────────────
@@ -123,11 +136,17 @@ echo "[INFO] NPROC_PER_NODE       = $NPROC"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "[INFO] MAX_SAMPLES          = ${MAX_SAMPLES:-all}"
 echo "[INFO] EVAL_STEPS           = $EVAL_STEPS"
-echo "[INFO] Dataset              : VST 500K"
+echo "[INFO] DATASET              = $DATASET"
+echo "[INFO] Dataset              : $(basename "$JSON_PATH")"
 echo "[INFO] Output dir           : $OUTPUT_DIR"
 echo "[INFO] Mode                 : $_mode_label"
 if [ -n "$DECOUPLE_FLAG" ]; then
     echo "[INFO] xyz_rope_dim         = ${XYZ_ROPE_DIM:-66 (default)}"
+fi
+if [ -n "$FREEZE_FLAG" ]; then
+    echo "[INFO] FREEZE (linear-attn) = on"
+else
+    echo "[INFO] FREEZE (linear-attn) = off"
 fi
 echo "[INFO] Loss                 : LM answer CE only"
 echo "[INFO] Starting             : $(date '+%Y-%m-%d %H:%M:%S')"
@@ -158,7 +177,6 @@ $TORCHRUN \
     --lr                     "$LR"                     \
     --warmup_steps           "$WARMUP_STEPS"           \
     --lora_rank              "$LORA_RANK"              \
-    --max_images             "$MAX_IMAGES"             \
     --grad_accum             "$GRAD_ACCUM"             \
     --num_workers            "$NUM_WORKERS"            \
     --save_steps             "$SAVE_STEPS"             \
@@ -166,9 +184,11 @@ $TORCHRUN \
     --wandb_project          "$WANDB_PROJECT"          \
     --wandb_entity           "$WANDB_ENTITY"           \
     --wandb_run_name         "$WANDB_RUN_NAME"         \
+    --dataset                "$DATASET"                \
     $DECOUPLE_FLAG                                     \
     $VANILLA_FLAG                                      \
     $XYZ_ROPE_DIM_FLAG                                 \
-    $MAX_SAMPLES_FLAG
+    $MAX_SAMPLES_FLAG                                  \
+    $FREEZE_FLAG
 
 echo "[INFO] Done — $(date '+%Y-%m-%d %H:%M:%S')"

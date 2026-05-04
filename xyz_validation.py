@@ -72,6 +72,7 @@ from src.models import (
 )
 from src.dataset import (
     load_testing_dataset, chunk_dataset, _qwen_align_view,
+    _qwen_params_from_processor,
     build_interleaved_content,
     extract_answer_letter as _extract_answer_letter,
     extract_answer_number as _extract_answer_number,
@@ -476,16 +477,23 @@ def _prepare_batch_spa(
     # (_load_and_align_views in train_dataset_qwen35.py) so train and eval
     # feed the model bit-equivalent (image, pts3d, mask) tuples.
     if image_inputs:
+        _factor, _min_p, _max_p = _qwen_params_from_processor(processor)
         aligned_imgs: list = []
         for k, img in enumerate(image_inputs):
             r = coord_results[k] if (coord_results is not None and k < len(coord_results)) else None
             if r is not None:
                 src_img = r.get("image") or img
-                img_q, pts_q, mask_q = _qwen_align_view(src_img, r["pts3d"], r["mask"])
+                img_q, pts_q, mask_q = _qwen_align_view(
+                    src_img, r["pts3d"], r["mask"],
+                    factor=_factor, min_pixels=_min_p, max_pixels=_max_p,
+                )
                 r["pts3d"] = pts_q
                 r["mask"]  = mask_q
             else:
-                img_q = _qwen_align_view(img, None, None)[0]
+                img_q = _qwen_align_view(
+                    img, None, None,
+                    factor=_factor, min_pixels=_min_p, max_pixels=_max_p,
+                )[0]
             aligned_imgs.append(img_q)
         image_inputs = aligned_imgs
 
